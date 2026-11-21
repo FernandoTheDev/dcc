@@ -6,8 +6,10 @@ on:
   pull_request:
 
 jobs:
-  build-and-test:
+  build-and-verify:
+    name: Build, Format & Differential Suite
     runs-on: ubuntu-latest
+    timeout-minutes: 15
     steps:
       - uses: actions/checkout@v4
 
@@ -16,12 +18,29 @@ jobs:
           gcc --version
           clang --version
           readelf --version | head -n 1
+          ar --version | head -n 1
 
-      - name: Build DCC (requires CGD installed in runner)
+      - name: Build DCC (requires CGD >= 0.9.0 installed in runner)
         run: ./bootstrap/build.sh
 
       - name: Check Delegua formatting
         run: make check-format
 
-      - name: Run full verification and differential suite
+      - name: Run full verification and differential suite (82 checks)
         run: ./bootstrap/verify.sh
+
+  security-and-stress:
+    name: Security, Fuzzing & Stress Suite
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Build DCC
+        run: ./bootstrap/build.sh
+
+      - name: Run security and fuzzing suite
+        run: make test-security
+
+      - name: Run multi-file, concurrency and benchmark suite
+        run: make test-stress

@@ -1,70 +1,84 @@
-# Arquitetura Interna do DCC
+# Arquitetura Interna do DCC (v0.2.0)
 
 ## 1. Visão Geral do Pipeline
 
 ```text
-  arquivos .c / .o
+  arquivos .c / .o / .a + flags (-I, -D, -U, -L, -l, -std=, -O0..3, -W*, -fdiagnostics-*, -ftime-report)
          │
          ▼
-  src/driver/cli.delegua          (CLI: -o, -c, -S, -E, -I, -D, -U, -L, -l, -std=, -O0..3, -W*)
+  src/driver/cli.delegua                  (Driver CLI, orquestração, Cronometro, resolução -L/-l, FFI chmod)
          │
-         ├──► (.c) src/preprocessor/preproc.delegua
-         │         Fases 1–4 em O(N) sobre bytes, descoberta dinâmica de /usr/include e
-         │         diretório freestanding, #include / #include_next, macros objeto/função/
-         │         variádicas, #, ##, hide-set, #if/defined/__has_include, MapaFonte
+         ├──► (.c) Pré-processador (3 módulos)
+         │         ├── src/preprocessor/preproc.delegua    (Fases 1–3, #include/#include_next, MI-OPT/cache, anti-DoS)
+         │         ├── src/preprocessor/pp_macros.delegua  (Tokenização PP, hide-set Prosser, #, ##, variádicas)
+         │         └── src/preprocessor/pp_expr.delegua    (Avaliador #if 64-bit signed/unsigned, div0/INT64_MIN guards)
          │         │
          │         ▼
-         │    src/lexer/lexer.delegua           (Dicionários O(1), linha/coluna exatas, Fase 6)
+         │    Lexer e Literais (2 módulos)
+         │         ├── src/lexer/literais.delegua          (ClassificadorChar, escapes C99, parseInteiroC99 u64, hex-float)
+         │         └── src/lexer/lexer.delegua             (Tokenização C99/GNU99, bytesStr exatos, Fase 6)
          │         │
          │         ▼
-         │    src/parser/parser.delegua         (AST C99/GNU99 + classificador __attribute__ A/B/C)
+         │    src/parser/parser.delegua                  (Precedence Climbing, guarda profundidade 96, pilhaTypedefs, Cat A/B/C)
          │         │
          │         ▼
-         │    src/semantic/sema.delegua         (Tipos LP64, padding, bit-fields, __asm__ link sym)
+         │    src/semantic/sema.delegua                  (Layout LP64, bit-fields, const/ponteiros, duplicatas, offsetof aninhado)
          │         │
          │         ▼
-         │    src/ir/ir_ssa.delegua             (CFG + IR SSA tipada + otimizador + verificador)
+         │    IR SSA + Otimizador + Verificador (5 módulos)
+         │         ├── src/ir/ir_tipos.delegua             (InstSSA, BlocoSSA, FuncaoSSA, GlobalSSA, ModuloSSA, RelocGlobal)
+         │         ├── src/ir/ir_builder.delegua           (Lowering AST→SSA, structs <=8/9..16/>16B sret, .rela.data, float32)
+         │         ├── src/ir/ir_opt.delegua               (Constant folding 32/64 seguro, DCE respeitando volatile e div/mod)
+         │         ├── src/ir/ir_verify.delegua            (Verificador de invariantes SSA antes do backend)
+         │         └── src/ir/ir_ssa.delegua               (Fachada de alto nível)
          │         │
-         │         ├──► (-S) src/backend/x86_64/asm.delegua      ──► arquivo .s (Intel x86-64)
-         │         └──► src/backend/x86_64/codegen.delegua       ──► CodigoObjeto PIC-compatível
-         │                     │
-         │                     ▼
-         │              src/object/elf/elf_obj.delegua           ──► arquivo objeto ELF64 (.o ET_REL)
-         │                     │
-         ▼                     ▼
-  src/linker/linker.delegua  (Lê .o do DCC/GCC/Clang, mescla seções, resolve símbolos,
-                              sintetiza _start + stubs PLT/GOT, aplica relocações x86-64)
+         │         ├──► (-S) src/backend/x86_64/asm.delegua         ──► Assembly Intel x86-64 (.s)
+         │         └──► Backend Objeto (2 módulos)
+         │                   ├── src/backend/x86_64/emissor.delegua  (Codificação x86-64, NaN-safe SSE, 32/64-bit, rel32 bounds)
+         │                   └── src/backend/x86_64/codegen.delegua  (Lowering SSA→CodigoObjeto PIC, sret, STB_WEAK, .rela.data)
+         │                   │
+         │                   ▼
+         │              Emissão ELF64 (2 módulos)
+         │                   ├── src/object/elf/elf_comum.delegua    (Constantes ELF64 e helpers little-endian compartilhados)
+         │                   └── src/object/elf/elf_obj.delegua      (Objeto ELF64 ET_REL com 11 seções + .rela.data + STB_WEAK)
+         │                   │
+         ▼                   ▼
+  Linker Nativo ELF64 (2 módulos)
+         ├── src/linker/elf_leitor.delegua        (Leitura validada de .o ELF64 e archives GNU ar .a)
+         └── src/linker/linker.delegua            (Ponto fixo .a, STB_WEAK, SHN_COMMON, _start argc/argv, PLT/GOT, bounds reloc)
          │
          ▼
-  Executável ELF64 Dinâmico (ET_EXEC: PT_LOAD R E + PT_LOAD R W + 13 Section Headers)
+  Executável ELF64 Dinâmico (ET_EXEC: PT_LOAD R E + PT_LOAD R W + PT_GNU_STACK + 13 Section Headers)
 ```
 
-## 2. ABI System V AMD64 (LP64)
+Módulos transversais:
+- [`src/diagnostics/diag.delegua`](../src/diagnostics/diag.delegua): códigos `E1xxx`–`E9xxx`/`W1xxx`–`W2xxx`, `MapaFonte`, pilha de inclusão, cores ANSI (`isatty(2)` + `NO_COLOR`), JSON (`cgd:json`) e `-Wno-*`.
+- [`src/types/tipos.delegua`](../src/types/tipos.delegua): enums de tokens/AST/IR, `TipoC` (com `ehConst`/`ehVolatile`/`ehRestrict` e `clonar()`), `TabelaTipos` LP64 e codificadores IEEE-754 puros (`double` 64-bit e `float` 32-bit).
 
-- **Larguras e alinhamentos**: `_Bool`/`char`=1, `short`=2, `int`/`float`=4, `long`/`long long`/`double`/ponteiro=8.
-- **Passagem de parâmetros**: 6 registradores GP (`rdi`, `rsi`, `rdx`, `rcx`, `r8`, `r9`) e 8 SSE (`xmm0`..`xmm7`) com contadores independentes; argumentos excedentes empilhados da direita para a esquerda mantendo `rsp` alinhado em 16 bytes antes de `call`, lidos pelo callee em `[rbp + 16 + k*8]`.
-- **Retornos**: `rax` (inteiros, ponteiros, `struct`/`union` ≤ 8 bytes), `xmm0` (`float`/`double`).
-- **`va_list` (`__builtin_va_list`)**: layout binário System V AMD64 (`gp_offset`, `fp_offset`, `overflow_arg_area`, `reg_save_area`) com área de salvamento de 176 bytes (6 GP + 8 XMM × 16B), compatível diretamente com `vprintf`/`vsnprintf` da `libc.so.6`.
-- **VLAs (`Alloca`)**: alocação dinâmica alinhada em 16 bytes na pilha via `sub rsp, rax`, restaurada automaticamente por `mov rsp, rbp` no epílogo.
+---
 
-## 3. Formato ELF64 e Linker Nativo
+## 2. Inventário de Módulos (`src/` — 23 arquivos, 12.838 LOC)
 
-### Objeto Relocável (`-c` → `ET_REL`, `src/object/elf/elf_obj.delegua`)
+| Camada | Arquivos | Responsabilidade |
+| :--- | :--- | :--- |
+| Entrada & Driver | `main.delegua`, `driver/cli.delegua` | CLI, cronômetro por fase, I/O, resolução `-L`/`-l` |
+| Diagnósticos | `diagnostics/diag.delegua` | Formatação texto/JSON, cores, include stack, ICE |
+| Tipos | `types/tipos.delegua` | Tipos LP64, layout, qualificadores, IEEE-754 puro |
+| Pré-processador | `preprocessor/preproc.delegua`, `pp_macros.delegua`, `pp_expr.delegua` | Fases 1–4, macros, `#if`, cache/MI-OPT, anti-DoS |
+| Lexer | `lexer/lexer.delegua`, `lexer/literais.delegua` | Tokenização C99/GNU99, escapes exatos, literais u64/hex-float |
+| Parser | `parser/parser.delegua` | AST C99/GNU99, Precedence Climbing, escopo de `typedef`, GNU Cat A/B/C |
+| Semântica | `semantic/sema.delegua` | Tipagem, validações de erro/aviso, bit-fields, `const`, `offsetof` |
+| IR SSA | `ir/ir_tipos.delegua`, `ir_builder.delegua`, `ir_opt.delegua`, `ir_verify.delegua`, `ir_ssa.delegua` | Construção SSA, otimização segura, verificação de invariantes |
+| Backend x86-64 | `backend/x86_64/emissor.delegua`, `codegen.delegua`, `asm.delegua` | Emissão binária x86-64 PIC e Assembly `-S` |
+| ELF64 & Linker | `object/elf/elf_comum.delegua`, `elf_obj.delegua`, `linker/elf_leitor.delegua`, `linker/linker.delegua` | Objetos `.o`, archives `.a` e executáveis dinâmicos `ET_EXEC` |
 
-Emite 10 seções padrão: `NULL`, `.text`, `.rela.text`, `.rodata`, `.data`, `.bss`, `.symtab` (todos `STB_LOCAL` antes de `STB_GLOBAL`), `.strtab`, `.shstrtab` e `.note.GNU-stack`.
+---
 
-Todo código gerado usa endereçamento relativo a RIP (`lea rax, [rip+disp32]` com `R_X86_64_PC32`, `mov rax, [rip+disp32]` com `R_X86_64_GOTPCREL`, `call rel32` com `R_X86_64_PLT32`), garantindo compatibilidade direta tanto com o linker nativo do DCC quanto com `gcc`/`ld` em modo PIE padrão do Linux.
+## 3. Regras de Acoplamento e Invariantes
 
-### Linker Nativo e Executável Dinâmico (`src/linker/linker.delegua`)
+1. **Dependência estritamente acíclica**: `types`/`diagnostics` → `lexer` → `preprocessor` → `parser` → `semantic` → `ir` → `backend` → `object/elf` → `linker` → `driver`.
+2. **Sem duplicação entre camadas**: constantes ELF64 e helpers LE vivem apenas em `elf_comum.delegua`; classificação de caracteres, escapes C99 e parsing de literais inteiros/hex-float vivem apenas em `literais.delegua`.
+3. **Barreira de invariantes antes do backend**: `ir_verify.delegua` valida blocos, terminadores, definições SSA únicas, registradores válidos e índices de strings/globais antes de `codegen.delegua` ou `asm.delegua`.
+4. **Sem estados globais ocultos**: estado de compilação pertence às instâncias (`GerenciadorDiagnosticos`, `PreprocessadorDCC`, `LexerDCC`, `ParserDCC`, `AnalisadorSemantico`, `ConstrutorIR`).
 
-- Lê múltiplos `.o` (`ET_REL` x86-64), mesclando seções alocáveis por permissões (`AX` → `.text`, `A` → `.rodata`, `WA PROGBITS` → `.data`, `WA NOBITS` → `.bss`).
-- Resolve símbolos globais/fracos (`STB_GLOBAL`/`STB_WEAK`), detecta redefinições e ausência de `main`.
-- Sintetiza `_start` (`call main; mov rdi, rax; xor eax, eax; call exit@plt`) e stubs PLT de 6 bytes (`jmp qword ptr [rip + got_disp32]`).
-- Aplica relocações `R_X86_64_64` (1), `R_X86_64_PC32` (2), `R_X86_64_PLT32` (4), `R_X86_64_GOTPCREL` (9), `R_X86_64_32` (10), `R_X86_64_32S` (11), `R_X86_64_GOTPCRELX` (41) e `R_X86_64_REX_GOTPCRELX` (42).
-- Produz executável W^X com 5 Program Headers (`PT_PHDR`, `PT_INTERP`, `PT_LOAD` `R E`, `PT_LOAD` `R W` alinhado em página 4096, `PT_DYNAMIC`) e 13 Section Headers.
-
-### Limitações Atuais do Linker
-
-- Não lê arquivos estáticos `.a` (`ar`) nem gera bibliotecas compartilhadas (`-shared`).
-- Não suporta relocações TLS (`R_X86_64_TPOFF32` / `__thread`) nem tabelas `.init_array`/`.fini_array` (`__attribute__((constructor))`).
-- Objetos externos produzidos por GCC/Clang com seções de código/dados padrão e relocações listadas acima linkam normalmente; construções que exijam símbolos internos da `libgcc` ou `crt1.o` ainda não são fornecidas.
+Para detalhes aprofundados, veja [ABI.md](ABI.md), [LINKER.md](LINKER.md), [DIAGNOSTICS.md](DIAGNOSTICS.md) e [CGD_STDLIB.md](CGD_STDLIB.md).
