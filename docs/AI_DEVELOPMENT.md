@@ -25,7 +25,7 @@ Especificamente, agentes de IA foram utilizados para:
 | :--- | :--- | :--- |
 | **Ciclo I** | Compilador C experimental dentro do ecossistema CGD | Pipeline inicial C99 com pré-processador, SSA, backend x86-64 e linking |
 | **Ciclo II** | Independência como projeto `dcc` (v0.1.0) | Consumo real de `/usr/include`, camada GNU Cat A/B/C, objetos ELF64 `.o`, linker nativo e 35 testes iniciais |
-| **Ciclo III** | Auditoria, refatoração, segurança e estabilização (v0.2.0) | Divisão modular de 13→23 módulos, adoção da stdlib `cgd:*`, endurecimento de segurança em PP/lexer/parser/IR/ELF/linker, suporte a `float` 32-bit, `NaN`, structs 9–16B e `>16B` (`sret`), `.rela.data`, archives `.a`, diagnósticos JSON/ANSI/códigos e expansão para 82 verificações + suíte adversarial + estresse |
+| **Ciclo III** | Auditoria, refatoração, segurança, escalabilidade e self-hosting (v0.2.0) | Divisão modular de 13→23 módulos, adoção da stdlib `cgd:*`, endurecimento de segurança em PP/lexer/parser/IR/ELF/linker, suporte a `float` 32-bit, `NaN`, structs 9–16B e `>16B` (`sret`), `.rela.data`, archives `.a`, TLS `__thread`, diagnósticos JSON/ANSI/códigos, auto-compilação de `build/dcc.c` (`build/dcc-self`) e expansão para 86 verificações + suíte adversarial + estresse |
 
 ---
 

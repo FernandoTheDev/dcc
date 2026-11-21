@@ -32,13 +32,13 @@ Todos os comandos abaixo foram executados e validados sobre o build limpo atual:
 
 - `make check-format` — **23/23 arquivos `.delegua` aprovados** sem desvios.
 - `./bootstrap/build.sh` — compilou `build/dcc` (`0.2.0`) com `CGD v0.9.0`.
-- `python3 tests/run_tests.py` — **82/82 verificações aprovadas, 0 falhas**:
-  - 17 programas diferenciais × 3 níveis (`-O0`, `-O1`, `-O2`) = 51 execuções idênticas a GCC e Clang usando headers reais de `/usr/include`;
-  - 4 direções de interoperabilidade ABI bidirecional (`DCC↔GCC`, `DCC↔Clang`);
+- `python3 tests/run_tests.py` — **86/86 verificações aprovadas, 0 falhas**:
+  - 18 programas diferenciais × 3 níveis (`-O0`, `-O1`, `-O2`) = 54 execuções idênticas a GCC e Clang usando headers reais de `/usr/include`;
+  - 5 verificações de interoperabilidade ABI bidirecional (`DCC↔GCC`, `DCC↔Clang`, incluindo retorno estreito `bool`);
   - 9 testes de linker, archives `.a`, `STB_WEAK`, duplicatas e auditoria ELF64 (`readelf`/`ldd`);
   - 18 testes de diagnósticos negativos, JSON, ANSI, `-Wno-*`, `-S`, `-ftime-report` e execução fora da árvore.
-- `python3 tests/test_security_fuzz.py` — **APROVADO** (12 adversariais de pré-processador, 50 entradas fuzzing lexer/parser, 15 ELF64/`.a` hostis rejeitados controladamente).
-- `python3 tests/test_stress.py` — **APROVADO** (multi-arquivo + `libutil.a` em `-O0/-O1/-O2`, 24 compilações paralelas 4× em `6.62–6.76s`, benchmark `-ftime-report` completo).
+- `python3 tests/test_security_fuzz.py` — **APROVADO** (17 verificações adversariais e de escalabilidade de pré-processador/pipeline, 50 entradas fuzzing lexer/parser, 15 ELF64/`.a` hostis rejeitados controladamente).
+- `python3 tests/test_stress.py` — **APROVADO** (multi-arquivo + `libutil.a` em `-O0/-O1/-O2`, 24 compilações paralelas 4× em `2,61s`, benchmark `-ftime-report` `-O2` em `872ms`).
 
 ---
 
