@@ -7,11 +7,12 @@ funcao offRegObj(tamanhoLocaisBytes: inteiro, reg: inteiro): inteiro {
 }
 
 funcao emitirCallObj(emissor: qualquer, fn: qualquer, inst: qualquer, ehExtern: logico, ehIndireto: logico): vazio {
+    const ci: qualquer = inst.callInfo
     var intIdx: inteiro = 0
     var fltIdx: inteiro = 0
 
     // Se retorno eh struct > 16B (sret), rdi recebe o ponteiro oculto de destino
-    var temSret: logico = inst.callRetStructModo == 3 e inst.callSretReg >= 0
+    var temSret: logico = ci.retStructModo == 3 e ci.sretReg >= 0
     se (temSret) {
         intIdx = 1
     }
@@ -23,12 +24,12 @@ funcao emitirCallObj(emissor: qualquer, fn: qualquer, inst: qualquer, ehExtern: 
     var regIntOps: qualquer[] = [] // tupla([regIdx, tipoOp, slotOff, qwordDisp])
     var regFltOps: qualquer[] = [] // tupla([xmmIdx, ehFloat32, slotOff])
 
-    para (var k: inteiro = 0; k < inst.callArgs.tamanho(); k++) {
-        const regArg: inteiro = inst.callArgs[k]
+    para (var k: inteiro = 0; k < ci.args.tamanho(); k++) {
+        const regArg: inteiro = ci.args[k]
         const slotArg: inteiro = offRegObj(fn.tamanhoLocaisBytes, regArg)
-        const ehFlt: logico = k < inst.callArgFloats.tamanho() ? inst.callArgFloats[k] : falso
-        const largA: inteiro = k < inst.callArgLarguras.tamanho() ? inst.callArgLarguras[k] : 8
-        const ehStructA: logico = k < inst.callArgEhStruct.tamanho() ? inst.callArgEhStruct[k] : falso
+        const ehFlt: logico = k < ci.argFloats.tamanho() ? ci.argFloats[k] : falso
+        const largA: inteiro = k < ci.argLarguras.tamanho() ? ci.argLarguras[k] : 8
+        const ehStructA: logico = k < ci.argEhStruct.tamanho() ? ci.argEhStruct[k] : falso
 
         se (ehStructA) {
             se (largA <= 8) {
@@ -104,7 +105,7 @@ funcao emitirCallObj(emissor: qualquer, fn: qualquer, inst: qualquer, ehExtern: 
 
     // Carrega argumentos GP (rdi..r9)
     se (temSret) {
-        emissor.loadArgAbiRbp(0, offRegObj(fn.tamanhoLocaisBytes, inst.callSretReg))
+        emissor.loadArgAbiRbp(0, offRegObj(fn.tamanhoLocaisBytes, ci.sretReg))
     }
 
     para (var i: inteiro = 0; i < regIntOps.tamanho(); i++) {
@@ -161,435 +162,546 @@ funcao emitirCallObj(emissor: qualquer, fn: qualquer, inst: qualquer, ehExtern: 
     }
 }
 
-funcao gerarCodigoObjetoX86_64(modulo: qualquer): qualquer {
-    const tMod: qualquer = importar("../../types/tipos.delegua")
+classe ContextoCodegenStreaming {
+    obj: qualquer
+    emissor: qualquer
+    strOffsets: inteiro[]
+    nStringsSinc: inteiro
+    nGlobaisSinc: inteiro
+    funcoesLocais: dicionario
+    funcoesWeak: dicionario
+    mapaGlobalSec: dicionario
+    mapaGlobalOff: dicionario
+    globaisWeak: dicionario
+    externosExtras: dicionario
+    externosTls: dicionario
+    simbolosFuncoes: qualquer[]
+
+    construtor(funcoesLocais: dicionario, funcoesWeak: dicionario) {
+        const emMod: qualquer = importar("emissor.delegua")
+        isto.obj = emMod.CodigoObjeto()
+        isto.emissor = emMod.EmissorX86_64()
+        isto.strOffsets = []
+        isto.nStringsSinc = 0
+        isto.nGlobaisSinc = 0
+        isto.funcoesLocais = funcoesLocais
+        isto.funcoesWeak = funcoesWeak
+        isto.mapaGlobalSec = {}
+        isto.mapaGlobalOff = {}
+        isto.globaisWeak = {}
+        isto.externosExtras = {}
+        isto.externosTls = {}
+        isto.simbolosFuncoes = []
+    }
+}
+
+funcao sincronizarModuloStreaming(ctx: ContextoCodegenStreaming, modulo: qualquer): vazio {
     const emMod: qualquer = importar("emissor.delegua")
     const elfComum: qualquer = importar("../../object/elf/elf_comum.delegua")
-    const diagMod: qualquer = importar("../../diagnostics/diag.delegua")
-    const OpI: qualquer = tMod.OpIR
+    const obj: qualquer = ctx.obj
 
-    const obj: qualquer = emMod.CodigoObjeto()
-    para (var i: inteiro = 0; i < modulo.libsExternas.tamanho(); i++) {
-        obj.libsExternas.empilhar(modulo.libsExternas[i])
-    }
-
-    // 1. Monta .rodata (strings exatas em bytes, preservando \0 e escapes)
-    var strOffsets: inteiro[] = []
-    para (var i: inteiro = 0; i < modulo.stringsBytes.tamanho(); i++) {
-        strOffsets.empilhar(obj.rodataBytes.tamanho())
+    // 1. Novas strings em .rodata (ordem identica a de registro no ModuloSSA)
+    para (var i: inteiro = ctx.nStringsSinc; i < modulo.stringsBytes.tamanho(); i++) {
+        ctx.strOffsets.empilhar(obj.rodataBytes.tamanho())
         const dados: inteiro[] = modulo.stringsBytes[i]
-        para (var k: inteiro = 0; k < dados.tamanho(); k++) obj.rodataBytes.empilhar(dados[k] & 255)
-        obj.rodataBytes.empilhar(0)
+        obj.rodataBytes.anexarVetor(dados)
+        obj.rodataBytes.anexarByte(0)
     }
 
-    // Mapeia funcoes definidas localmente nesta TU (e quais sao STB_WEAK)
-    var funcoesLocais: dicionario = {}
-    var funcoesWeak: dicionario = {}
-    para (var f: inteiro = 0; f < modulo.funcoes.tamanho(); f++) {
-        funcoesLocais[modulo.funcoes[f].nome] = verdadeiro
-        se (modulo.funcoes[f].ehWeak) funcoesWeak[modulo.funcoes[f].nome] = verdadeiro
-    }
+    ctx.nStringsSinc = modulo.stringsBytes.tamanho()
 
-    // 2. Monta .data e .bss + tabela de offsets das globais locais desta TU
-    var mapaGlobalSec: dicionario = {}
-    var mapaGlobalOff: dicionario = {}
-    var globaisWeak: dicionario = {}
-    para (var i: inteiro = 0; i < modulo.globais.tamanho(); i++) {
+    // 2. Novas globais (.data / .bss) e relocacoes .rela.data
+    const inicioGlob: inteiro = ctx.nGlobaisSinc
+    para (var i: inteiro = inicioGlob; i < modulo.globais.tamanho(); i++) {
         const g: qualquer = modulo.globais[i]
-        se (g.ehWeak) globaisWeak[g.nome] = verdadeiro
+        se (g.ehWeak) ctx.globaisWeak[g.nome] = verdadeiro
         se (g.temInit) {
-            elfComum.preencherAlinh(obj.dataBytes, g.alinhamento, 0)
+            const padG: inteiro = elfComum.alinharValor(obj.dataBytes.tamanho(), g.alinhamento) - obj.dataBytes.tamanho()
+            se (padG > 0) obj.dataBytes.anexarZeros(padG)
             const offG: inteiro = obj.dataBytes.tamanho()
-            mapaGlobalSec[g.nome] = ".data"
-            mapaGlobalOff[g.nome] = offG
-            para (var k: inteiro = 0; k < g.bytesInit.tamanho(); k++) obj.dataBytes.empilhar(g.bytesInit[k] & 255)
+            ctx.mapaGlobalSec[g.nome] = ".data"
+            ctx.mapaGlobalOff[g.nome] = offG
+            obj.dataBytes.anexarVetor(g.bytesInit)
             obj.simbolos.empilhar(emMod.SimboloObj(g.nome, "DATA", offG, g.tamanhoBytes,
                 !g.ehStatic, elfComum.STT_OBJECT, g.ehWeak))
         } senao {
             obj.bssSize = elfComum.alinharValor(obj.bssSize, g.alinhamento)
             const offB: inteiro = obj.bssSize
-            mapaGlobalSec[g.nome] = ".bss"
-            mapaGlobalOff[g.nome] = offB
+            ctx.mapaGlobalSec[g.nome] = ".bss"
+            ctx.mapaGlobalOff[g.nome] = offB
             obj.bssSize = obj.bssSize + g.tamanhoBytes
             obj.simbolos.empilhar(emMod.SimboloObj(g.nome, "BSS", offB, g.tamanhoBytes, !g.ehStatic,
                 elfComum.STT_OBJECT, g.ehWeak))
         }
     }
 
-    // 2b. Emite relocacoes .rela.data para ponteiros globais inicializados
-    var externosExtras: dicionario = {}
-    var externosTls: dicionario = {}
-    para (var i: inteiro = 0; i < modulo.globais.tamanho(); i++) {
+    para (var i: inteiro = inicioGlob; i < modulo.globais.tamanho(); i++) {
         const g: qualquer = modulo.globais[i]
         se (!g.temInit ou g.relocs.tamanho() == 0) continua
-        const baseOffG: inteiro = inteiro(mapaGlobalOff[g.nome])
+        const baseOffG: inteiro = inteiro(ctx.mapaGlobalOff[g.nome])
         para (var r: inteiro = 0; r < g.relocs.tamanho(); r++) {
             const rel: qualquer = g.relocs[r]
             const offDataRel: inteiro = baseOffG + rel.offsetGlobal
             se (rel.ehStr) {
                 obj.relocsData.empilhar(emMod.RelocObj(offDataRel, ".rodata", elfComum.R_X86_64_64,
-                    strOffsets[rel.idxStr] + rel.addend))
-            } senao se (mapaGlobalSec.contem(rel.simbolo)) {
-                obj.relocsData.empilhar(emMod.RelocObj(offDataRel, texto(mapaGlobalSec[rel.simbolo]),
-                    elfComum.R_X86_64_64, inteiro(mapaGlobalOff[rel.simbolo]) + rel.addend))
-            } senao se (funcoesLocais.contem(rel.simbolo)) {
+                    ctx.strOffsets[rel.idxStr] + rel.addend))
+            } senao se (ctx.mapaGlobalSec.contem(rel.simbolo)) {
+                obj.relocsData.empilhar(emMod.RelocObj(offDataRel, texto(ctx.mapaGlobalSec[rel.simbolo]),
+                    elfComum.R_X86_64_64, inteiro(ctx.mapaGlobalOff[rel.simbolo]) + rel.addend))
+            } senao se (ctx.funcoesLocais.contem(rel.simbolo)) {
                 obj.relocsData.empilhar(emMod.RelocObj(offDataRel, rel.simbolo, elfComum.R_X86_64_64,
                     rel.addend))
             } senao {
-                externosExtras[rel.simbolo] = verdadeiro
+                ctx.externosExtras[rel.simbolo] = verdadeiro
                 obj.relocsData.empilhar(emMod.RelocObj(offDataRel, rel.simbolo, elfComum.R_X86_64_64,
                     rel.addend))
             }
+        }
+        g.bytesInit = []
+        g.relocs = []
+    }
+
+    ctx.nGlobaisSinc = modulo.globais.tamanho()
+}
+
+funcao iniciarCodegenStreaming(modulo: qualquer, funcoesLocais: dicionario, funcoesWeak: dicionario): ContextoCodegenStreaming {
+    const ctx: ContextoCodegenStreaming = ContextoCodegenStreaming(funcoesLocais, funcoesWeak)
+    para (var i: inteiro = 0; i < modulo.libsExternas.tamanho(); i++) {
+        ctx.obj.libsExternas.empilhar(modulo.libsExternas[i])
+    }
+
+    sincronizarModuloStreaming(ctx, modulo)
+    retorna ctx
+}
+
+funcao emitirFuncaoParaEmissor(emissor: qualquer, fn: qualquer, strOffsets: inteiro[], mapaGlobalSec: dicionario,
+    mapaGlobalOff: dicionario, globaisWeak: dicionario, funcoesLocais: dicionario, funcoesWeak: dicionario,
+    externosExtras: dicionario, externosTls: dicionario): (inteiro, inteiro) {
+    const tMod: qualquer = importar("../../types/tipos.delegua")
+    const elfComum: qualquer = importar("../../object/elf/elf_comum.delegua")
+    const diagMod: qualquer = importar("../../diagnostics/diag.delegua")
+    const OpI: qualquer = tMod.OpIR
+
+    enquanto (emissor.code.tamanho() % 16 != 0) emissor.u8(144) // nop alinhamento 16B
+    const inicioFn: inteiro = emissor.code.tamanho()
+    const inicioPatches: inteiro = emissor.patchesRel32.tamanho()
+    const frameBytes: inteiro = elfComum.alinharValor(fn.tamanhoLocaisBytes + fn.numRegs * 8,
+        16)
+    se (frameBytes > 1073741824) {
+        falhar diagMod.ErroDCC("Backend x86-64: stack frame excessivo (${frameBytes} bytes) na funcao '${fn.nome}'",
+            "", 0, 0, "E4001", falso)
+    }
+
+    emissor.marcarLabel("fn_" + fn.nome)
+    emissor.pushRbp()
+    emissor.movRbpRsp()
+    se (frameBytes > 0) emissor.subRspImm32(frameBytes)
+
+    se (fn.ehVariadica) {
+        para (var r: inteiro = 0; r < 6; r++) {
+            emissor.storeArgAbiRbp(r, fn.regSaveOffset - r * 8)
+        }
+        para (var x: inteiro = 0; x < 8; x++) {
+            emissor.storeXmmRbpDisp(x, -(fn.regSaveOffset - (48 + x * 16)))
         }
     }
 
-    // 3. Emite codigo de maquina .text para todas as funcoes desta TU
-    const emissor: qualquer = emMod.EmissorX86_64()
-    const funcoes: qualquer[] = modulo.funcoes
+    var pInt: inteiro = 0
+    var pFlt: inteiro = 0
+    var pStk: inteiro = 0
 
-    para (var f: inteiro = 0; f < funcoes.tamanho(); f++) {
-        const fn: qualquer = funcoes[f]
-        enquanto (emissor.code.tamanho() % 16 != 0) emissor.u8(144) // nop alinhamento 16B
-        const inicioFn: inteiro = emissor.code.tamanho()
-        const frameBytes: inteiro = elfComum.alinharValor(fn.tamanhoLocaisBytes + fn.numRegs * 8,
-            16)
-        se (frameBytes > 1073741824) {
-            falhar diagMod.ErroDCC("Backend x86-64: stack frame excessivo (${frameBytes} bytes) na funcao '${fn.nome}'",
-                "", 0, 0, "E4001", falso)
-        }
+    // Se funcao retorna struct > 16B, salva ponteiro oculto sret (rdi)
+    se (fn.retStructModo == 3) {
+        emissor.storeArgAbiRbp(0, fn.sretPtrOffset)
+        pInt = 1
+    }
 
-        emissor.marcarLabel("fn_" + fn.nome)
-        emissor.pushRbp()
-        emissor.movRbpRsp()
-        se (frameBytes > 0) emissor.subRspImm32(frameBytes)
+    para (var p: inteiro = 0; p < fn.aridade; p++) {
+        const offP: inteiro = fn.paramOffsets[p]
+        const largP: inteiro = fn.paramLarguras[p]
+        const ehFltP: logico = fn.paramEhFloat[p]
+        const ehStructP: logico = p < fn.paramEhStruct.tamanho() ? fn.paramEhStruct[p] : falso
 
-        se (fn.ehVariadica) {
-            para (var r: inteiro = 0; r < 6; r++) {
-                emissor.storeArgAbiRbp(r, fn.regSaveOffset - r * 8)
-            }
-            para (var x: inteiro = 0; x < 8; x++) {
-                emissor.storeXmmRbpDisp(x, -(fn.regSaveOffset - (48 + x * 16)))
-            }
-        }
-
-        var pInt: inteiro = 0
-        var pFlt: inteiro = 0
-        var pStk: inteiro = 0
-
-        // Se funcao retorna struct > 16B, salva ponteiro oculto sret (rdi)
-        se (fn.retStructModo == 3) {
-            emissor.storeArgAbiRbp(0, fn.sretPtrOffset)
-            pInt = 1
-        }
-
-        para (var p: inteiro = 0; p < fn.aridade; p++) {
-            const offP: inteiro = fn.paramOffsets[p]
-            const largP: inteiro = fn.paramLarguras[p]
-            const ehFltP: logico = fn.paramEhFloat[p]
-            const ehStructP: logico = p < fn.paramEhStruct.tamanho() ? fn.paramEhStruct[p] : falso
-
-            se (ehStructP) {
-                se (largP <= 8) {
-                    se (pInt < 6) {
-                        emissor.storeArgAbiRbp(pInt, offP)
-                        pInt++
-                    } senao {
-                        emissor.loadRaxRbpDisp(16 + pStk * 8)
-                        emissor.storeRaxRbp(offP)
-                        pStk++
-                    }
-                } senao se (largP <= 16) {
-                    se (pInt + 2 <= 6) {
-                        emissor.storeArgAbiRbp(pInt, offP)
-                        emissor.storeArgAbiRbp(pInt + 1, offP - 8)
-                        pInt = pInt + 2
-                    } senao {
-                        emissor.loadRaxRbpDisp(16 + pStk * 8)
-                        emissor.storeRaxRbp(offP)
-                        emissor.loadRaxRbpDisp(16 + (pStk + 1) * 8)
-                        emissor.storeRaxRbp(offP - 8)
-                        pStk = pStk + 2
-                    }
-                } senao {
-                    const nQ: inteiro = (largP + 7) \ 8
-                    para (var q: inteiro = 0; q < nQ; q++) {
-                        emissor.loadRaxRbpDisp(16 + (pStk + q) * 8)
-                        emissor.storeRaxRbpDisp(-offP + q * 8)
-                    }
-                    pStk = pStk + nQ
-                }
-                continua
-            }
-
-            se (ehFltP) {
-                se (pFlt < 8) {
-                    se (largP == 4) {
-                        emissor.storeXmmFloatRbpDisp(pFlt, -offP)
-                    } senao {
-                        emissor.storeXmmRbpDisp(pFlt, -offP)
-                    }
-                    pFlt++
-                } senao {
-                    const stkOff: inteiro = 16 + pStk * 8
-                    se (largP == 4) {
-                        emissor.loadXmmFloatRbpDisp(0, stkOff)
-                        emissor.storeXmmFloatRbpDisp(0, -offP)
-                    } senao {
-                        emissor.loadXmmRbpDisp(0, stkOff)
-                        emissor.storeXmmRbpDisp(0, -offP)
-                    }
-                    pStk++
-                }
-            } senao {
+        se (ehStructP) {
+            se (largP <= 8) {
                 se (pInt < 6) {
                     emissor.storeArgAbiRbp(pInt, offP)
                     pInt++
                 } senao {
-                    const stkOff: inteiro = 16 + pStk * 8
-                    emissor.loadRaxRbpDisp(stkOff)
+                    emissor.loadRaxRbpDisp(16 + pStk * 8)
                     emissor.storeRaxRbp(offP)
                     pStk++
                 }
-            }
-        }
-
-        para (var b: inteiro = 0; b < fn.blocos.tamanho(); b++) {
-            const bb: qualquer = fn.blocos[b]
-            emissor.marcarLabel("bb_" + fn.nome + "_" + bb.nome)
-
-            para (var i: inteiro = 0; i < bb.insts.tamanho(); i++) {
-                const inst: qualquer = bb.insts[i]
-                const op: qualquer = inst.op
-
-                escolha (op) {
-                    caso OpI.Const:
-                    emissor.movRaxImm64(inst.a)
-                    emissor.storeRaxRbp(offRegObj(fn.tamanhoLocaisBytes, inst.dst))
-                    caso OpI.FConst:
-                    const fBits: inteiro = tMod.doubleParaBitsIEEE754(inst.fval)
-                    emissor.movRaxImm64(fBits)
-                    emissor.storeRaxRbp(offRegObj(fn.tamanhoLocaisBytes, inst.dst))
-                    caso OpI.Copy:
-                    emissor.loadRaxRbp(offRegObj(fn.tamanhoLocaisBytes, inst.a))
-                    emissor.storeRaxRbp(offRegObj(fn.tamanhoLocaisBytes, inst.dst))
-                    caso OpI.AddrSlot:
-                    emissor.leaRaxRbp(inst.a)
-                    emissor.storeRaxRbp(offRegObj(fn.tamanhoLocaisBytes, inst.dst))
-                    caso OpI.AddrRbpDisp:
-                    emissor.leaRaxRbpDisp(inst.a)
-                    emissor.storeRaxRbp(offRegObj(fn.tamanhoLocaisBytes, inst.dst))
-                    caso OpI.AddrGlobal:
-                    se (globaisWeak.contem(inst.alvo1)) {
-                        emissor.leaRaxRipReloc(inst.alvo1, -4)
-                    } senao {
-                        const secG: texto = texto(mapaGlobalSec[inst.alvo1])
-                        const offG: inteiro = inteiro(mapaGlobalOff[inst.alvo1])
-                        emissor.leaRaxRipReloc(secG, offG - 4)
-                    }
-                    emissor.storeRaxRbp(offRegObj(fn.tamanhoLocaisBytes, inst.dst))
-                    caso OpI.AddrExternGlobal:
-                    emissor.movRaxGotReloc(inst.alvo1)
-                    emissor.storeRaxRbp(offRegObj(fn.tamanhoLocaisBytes, inst.dst))
-                    caso OpI.AddrExternTls:
-                    externosTls[inst.alvo1] = verdadeiro
-                    emissor.movRaxTlsGotReloc(inst.alvo1)
-                    emissor.storeRaxRbp(offRegObj(fn.tamanhoLocaisBytes, inst.dst))
-                    caso OpI.AddrFunc:
-                    se (funcoesWeak.contem(inst.alvo1)) {
-                        emissor.leaRaxRipReloc(inst.alvo1, -4)
-                    } senao se (funcoesLocais.contem(inst.alvo1)) {
-                        emissor.leaRaxRipLabel("fn_" + inst.alvo1)
-                    } senao {
-                        externosExtras[inst.alvo1] = verdadeiro
-                        emissor.movRaxGotReloc(inst.alvo1)
-                    }
-                    emissor.storeRaxRbp(offRegObj(fn.tamanhoLocaisBytes, inst.dst))
-                    caso OpI.AddrStr:
-                    emissor.leaRaxRipReloc(".rodata", strOffsets[inst.a] - 4)
-                    emissor.storeRaxRbp(offRegObj(fn.tamanhoLocaisBytes, inst.dst))
-                    caso OpI.Alloca:
-                    emissor.loadRaxRbp(offRegObj(fn.tamanhoLocaisBytes, inst.a))
-                    emissor.u8(72)
-                    emissor.u8(131)
-                    emissor.u8(192)
-                    emissor.u8(15)
-                    emissor.u8(72)
-                    emissor.u8(131)
-                    emissor.u8(224)
-                    emissor.u8(240)
-                    emissor.u8(72)
-                    emissor.u8(41)
-                    emissor.u8(196)
-                    emissor.u8(72)
-                    emissor.u8(137)
-                    emissor.u8(224)
-                    emissor.storeRaxRbp(offRegObj(fn.tamanhoLocaisBytes, inst.dst))
-                    caso OpI.Load:
-                    emissor.loadRaxRbp(offRegObj(fn.tamanhoLocaisBytes, inst.a))
-                    emissor.loadSizedFromPtrRax(inst.largura, inst.ehSemSinal)
-                    emissor.storeRaxRbp(offRegObj(fn.tamanhoLocaisBytes, inst.dst))
-                    caso OpI.Store:
-                    emissor.loadRaxRbp(offRegObj(fn.tamanhoLocaisBytes, inst.a))
-                    emissor.loadRcxRbp(offRegObj(fn.tamanhoLocaisBytes, inst.b))
-                    emissor.storeSizedRcxToPtrRax(inst.largura)
-                    caso OpI.FLoad:
-                    emissor.loadRaxRbp(offRegObj(fn.tamanhoLocaisBytes, inst.a))
-                    emissor.floadFromPtrRax(inst.largura)
-                    emissor.storeXmmRbpDisp(0, -offRegObj(fn.tamanhoLocaisBytes, inst.dst))
-                    caso OpI.FStore:
-                    emissor.loadRaxRbp(offRegObj(fn.tamanhoLocaisBytes, inst.a))
-                    emissor.loadXmmRbpDisp(0, -offRegObj(fn.tamanhoLocaisBytes, inst.b))
-                    emissor.fstoreToPtrRax(inst.largura)
-                    caso OpI.Neg:
-                    emissor.loadRaxRbp(offRegObj(fn.tamanhoLocaisBytes, inst.a))
-                    se (inst.largura != 4) emissor.u8(72)
-                    emissor.u8(247)
-                    emissor.u8(216)
-                    se (inst.largura == 4 e !inst.ehSemSinal) emissor.truncRax(4, falso)
-                    emissor.storeRaxRbp(offRegObj(fn.tamanhoLocaisBytes, inst.dst))
-                    caso OpI.BitNot:
-                    emissor.loadRaxRbp(offRegObj(fn.tamanhoLocaisBytes, inst.a))
-                    se (inst.largura != 4) emissor.u8(72)
-                    emissor.u8(247)
-                    emissor.u8(208)
-                    se (inst.largura == 4 e !inst.ehSemSinal) emissor.truncRax(4, falso)
-                    emissor.storeRaxRbp(offRegObj(fn.tamanhoLocaisBytes, inst.dst))
-                    caso OpI.LogNot:
-                    emissor.loadRaxRbp(offRegObj(fn.tamanhoLocaisBytes, inst.a))
-                    emissor.testRaxRax()
-                    emissor.u8(15)
-                    emissor.u8(148)
-                    emissor.u8(192)
-                    emissor.movzxRaxAl()
-                    emissor.storeRaxRbp(offRegObj(fn.tamanhoLocaisBytes, inst.dst))
-                    caso OpI.ToBool:
-                    emissor.loadRaxRbp(offRegObj(fn.tamanhoLocaisBytes, inst.a))
-                    emissor.testRaxRax()
-                    emissor.u8(15)
-                    emissor.u8(149)
-                    emissor.u8(192)
-                    emissor.movzxRaxAl()
-                    emissor.storeRaxRbp(offRegObj(fn.tamanhoLocaisBytes, inst.dst))
-                    caso OpI.TruncSext:
-                    emissor.loadRaxRbp(offRegObj(fn.tamanhoLocaisBytes, inst.a))
-                    emissor.truncRax(inst.largura, falso)
-                    emissor.storeRaxRbp(offRegObj(fn.tamanhoLocaisBytes, inst.dst))
-                    caso OpI.TruncZext:
-                    emissor.loadRaxRbp(offRegObj(fn.tamanhoLocaisBytes, inst.a))
-                    emissor.truncRax(inst.largura, verdadeiro)
-                    emissor.storeRaxRbp(offRegObj(fn.tamanhoLocaisBytes, inst.dst))
-                    caso OpI.ItoF:
-                    emissor.loadRaxRbp(offRegObj(fn.tamanhoLocaisBytes, inst.a))
-                    emissor.u8(242)
-                    emissor.u8(72)
-                    emissor.u8(15)
-                    emissor.u8(42)
-                    emissor.u8(192)
-                    emissor.storeXmmRbpDisp(0, -offRegObj(fn.tamanhoLocaisBytes, inst.dst))
-                    caso OpI.UItoF:
-                    emissor.loadRaxRbp(offRegObj(fn.tamanhoLocaisBytes, inst.a))
-                    emissor.emitirUItoF()
-                    emissor.storeXmmRbpDisp(0, -offRegObj(fn.tamanhoLocaisBytes, inst.dst))
-                    caso OpI.FtoI:
-                    emissor.loadXmmRbpDisp(0, -offRegObj(fn.tamanhoLocaisBytes, inst.a))
-                    emissor.u8(242)
-                    emissor.u8(72)
-                    emissor.u8(15)
-                    emissor.u8(44)
-                    emissor.u8(192)
-                    emissor.storeRaxRbp(offRegObj(fn.tamanhoLocaisBytes, inst.dst))
-                    caso OpI.FtoUI:
-                    emissor.loadXmmRbpDisp(0, -offRegObj(fn.tamanhoLocaisBytes, inst.a))
-                    emissor.emitirFtoUI()
-                    emissor.storeRaxRbp(offRegObj(fn.tamanhoLocaisBytes, inst.dst))
-                    caso OpI.FNeg:
-                    emissor.loadXmmRbpDisp(0, -offRegObj(fn.tamanhoLocaisBytes, inst.a))
-                    emissor.movRaxImm64(-9223372036854775807 - 1)
-                    emissor.u8(102)
-                    emissor.u8(72)
-                    emissor.u8(15)
-                    emissor.u8(110)
-                    emissor.u8(200)
-                    emissor.u8(102)
-                    emissor.u8(15)
-                    emissor.u8(87)
-                    emissor.u8(193)
-                    emissor.storeXmmRbpDisp(0, -offRegObj(fn.tamanhoLocaisBytes, inst.dst))
-                    caso OpI.FAdd:
-                    caso OpI.FSub:
-                    caso OpI.FMul:
-                    caso OpI.FDiv:
-                    emissor.loadXmmRbpDisp(0, -offRegObj(fn.tamanhoLocaisBytes, inst.a))
-                    emissor.loadXmmRbpDisp(1, -offRegObj(fn.tamanhoLocaisBytes, inst.b))
-                    emissor.u8(242)
-                    emissor.u8(15)
-                    se (op == OpI.FAdd) emissor.u8(88)
-                    senao se (op == OpI.FSub) emissor.u8(92)
-                    senao se (op == OpI.FMul) emissor.u8(89)
-                    senao emissor.u8(94)
-                    emissor.u8(193)
-                    emissor.storeXmmRbpDisp(0, -offRegObj(fn.tamanhoLocaisBytes, inst.dst))
-                    caso OpI.FEq:
-                    caso OpI.FNeq:
-                    caso OpI.FLt:
-                    caso OpI.FLe:
-                    caso OpI.FGt:
-                    caso OpI.FGe:
-                    emissor.loadXmmRbpDisp(0, -offRegObj(fn.tamanhoLocaisBytes, inst.a))
-                    emissor.loadXmmRbpDisp(1, -offRegObj(fn.tamanhoLocaisBytes, inst.b))
-                    emissor.emitirCompFloat(op, OpI)
-                    emissor.storeRaxRbp(offRegObj(fn.tamanhoLocaisBytes, inst.dst))
-                    caso OpI.Br:
-                    emissor.jmpLabel("bb_" + fn.nome + "_" + inst.alvo1)
-                    caso OpI.BrCond:
-                    emissor.loadRaxRbp(offRegObj(fn.tamanhoLocaisBytes, inst.a))
-                    emissor.testRaxRax()
-                    emissor.jzLabel("bb_" + fn.nome + "_" + inst.alvo2)
-                    emissor.jmpLabel("bb_" + fn.nome + "_" + inst.alvo1)
-                    caso OpI.Ret:
-                    emissor.loadRaxRbp(offRegObj(fn.tamanhoLocaisBytes, inst.a))
-                    emissor.movRspRbp()
-                    emissor.popRbp()
-                    emissor.retInst()
-                    caso OpI.RetPair:
-                    emissor.loadRaxRbp(offRegObj(fn.tamanhoLocaisBytes, inst.a))
-                    emissor.loadRdxRbp(offRegObj(fn.tamanhoLocaisBytes, inst.b))
-                    emissor.movRspRbp()
-                    emissor.popRbp()
-                    emissor.retInst()
-                    caso OpI.FRet:
-                    se (inst.largura == 4) {
-                        emissor.cvtsd2ssXmmFromRbpDisp(0, -offRegObj(fn.tamanhoLocaisBytes,
-                            inst.a))
-                    } senao {
-                        emissor.loadXmmRbpDisp(0, -offRegObj(fn.tamanhoLocaisBytes, inst.a))
-                    }
-                    emissor.movRspRbp()
-                    emissor.popRbp()
-                    emissor.retInst()
-                    caso OpI.Call:
-                    emitirCallObj(emissor, fn, inst, funcoesWeak.contem(inst.alvo1), falso)
-                    caso OpI.CallExtern:
-                    emitirCallObj(emissor, fn, inst, verdadeiro, falso)
-                    caso OpI.CallIndirect:
-                    emitirCallObj(emissor, fn, inst, falso, verdadeiro)
-                    padrao:
-                    emissor.loadRaxRbp(offRegObj(fn.tamanhoLocaisBytes, inst.a))
-                    emissor.loadRcxRbp(offRegObj(fn.tamanhoLocaisBytes, inst.b))
-                    emissor.emitirBinariaInt(op, OpI, inst.largura, inst.ehSemSinal)
-                    emissor.storeRaxRbp(offRegObj(fn.tamanhoLocaisBytes, inst.dst))
+            } senao se (largP <= 16) {
+                se (pInt + 2 <= 6) {
+                    emissor.storeArgAbiRbp(pInt, offP)
+                    emissor.storeArgAbiRbp(pInt + 1, offP - 8)
+                    pInt = pInt + 2
+                } senao {
+                    emissor.loadRaxRbpDisp(16 + pStk * 8)
+                    emissor.storeRaxRbp(offP)
+                    emissor.loadRaxRbpDisp(16 + (pStk + 1) * 8)
+                    emissor.storeRaxRbp(offP - 8)
+                    pStk = pStk + 2
                 }
+            } senao {
+                const nQ: inteiro = (largP + 7) \ 8
+                para (var q: inteiro = 0; q < nQ; q++) {
+                    emissor.loadRaxRbpDisp(16 + (pStk + q) * 8)
+                    emissor.storeRaxRbpDisp(-offP + q * 8)
+                }
+                pStk = pStk + nQ
+            }
+            continua
+        }
+
+        se (ehFltP) {
+            se (pFlt < 8) {
+                se (largP == 4) {
+                    emissor.storeXmmFloatRbpDisp(pFlt, -offP)
+                } senao {
+                    emissor.storeXmmRbpDisp(pFlt, -offP)
+                }
+                pFlt++
+            } senao {
+                const stkOff: inteiro = 16 + pStk * 8
+                se (largP == 4) {
+                    emissor.loadXmmFloatRbpDisp(0, stkOff)
+                    emissor.storeXmmFloatRbpDisp(0, -offP)
+                } senao {
+                    emissor.loadXmmRbpDisp(0, stkOff)
+                    emissor.storeXmmRbpDisp(0, -offP)
+                }
+                pStk++
+            }
+        } senao {
+            se (pInt < 6) {
+                emissor.storeArgAbiRbp(pInt, offP)
+                pInt++
+            } senao {
+                const stkOff: inteiro = 16 + pStk * 8
+                emissor.loadRaxRbpDisp(stkOff)
+                emissor.storeRaxRbp(offP)
+                pStk++
             }
         }
-        const tamFn: inteiro = emissor.code.tamanho() - inicioFn
-        obj.simbolos.empilhar(emMod.SimboloObj(fn.nome, "TEXT", inicioFn, tamFn, !fn.ehStatic,
-            elfComum.STT_FUNC, fn.ehWeak))
-        fn.blocos = []
     }
 
-    emissor.resolverPatchesInternos()
-    obj.textBytes = emissor.code
-    obj.relocsText = emissor.relocs
+    para (var b: inteiro = 0; b < fn.blocos.tamanho(); b++) {
+        const bb: qualquer = fn.blocos[b]
+        emissor.marcarLabel("bb_" + fn.nome + "_" + bb.nome)
+        var regEmRax: inteiro = -1
+
+        para (var i: inteiro = 0; i < bb.insts.tamanho(); i++) {
+            const inst: qualquer = bb.insts[i]
+            const op: qualquer = inst.op
+
+            escolha (op) {
+                caso OpI.Const:
+                emissor.movRaxImm64(inst.a)
+                emissor.storeRaxRbp(offRegObj(fn.tamanhoLocaisBytes, inst.dst))
+                regEmRax = inst.dst
+                caso OpI.FConst:
+                const fBits: inteiro = inst.b != 0 ? inst.a : tMod.doubleParaBitsIEEE754(inst.fval)
+                emissor.movRaxImm64(fBits)
+                emissor.storeRaxRbp(offRegObj(fn.tamanhoLocaisBytes, inst.dst))
+                regEmRax = inst.dst
+                caso OpI.Copy:
+                se (regEmRax != inst.a) emissor.loadRaxRbp(offRegObj(fn.tamanhoLocaisBytes,
+                    inst.a))
+                emissor.storeRaxRbp(offRegObj(fn.tamanhoLocaisBytes, inst.dst))
+                regEmRax = inst.dst
+                caso OpI.AddrSlot:
+                emissor.leaRaxRbp(inst.a)
+                emissor.storeRaxRbp(offRegObj(fn.tamanhoLocaisBytes, inst.dst))
+                regEmRax = inst.dst
+                caso OpI.AddrRbpDisp:
+                emissor.leaRaxRbpDisp(inst.a)
+                emissor.storeRaxRbp(offRegObj(fn.tamanhoLocaisBytes, inst.dst))
+                regEmRax = inst.dst
+                caso OpI.AddrGlobal:
+                se (globaisWeak.contem(inst.alvo1)) {
+                    emissor.leaRaxRipReloc(inst.alvo1, -4)
+                } senao {
+                    const secG: texto = texto(mapaGlobalSec[inst.alvo1])
+                    const offG: inteiro = inteiro(mapaGlobalOff[inst.alvo1])
+                    emissor.leaRaxRipReloc(secG, offG - 4)
+                }
+                emissor.storeRaxRbp(offRegObj(fn.tamanhoLocaisBytes, inst.dst))
+                regEmRax = inst.dst
+                caso OpI.AddrExternGlobal:
+                emissor.movRaxGotReloc(inst.alvo1)
+                emissor.storeRaxRbp(offRegObj(fn.tamanhoLocaisBytes, inst.dst))
+                regEmRax = inst.dst
+                caso OpI.AddrExternTls:
+                externosTls[inst.alvo1] = verdadeiro
+                emissor.movRaxTlsGotReloc(inst.alvo1)
+                emissor.storeRaxRbp(offRegObj(fn.tamanhoLocaisBytes, inst.dst))
+                regEmRax = inst.dst
+                caso OpI.AddrFunc:
+                se (funcoesWeak.contem(inst.alvo1)) {
+                    emissor.leaRaxRipReloc(inst.alvo1, -4)
+                } senao se (funcoesLocais.contem(inst.alvo1)) {
+                    emissor.leaRaxRipLabel("fn_" + inst.alvo1)
+                } senao {
+                    externosExtras[inst.alvo1] = verdadeiro
+                    emissor.movRaxGotReloc(inst.alvo1)
+                }
+                emissor.storeRaxRbp(offRegObj(fn.tamanhoLocaisBytes, inst.dst))
+                regEmRax = inst.dst
+                caso OpI.AddrStr:
+                emissor.leaRaxRipReloc(".rodata", strOffsets[inst.a] - 4)
+                emissor.storeRaxRbp(offRegObj(fn.tamanhoLocaisBytes, inst.dst))
+                regEmRax = inst.dst
+                caso OpI.Alloca:
+                se (regEmRax != inst.a) emissor.loadRaxRbp(offRegObj(fn.tamanhoLocaisBytes,
+                    inst.a))
+                emissor.u8(72)
+                emissor.u8(131)
+                emissor.u8(192)
+                emissor.u8(15)
+                emissor.u8(72)
+                emissor.u8(131)
+                emissor.u8(224)
+                emissor.u8(240)
+                emissor.u8(72)
+                emissor.u8(41)
+                emissor.u8(196)
+                emissor.u8(72)
+                emissor.u8(137)
+                emissor.u8(224)
+                emissor.storeRaxRbp(offRegObj(fn.tamanhoLocaisBytes, inst.dst))
+                regEmRax = inst.dst
+                caso OpI.Load:
+                se (regEmRax != inst.a) emissor.loadRaxRbp(offRegObj(fn.tamanhoLocaisBytes,
+                    inst.a))
+                emissor.loadSizedFromPtrRax(inst.largura, inst.ehSemSinal)
+                emissor.storeRaxRbp(offRegObj(fn.tamanhoLocaisBytes, inst.dst))
+                regEmRax = inst.dst
+                caso OpI.Store:
+                se (regEmRax != inst.a) emissor.loadRaxRbp(offRegObj(fn.tamanhoLocaisBytes,
+                    inst.a))
+                emissor.loadRcxRbp(offRegObj(fn.tamanhoLocaisBytes, inst.b))
+                emissor.storeSizedRcxToPtrRax(inst.largura)
+                regEmRax = -1
+                caso OpI.FLoad:
+                se (regEmRax != inst.a) emissor.loadRaxRbp(offRegObj(fn.tamanhoLocaisBytes,
+                    inst.a))
+                emissor.floadFromPtrRax(inst.largura)
+                emissor.storeXmmRbpDisp(0, -offRegObj(fn.tamanhoLocaisBytes, inst.dst))
+                regEmRax = -1
+                caso OpI.FStore:
+                se (regEmRax != inst.a) emissor.loadRaxRbp(offRegObj(fn.tamanhoLocaisBytes,
+                    inst.a))
+                emissor.loadXmmRbpDisp(0, -offRegObj(fn.tamanhoLocaisBytes, inst.b))
+                emissor.fstoreToPtrRax(inst.largura)
+                regEmRax = -1
+                caso OpI.Neg:
+                se (regEmRax != inst.a) emissor.loadRaxRbp(offRegObj(fn.tamanhoLocaisBytes,
+                    inst.a))
+                se (inst.largura != 4) emissor.u8(72)
+                emissor.u8(247)
+                emissor.u8(216)
+                se (inst.largura == 4 e !inst.ehSemSinal) emissor.truncRax(4, falso)
+                emissor.storeRaxRbp(offRegObj(fn.tamanhoLocaisBytes, inst.dst))
+                regEmRax = inst.dst
+                caso OpI.BitNot:
+                se (regEmRax != inst.a) emissor.loadRaxRbp(offRegObj(fn.tamanhoLocaisBytes,
+                    inst.a))
+                se (inst.largura != 4) emissor.u8(72)
+                emissor.u8(247)
+                emissor.u8(208)
+                se (inst.largura == 4 e !inst.ehSemSinal) emissor.truncRax(4, falso)
+                emissor.storeRaxRbp(offRegObj(fn.tamanhoLocaisBytes, inst.dst))
+                regEmRax = inst.dst
+                caso OpI.LogNot:
+                se (regEmRax != inst.a) emissor.loadRaxRbp(offRegObj(fn.tamanhoLocaisBytes,
+                    inst.a))
+                emissor.testRaxRax()
+                emissor.u8(15)
+                emissor.u8(148)
+                emissor.u8(192)
+                emissor.movzxRaxAl()
+                emissor.storeRaxRbp(offRegObj(fn.tamanhoLocaisBytes, inst.dst))
+                regEmRax = inst.dst
+                caso OpI.ToBool:
+                se (regEmRax != inst.a) emissor.loadRaxRbp(offRegObj(fn.tamanhoLocaisBytes,
+                    inst.a))
+                emissor.testRaxRax()
+                emissor.u8(15)
+                emissor.u8(149)
+                emissor.u8(192)
+                emissor.movzxRaxAl()
+                emissor.storeRaxRbp(offRegObj(fn.tamanhoLocaisBytes, inst.dst))
+                regEmRax = inst.dst
+                caso OpI.TruncSext:
+                se (regEmRax != inst.a) emissor.loadRaxRbp(offRegObj(fn.tamanhoLocaisBytes,
+                    inst.a))
+                emissor.truncRax(inst.largura, falso)
+                emissor.storeRaxRbp(offRegObj(fn.tamanhoLocaisBytes, inst.dst))
+                regEmRax = inst.dst
+                caso OpI.TruncZext:
+                se (regEmRax != inst.a) emissor.loadRaxRbp(offRegObj(fn.tamanhoLocaisBytes,
+                    inst.a))
+                emissor.truncRax(inst.largura, verdadeiro)
+                emissor.storeRaxRbp(offRegObj(fn.tamanhoLocaisBytes, inst.dst))
+                regEmRax = inst.dst
+                caso OpI.ItoF:
+                se (regEmRax != inst.a) emissor.loadRaxRbp(offRegObj(fn.tamanhoLocaisBytes,
+                    inst.a))
+                emissor.u8(242)
+                emissor.u8(72)
+                emissor.u8(15)
+                emissor.u8(42)
+                emissor.u8(192)
+                emissor.storeXmmRbpDisp(0, -offRegObj(fn.tamanhoLocaisBytes, inst.dst))
+                regEmRax = -1
+                caso OpI.UItoF:
+                se (regEmRax != inst.a) emissor.loadRaxRbp(offRegObj(fn.tamanhoLocaisBytes,
+                    inst.a))
+                emissor.emitirUItoF()
+                emissor.storeXmmRbpDisp(0, -offRegObj(fn.tamanhoLocaisBytes, inst.dst))
+                regEmRax = -1
+                caso OpI.FtoI:
+                emissor.loadXmmRbpDisp(0, -offRegObj(fn.tamanhoLocaisBytes, inst.a))
+                emissor.u8(242)
+                emissor.u8(72)
+                emissor.u8(15)
+                emissor.u8(44)
+                emissor.u8(192)
+                emissor.storeRaxRbp(offRegObj(fn.tamanhoLocaisBytes, inst.dst))
+                regEmRax = inst.dst
+                caso OpI.FtoUI:
+                emissor.loadXmmRbpDisp(0, -offRegObj(fn.tamanhoLocaisBytes, inst.a))
+                emissor.emitirFtoUI()
+                emissor.storeRaxRbp(offRegObj(fn.tamanhoLocaisBytes, inst.dst))
+                regEmRax = inst.dst
+                caso OpI.FNeg:
+                emissor.loadXmmRbpDisp(0, -offRegObj(fn.tamanhoLocaisBytes, inst.a))
+                emissor.movRaxImm64(-9223372036854775807 - 1)
+                emissor.u8(102)
+                emissor.u8(72)
+                emissor.u8(15)
+                emissor.u8(110)
+                emissor.u8(200)
+                emissor.u8(102)
+                emissor.u8(15)
+                emissor.u8(87)
+                emissor.u8(193)
+                emissor.storeXmmRbpDisp(0, -offRegObj(fn.tamanhoLocaisBytes, inst.dst))
+                regEmRax = -1
+                caso OpI.FAdd:
+                caso OpI.FSub:
+                caso OpI.FMul:
+                caso OpI.FDiv:
+                emissor.loadXmmRbpDisp(0, -offRegObj(fn.tamanhoLocaisBytes, inst.a))
+                emissor.loadXmmRbpDisp(1, -offRegObj(fn.tamanhoLocaisBytes, inst.b))
+                emissor.u8(242)
+                emissor.u8(15)
+                se (op == OpI.FAdd) emissor.u8(88)
+                senao se (op == OpI.FSub) emissor.u8(92)
+                senao se (op == OpI.FMul) emissor.u8(89)
+                senao emissor.u8(94)
+                emissor.u8(193)
+                emissor.storeXmmRbpDisp(0, -offRegObj(fn.tamanhoLocaisBytes, inst.dst))
+                regEmRax = -1
+                caso OpI.FEq:
+                caso OpI.FNeq:
+                caso OpI.FLt:
+                caso OpI.FLe:
+                caso OpI.FGt:
+                caso OpI.FGe:
+                emissor.loadXmmRbpDisp(0, -offRegObj(fn.tamanhoLocaisBytes, inst.a))
+                emissor.loadXmmRbpDisp(1, -offRegObj(fn.tamanhoLocaisBytes, inst.b))
+                emissor.emitirCompFloat(op, OpI)
+                emissor.storeRaxRbp(offRegObj(fn.tamanhoLocaisBytes, inst.dst))
+                regEmRax = inst.dst
+                caso OpI.Br:
+                emissor.jmpLabel("bb_" + fn.nome + "_" + inst.alvo1)
+                regEmRax = -1
+                caso OpI.BrCond:
+                se (regEmRax != inst.a) emissor.loadRaxRbp(offRegObj(fn.tamanhoLocaisBytes,
+                    inst.a))
+                emissor.testRaxRax()
+                emissor.jzLabel("bb_" + fn.nome + "_" + inst.alvo2)
+                emissor.jmpLabel("bb_" + fn.nome + "_" + inst.alvo1)
+                regEmRax = -1
+                caso OpI.Ret:
+                se (regEmRax != inst.a) emissor.loadRaxRbp(offRegObj(fn.tamanhoLocaisBytes,
+                    inst.a))
+                emissor.movRspRbp()
+                emissor.popRbp()
+                emissor.retInst()
+                regEmRax = -1
+                caso OpI.RetPair:
+                se (regEmRax != inst.a) emissor.loadRaxRbp(offRegObj(fn.tamanhoLocaisBytes,
+                    inst.a))
+                emissor.loadRdxRbp(offRegObj(fn.tamanhoLocaisBytes, inst.b))
+                emissor.movRspRbp()
+                emissor.popRbp()
+                emissor.retInst()
+                regEmRax = -1
+                caso OpI.FRet:
+                se (inst.largura == 4) {
+                    emissor.cvtsd2ssXmmFromRbpDisp(0, -offRegObj(fn.tamanhoLocaisBytes, inst.a))
+                } senao {
+                    emissor.loadXmmRbpDisp(0, -offRegObj(fn.tamanhoLocaisBytes, inst.a))
+                }
+                emissor.movRspRbp()
+                emissor.popRbp()
+                emissor.retInst()
+                regEmRax = -1
+                caso OpI.Call:
+                emitirCallObj(emissor, fn, inst, funcoesWeak.contem(inst.alvo1), falso)
+                regEmRax = (inst.dst >= 0 e !inst.ehFloatDst) ? inst.dst : -1
+                caso OpI.CallExtern:
+                emitirCallObj(emissor, fn, inst, verdadeiro, falso)
+                regEmRax = (inst.dst >= 0 e !inst.ehFloatDst) ? inst.dst : -1
+                caso OpI.CallIndirect:
+                emitirCallObj(emissor, fn, inst, falso, verdadeiro)
+                regEmRax = (inst.dst >= 0 e !inst.ehFloatDst) ? inst.dst : -1
+                padrao:
+                se (regEmRax != inst.a) emissor.loadRaxRbp(offRegObj(fn.tamanhoLocaisBytes,
+                    inst.a))
+                emissor.loadRcxRbp(offRegObj(fn.tamanhoLocaisBytes, inst.b))
+                emissor.emitirBinariaInt(op, OpI, inst.largura, inst.ehSemSinal)
+                emissor.storeRaxRbp(offRegObj(fn.tamanhoLocaisBytes, inst.dst))
+                regEmRax = inst.dst
+            }
+        }
+    }
+
+    emissor.resolverPatchesFuncao(inicioPatches)
+    const tamFn: inteiro = emissor.code.tamanho() - inicioFn
+    retorna tupla([inicioFn, tamFn])
+}
+
+funcao emitirFuncaoStreaming(ctx: ContextoCodegenStreaming, fn: qualquer): vazio {
+    const emMod: qualquer = importar("emissor.delegua")
+    const elfComum: qualquer = importar("../../object/elf/elf_comum.delegua")
+    const span: (inteiro, inteiro) = emitirFuncaoParaEmissor(ctx.emissor, fn, ctx.strOffsets,
+        ctx.mapaGlobalSec, ctx.mapaGlobalOff, ctx.globaisWeak, ctx.funcoesLocais, ctx.funcoesWeak,
+        ctx.externosExtras, ctx.externosTls)
+    ctx.simbolosFuncoes.empilhar(emMod.SimboloObj(fn.nome, "TEXT", span[0], span[1], !fn.ehStatic,
+        elfComum.STT_FUNC, fn.ehWeak))
+    fn.blocos = []
+}
+
+funcao finalizarCodegenStreaming(ctx: ContextoCodegenStreaming, modulo: qualquer): qualquer {
+    const emMod: qualquer = importar("emissor.delegua")
+    const elfComum: qualquer = importar("../../object/elf/elf_comum.delegua")
+    sincronizarModuloStreaming(ctx, modulo)
+
+    const obj: qualquer = ctx.obj
+    para (var i: inteiro = 0; i < ctx.simbolosFuncoes.tamanho(); i++) {
+        obj.simbolos.empilhar(ctx.simbolosFuncoes[i])
+    }
+
+    ctx.simbolosFuncoes = []
+
+    ctx.emissor.resolverPatchesInternos()
+    obj.textBytes = ctx.emissor.code
+    obj.relocsText = ctx.emissor.relocs
 
     // Registra simbolos externos indefinidos (funcoes e dados)
     var extVistos: dicionario = {}
@@ -605,12 +717,12 @@ funcao gerarCodigoObjetoX86_64(modulo: qualquer): qualquer {
         const nm: texto = modulo.externosDados[i]
         se (!extVistos.contem(nm)) {
             extVistos[nm] = verdadeiro
-            const tipoSymExt: inteiro = externosTls.contem(nm) ? elfComum.STT_TLS : elfComum.STT_NOTYPE
+            const tipoSymExt: inteiro = ctx.externosTls.contem(nm) ? elfComum.STT_TLS : elfComum.STT_NOTYPE
             obj.simbolos.empilhar(emMod.SimboloObj(nm, "UNDEF", 0, 0, verdadeiro, tipoSymExt))
         }
     }
 
-    const chavesEx: texto[] = externosExtras.chaves()
+    const chavesEx: texto[] = ctx.externosExtras.chaves()
     para (var i: inteiro = 0; i < chavesEx.tamanho(); i++) {
         const nm: texto = chavesEx[i]
         se (!extVistos.contem(nm)) {
@@ -620,4 +732,21 @@ funcao gerarCodigoObjetoX86_64(modulo: qualquer): qualquer {
     }
 
     retorna obj
+}
+
+funcao gerarCodigoObjetoX86_64(modulo: qualquer): qualquer {
+    var funcoesLocais: dicionario = {}
+    var funcoesWeak: dicionario = {}
+    para (var f: inteiro = 0; f < modulo.funcoes.tamanho(); f++) {
+        funcoesLocais[modulo.funcoes[f].nome] = verdadeiro
+        se (modulo.funcoes[f].ehWeak) funcoesWeak[modulo.funcoes[f].nome] = verdadeiro
+    }
+
+    const ctx: ContextoCodegenStreaming = iniciarCodegenStreaming(modulo, funcoesLocais,
+        funcoesWeak)
+    para (var f: inteiro = 0; f < modulo.funcoes.tamanho(); f++) {
+        emitirFuncaoStreaming(ctx, modulo.funcoes[f])
+    }
+
+    retorna finalizarCodegenStreaming(ctx, modulo)
 }

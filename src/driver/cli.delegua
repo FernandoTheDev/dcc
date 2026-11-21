@@ -1,8 +1,9 @@
 // Driver CLI completo do DCC (Delegua C Compiler).
 // Suporta compilacao de .c -> -E / -S / -c (.o ELF64) / executavel ELF64 via linker nativo,
 // combinando arquivos .c, .o e bibliotecas estaticas .a (inclusive objetos de GCC/Clang).
-// Utiliza a biblioteca padrao CGD (cgd:io, cgd:caminhos, cgd:textos, cgd:arquivos, cgd:bytes,
-// cgd:processo, cgd:tempo) e envia todos os erros e avisos exclusivamente para stderr.
+// Ciclo V: pipeline streaming por funcao com cgd:memoria.Arena, paralelismo adaptativo
+// multi-TU (Processo.executarLote), backend paralelo intra-TU por janelas (rotina + BytesCongelado)
+// e linker ELF64 paralelo deterministico (-j 1/2/4/8/auto, --parallel=off/auto).
 
 @definicao(biblioteca = "c", abi = "c")
 classe estrangeira LibCChmod {
@@ -21,17 +22,10 @@ funcao trocarExtensaoLocal(caminho: texto, novaExt: texto): texto {
     retorna camMod.Caminhos.semExtensao(baseNome) + novaExt
 }
 
-// Grava buffer binario cgd:bytes em disco sem interpolar caminhos em comando shell;
+// Grava buffer binario cgd:bytes diretamente em disco via runtime nativo (sem subprocesso base64);
 // aplica permissao 0755 diretamente via syscall POSIX chmod (FFI).
 funcao gravarBinarioBytes(caminhoSaida: texto, b: qualquer, executavel: logico): vazio {
-    const procMod: qualquer = importar("cgd:processo")
-    const res: qualquer = procMod.Processo.executar("/bin/sh", [
-        "-c",
-        "exec base64 -d > \"$1\"",
-        "_",
-        caminhoSaida
-    ], "", {}, 60000, 65536, b.paraBase64())
-    res.exigirSucesso()
+    b.gravarArquivo(caminhoSaida)
     se (executavel) {
         LibCChmod.chmodArq(caminhoSaida, 493) // 0755
     }
@@ -42,14 +36,51 @@ funcao gravarBinario(caminhoSaida: texto, vetorBytes: qualquer, executavel: logi
     gravarBinarioBytes(caminhoSaida, bytesMod.Bytes.deVetor(vetorBytes), executavel)
 }
 
-funcao lerBinario(caminho: texto): inteiro[] {
+funcao lerBinarioBytes(caminho: texto): qualquer {
     const bytesMod: qualquer = importar("cgd:bytes")
-    const procMod: qualquer = importar("cgd:processo")
-    const res: qualquer = procMod.Processo.executar("base64", ["-w", "0", caminho], "", {},
-        15000, 67108864)
-    res.exigirSucesso()
-    const b64: texto = res.saidaPadrao().aparar()
-    retorna bytesMod.Bytes.deBase64(b64).paraVetor()
+    retorna bytesMod.Bytes.lerArquivo(caminho)
+}
+
+funcao lerBinario(caminho: texto): inteiro[] {
+    retorna lerBinarioBytes(caminho).paraVetor()
+}
+
+funcao parseIntPositivoEstrito(s: texto): inteiro {
+    se (s.tamanho() == 0) retorna -1
+    var acc: inteiro = 0
+    para (var i: inteiro = 0; i < s.tamanho(); i++) {
+        const ch: texto = s[i]
+        var d: inteiro = -1
+        se (ch == "0") d = 0
+        senao se (ch == "1") d = 1
+        senao se (ch == "2") d = 2
+        senao se (ch == "3") d = 3
+        senao se (ch == "4") d = 4
+        senao se (ch == "5") d = 5
+        senao se (ch == "6") d = 6
+        senao se (ch == "7") d = 7
+        senao se (ch == "8") d = 8
+        senao se (ch == "9") d = 9
+        se (d < 0) retorna -1
+        acc = acc * 10 + d
+        se (acc > 1024) retorna 1024
+    }
+
+    se (acc <= 0) retorna -1
+    retorna acc
+}
+
+// Resolve quantidade efetiva de workers respeitando afinidade de CPU, quotas cgroup e memoria disponivel.
+// jobsSolicitado == 0 significa modo adaptativo (-j auto).
+funcao resolverWorkersEfetivos(jobsSolicitado: inteiro, memPorTarefaBytes: inteiro = 134217728): inteiro {
+    se (jobsSolicitado == 1) retorna 1
+    se (jobsSolicitado > 1) {
+        retorna jobsSolicitado > 32 ? 32 : jobsSolicitado
+    }
+
+    const asyncMod: qualquer = importar("cgd:assincrono")
+    const rec: inteiro = asyncMod.Rotinas.workersRecomendados(memPorTarefaBytes)
+    retorna rec < 1 ? 1 : rec
 }
 
 // Busca primeiro biblioteca estatica lib<nome>.a em -L; se nao achar, mapeia para .so dinamica.
@@ -77,7 +108,7 @@ funcao resolverBibliotecaCli(nomeL: texto, dirsLib: texto[]): (texto, logico) {
 funcao imprimirAjuda(): vazio {
     escreva("Uso: dcc [opcoes] arquivo1.c|arquivo1.o|lib.a [arquivo2...]")
     escreva("")
-    escreva("DCC - Delegua C Compiler v0.2.0 (Linux x86-64 / System V AMD64 ABI)")
+    escreva("DCC - Delegua C Compiler v0.3.0 (Linux x86-64 / System V AMD64 ABI)")
     escreva("")
     escreva("Opcoes:")
     escreva("  -o <arquivo>                 Define o arquivo de saida (padrao: a.out)")
@@ -92,15 +123,233 @@ funcao imprimirAjuda(): vazio {
     escreva("  -std=c99                     Modo ISO C99 (padrao)")
     escreva("  -std=gnu99                   Modo C99 com extensoes GNU delimitadas")
     escreva("  -O0, -O1, -O2, -O3           Nivel de otimizacao da IR SSA")
+    escreva("  -j <N|auto>                  Numero de workers paralelos (ou 'auto' adaptativo)")
+    escreva("  --parallel=off|auto          Desativa ou ativa paralelismo adaptativo")
     escreva("  -Wall, -Wextra               Ativa avisos adicionais")
     escreva("  -Werror                      Trata avisos como erros")
     escreva("  -Wno-<categoria>             Suprime avisos da categoria especificada")
     escreva("  -fdiagnostics-color=<modo>   Cores ANSI nos diagnosticos: auto, always, never")
     escreva("  -fdiagnostics-format=<fmt>   Formato de diagnosticos: text, json")
     escreva("  -ftime-report                Exibe tempo detalhado por fase de compilacao em stderr")
+    escreva("  -fmem-report                 Exibe telemetria de memoria/GC por fase em stderr")
     escreva("  -v                           Modo detalhado (verbose)")
     escreva("  --version                    Exibe versao e alvo")
     escreva("  --help                       Exibe esta ajuda")
+}
+
+funcao registrarMemoriaFase(ativo: logico, marcador: texto, extra: texto = ""): vazio {
+    se (!ativo) retorna
+    const memMod: qualquer = importar("cgd:memoria")
+    const m: dicionario = memMod.Memoria.estatisticas()
+    const rssMb: inteiro = inteiro(m["rssBytes"]) \ 1048576
+    const hwmMb: inteiro = inteiro(m["hwmBytes"]) \ 1048576
+    const pssMb: inteiro = inteiro(m["pssBytes"]) \ 1048576
+    const heapMb: inteiro = inteiro(m["heapBytes"]) \ 1048576
+    const freeMb: inteiro = inteiro(m["livresBytes"]) \ 1048576
+    const unmapMb: inteiro = inteiro(m["desmapeadosBytes"]) \ 1048576
+    const totMb: inteiro = inteiro(m["alocadosBytes"]) \ 1048576
+    const useMb: inteiro = inteiro(m["emUsoBytes"]) \ 1048576
+    const cyc: inteiro = inteiro(m["ciclosGC"])
+    const suf: texto = extra.tamanho() > 0 ? " " + extra : ""
+    escreverErro("[dcc-mem] ${marcador} rss=${rssMb}MiB hwm=${hwmMb}MiB pss=${pssMb}MiB gc_heap=${heapMb}MiB gc_free=${freeMb}MiB gc_unmap=${unmapMb}MiB gc_use=${useMb}MiB gc_total=${totMb}MiB gc_cyc=${cyc}${suf}")
+}
+
+funcao contarAstRec(no: qualquer, stats: inteiro[]): vazio {
+    se (no == nulo) retorna
+    stats[0] = stats[0] + 1
+    se (no.filhos == nulo ou no.filhos.tamanho() == 0) {
+        stats[1] = stats[1] + 1
+    } senao {
+        const n: inteiro = no.filhos.tamanho()
+        stats[2] = stats[2] + n
+        para (var i: inteiro = 0; i < n; i++) {
+            contarAstRec(no.filhos[i], stats)
+        }
+    }
+}
+
+funcao executarPreprocLexParse(arqPath: texto, dirsInclude: texto[], defsCli: texto[], undefsCli: texto[],
+    diag: qualquer, modoGnu: logico, verbose: logico, memReport: logico, tempos: real[]): (qualquer,
+    inteiro) {
+    const preMod: qualquer = importar("../preprocessor/preproc.delegua")
+    const lexMod: qualquer = importar("../lexer/lexer.delegua")
+    const parMod: qualquer = importar("../parser/parser.delegua")
+    const arquivos: qualquer = importar("cgd:arquivos")
+    const tempoMod: qualquer = importar("cgd:tempo")
+    const cron: qualquer = tempoMod.Cronometro()
+
+    cron.reiniciar()
+    registrarMemoriaFase(memReport, "PREPROCESS_START")
+    var resPre: qualquer = preMod.preprocessarDCC(arquivos.Arquivo(arqPath).ler(), arqPath,
+        dirsInclude, defsCli, undefsCli, diag, modoGnu)
+    const dtPre: real = cron.milisegundos()
+    tempos[0] = tempos[0] + dtPre
+    registrarMemoriaFase(memReport, "PREPROCESS_END", "includes=${resPre[1]} ppChars=${resPre[0].tamanho()}")
+    se (verbose) escreverErro("[dcc] preprocess concluido em ${inteiro(tempos[0])}ms (includes=${resPre[1]})")
+
+    cron.reiniciar()
+    registrarMemoriaFase(memReport, "LEX_START")
+    var tokens: qualquer = lexMod.tokenizarDCC(resPre[0], diag, modoGnu)
+    resPre = nulo
+    const nTokensTU: inteiro = tokens.tamanho()
+    const dtLex: real = cron.milisegundos()
+    tempos[1] = tempos[1] + dtLex
+    registrarMemoriaFase(memReport, "LEX_END", "tokens=${nTokensTU}")
+    se (verbose) escreverErro("[dcc] lex concluido em ${inteiro(tempos[1])}ms (tokens=${nTokensTU})")
+
+    cron.reiniciar()
+    registrarMemoriaFase(memReport, "PARSE_START")
+    const ast: qualquer = parMod.analisarSintaxeDCC(tokens, diag, modoGnu)
+    tokens.limpar()
+    tokens = nulo
+    const dtPar: real = cron.milisegundos()
+    tempos[2] = tempos[2] + dtPar
+    retorna tupla([ast, nTokensTU])
+}
+
+funcao executarSemaEIR(arqPath: texto, dirsInclude: texto[], defsCli: texto[], undefsCli: texto[],
+    diag: qualquer, modoGnu: logico, verbose: logico, memReport: logico, tempos: real[]): (qualquer,
+    inteiro) {
+    const semMod: qualquer = importar("../semantic/sema.delegua")
+    const irMod: qualquer = importar("../ir/ir_ssa.delegua")
+    const tempoMod: qualquer = importar("cgd:tempo")
+    const memMod: qualquer = importar("cgd:memoria")
+    const cron: qualquer = tempoMod.Cronometro()
+
+    const resFront: (qualquer, inteiro) = executarPreprocLexParse(arqPath, dirsInclude, defsCli,
+        undefsCli, diag, modoGnu, verbose, memReport, tempos)
+    const ast: qualquer = resFront[0]
+    const nTokensTU: inteiro = resFront[1]
+    se (nTokensTU > 20000) memMod.Memoria.coletar(verdadeiro)
+    se (memReport) {
+        var astStats: inteiro[] = [0, 0, 0]
+        contarAstRec(ast, astStats)
+        registrarMemoriaFase(memReport, "PARSE_END", "decls=${ast.filhos.tamanho()} astNodes=${astStats[0]} astLeaves=${astStats[1]} astEdges=${astStats[2]}")
+    }
+
+    se (verbose) escreverErro("[dcc] parse concluido em ${inteiro(tempos[2])}ms (decls=${ast.filhos.tamanho()})")
+
+    cron.reiniciar()
+    registrarMemoriaFase(memReport, "SEMA_START")
+    const resSema: qualquer = semMod.analisarSemanticaDCC(ast, diag, falso)
+    tempos[3] = tempos[3] + cron.milisegundos()
+    registrarMemoriaFase(memReport, "SEMA_END")
+    se (verbose) escreverErro("[dcc] sema concluido em ${inteiro(tempos[3])}ms")
+
+    cron.reiniciar()
+    registrarMemoriaFase(memReport, "IR_START")
+    const moduloSSA: qualquer = irMod.construirModuloSSA(ast, resSema.tabela)
+    ast.filhos.limpar()
+    tempos[4] = tempos[4] + cron.milisegundos()
+    retorna tupla([moduloSSA, nTokensTU])
+}
+
+// Pipeline streaming por funcao: sema-corpo -> IR -> opt+verify (Arena) -> codegen (sequencial ou paralelo
+// por janelas via rotinas CGD + Bytes congelado), mantendo determinismo bit a bit e reduzindo pico RSS.
+assincrona funcao compilarTUStreamingAsync(arqPath: texto, dirsInclude: texto[], defsCli: texto[],
+    undefsCli: texto[], diag: qualquer, modoGnu: logico, nivelOpt: inteiro, workers: inteiro,
+    verbose: logico, memReport: logico, tempos: real[]): qualquer {
+    const tMod: qualquer = importar("../types/tipos.delegua")
+    const semMod: qualquer = importar("../semantic/sema.delegua")
+    const irMod: qualquer = importar("../ir/ir_ssa.delegua")
+    const irTipos: qualquer = importar("../ir/ir_tipos.delegua")
+    const cgMod: qualquer = importar("../backend/x86_64/codegen.delegua")
+    const memMod: qualquer = importar("cgd:memoria")
+    const tempoMod: qualquer = importar("cgd:tempo")
+    const Kind: qualquer = tMod.NoKind
+    const cron: qualquer = tempoMod.Cronometro()
+
+    const resFront: (qualquer, inteiro) = executarPreprocLexParse(arqPath, dirsInclude, defsCli,
+        undefsCli, diag, modoGnu, verbose, memReport, tempos)
+    const ast: qualquer = resFront[0]
+    const nTokensTU: inteiro = resFront[1]
+    se (nTokensTU > 20000) memMod.Memoria.coletar(verdadeiro)
+    se (memReport) {
+        var astStats: inteiro[] = [0, 0, 0]
+        contarAstRec(ast, astStats)
+        registrarMemoriaFase(memReport, "PARSE_END", "decls=${ast.filhos.tamanho()} astNodes=${astStats[0]} astLeaves=${astStats[1]} astEdges=${astStats[2]}")
+    }
+
+    se (verbose) escreverErro("[dcc] parse concluido em ${inteiro(tempos[2])}ms (decls=${ast.filhos.tamanho()})")
+
+    // Passe 1 semantico: tipos, globais, assinaturas
+    cron.reiniciar()
+    registrarMemoriaFase(memReport, "SEMA_START")
+    const sema: qualquer = semMod.criarAnalisadorSemanticoDCC(diag)
+    const resSema: qualquer = sema.prepararGlobaisEAssinaturas(ast, falso)
+    tempos[3] = tempos[3] + cron.milisegundos()
+
+    // Globais iniciais do modulo SSA e tabela de funcoes locais
+    cron.reiniciar()
+    registrarMemoriaFase(memReport, "IR_START")
+    const moduloSSA: qualquer = irMod.criarModuloComGlobaisSSA(ast, resSema.tabela)
+    var funcoesLocais: dicionario = {}
+    var funcoesWeak: dicionario = {}
+    var astFuncoes: qualquer[] = []
+    para (var idx: inteiro = 0; idx < ast.filhos.tamanho(); idx++) {
+        const no: qualquer = ast.filhos[idx]
+        se (no.kind == Kind.Funcao) {
+            funcoesLocais[no.nome] = verdadeiro
+            se (no.ehWeak) funcoesWeak[no.nome] = verdadeiro
+            astFuncoes.empilhar(no)
+        }
+    }
+
+    ast.filhos.limpar()
+    tempos[4] = tempos[4] + cron.milisegundos()
+
+    const ctxCg: qualquer = cgMod.iniciarCodegenStreaming(moduloSSA, funcoesLocais, funcoesWeak)
+    const nFuncoes: inteiro = astFuncoes.tamanho()
+    const usarBackendPar: logico = falso
+
+    const statsOpt: qualquer = irTipos.StatsSSA()
+    const arenaOpt: qualquer = memMod.Arena(65536, 67108864)
+
+    para (var f: inteiro = 0; f < nFuncoes; f++) {
+        const noFn: qualquer = astFuncoes[f]
+        astFuncoes[f] = nulo
+
+        cron.reiniciar()
+        sema.verificarCorpoFuncao(noFn)
+        tempos[3] = tempos[3] + cron.milisegundos()
+
+        cron.reiniciar()
+        const fnSSA: qualquer = irMod.construirFuncaoSSA(noFn, resSema.tabela, moduloSSA)
+        tempos[4] = tempos[4] + cron.milisegundos()
+
+        const nStrAtual: inteiro = moduloSSA.stringsBytes.tamanho() > 0 ? moduloSSA.stringsBytes.tamanho() : moduloSSA.strings.tamanho()
+        const nGlobAtual: inteiro = moduloSSA.globais.tamanho()
+
+        cron.reiniciar()
+        se (nivelOpt > 0) {
+            para (var p: inteiro = 0; p < nivelOpt; p++) {
+                irMod.otimizarFuncaoSSA(fnSSA, statsOpt, arenaOpt)
+            }
+        }
+        irMod.verificarFuncaoSSA(fnSSA, nStrAtual, nGlobAtual, arenaOpt)
+        tempos[5] = tempos[5] + cron.milisegundos()
+
+        cron.reiniciar()
+        cgMod.sincronizarModuloStreaming(ctxCg, moduloSSA)
+        cgMod.emitirFuncaoStreaming(ctxCg, fnSSA)
+        tempos[6] = tempos[6] + cron.milisegundos()
+
+        se ((f + 1) % 128 == 0) {
+            memMod.Memoria.coletarSeAcima(268435456, verdadeiro)
+        }
+    }
+
+    arenaOpt.liberar()
+    registrarMemoriaFase(memReport, "SEMA_END")
+    registrarMemoriaFase(memReport, "IR_END", "fns=${nFuncoes} streaming=1 workers=${usarBackendPar ? workers : 1} globais=${moduloSSA.globais.tamanho()} strs=${moduloSSA.stringsBytes.tamanho()}")
+
+    cron.reiniciar()
+    const codObj: qualquer = cgMod.finalizarCodegenStreaming(ctxCg, moduloSSA)
+    tempos[6] = tempos[6] + cron.milisegundos()
+    registrarMemoriaFase(memReport, "CODEGEN_END", "text=${codObj.textBytes.tamanho()}B rodata=${codObj.rodataBytes.tamanho()}B data=${codObj.dataBytes.tamanho()}B syms=${codObj.simbolos.tamanho()} relaText=${codObj.relocsText.tamanho()} relaData=${codObj.relocsData.tamanho()}")
+    se (verbose) escreverErro("[dcc] streaming concluido (fns=${nFuncoes}, workers=${usarBackendPar ? workers : 1}, text=${codObj.textBytes.tamanho()}B)")
+
+    retorna codObj
 }
 
 funcao emitirAvisosDiag(diag: qualquer): vazio {
@@ -116,20 +365,58 @@ funcao emitirAvisosDiag(diag: qualquer): vazio {
     }
 }
 
-funcao executarDriverDCC(args: texto[]): inteiro {
+funcao construirArgsSubprocessoTU(arqPath: texto, destPath: texto, somenteAsm: logico, dirsInclude: texto[],
+    defsCli: texto[], undefsCli: texto[], modoGnu: logico, nivelOpt: inteiro, wall: logico, wextra: logico,
+    werror: logico, modoCor: texto, formatoJson: logico, catsDesab: dicionario): texto[] {
+    var cmdArgs: texto[] = ["-j", "1"]
+    se (somenteAsm) cmdArgs.empilhar("-S")
+    senao cmdArgs.empilhar("-c")
+    cmdArgs.empilhar("-o")
+    cmdArgs.empilhar(destPath)
+    cmdArgs.empilhar(modoGnu ? "-std=gnu99" : "-std=c99")
+    cmdArgs.empilhar("-O${nivelOpt}")
+    se (wall) cmdArgs.empilhar("-Wall")
+    se (wextra) cmdArgs.empilhar("-Wextra")
+    se (werror) cmdArgs.empilhar("-Werror")
+    cmdArgs.empilhar("-fdiagnostics-color=${modoCor}")
+    se (formatoJson) cmdArgs.empilhar("-fdiagnostics-format=json")
+    const cats: texto[] = catsDesab.chaves()
+    para (var c: inteiro = 0; c < cats.tamanho(); c++) {
+        cmdArgs.empilhar("-Wno-" + cats[c])
+    }
+
+    para (var k: inteiro = 0; k < dirsInclude.tamanho(); k++) {
+        cmdArgs.empilhar("-I")
+        cmdArgs.empilhar(dirsInclude[k])
+    }
+
+    para (var k: inteiro = 0; k < defsCli.tamanho(); k++) {
+        cmdArgs.empilhar("-D")
+        cmdArgs.empilhar(defsCli[k])
+    }
+
+    para (var k: inteiro = 0; k < undefsCli.tamanho(); k++) {
+        cmdArgs.empilhar("-U")
+        cmdArgs.empilhar(undefsCli[k])
+    }
+
+    cmdArgs.empilhar(arqPath)
+    retorna cmdArgs
+}
+
+assincrona funcao executarDriverDCCAsync(args: texto[]): inteiro {
     const diagMod: qualquer = importar("../diagnostics/diag.delegua")
     const preMod: qualquer = importar("../preprocessor/preproc.delegua")
-    const lexMod: qualquer = importar("../lexer/lexer.delegua")
-    const parMod: qualquer = importar("../parser/parser.delegua")
-    const semMod: qualquer = importar("../semantic/sema.delegua")
     const irMod: qualquer = importar("../ir/ir_ssa.delegua")
     const asmMod: qualquer = importar("../backend/x86_64/asm.delegua")
-    const cgMod: qualquer = importar("../backend/x86_64/codegen.delegua")
     const elfObjMod: qualquer = importar("../object/elf/elf_obj.delegua")
     const lnkMod: qualquer = importar("../linker/linker.delegua")
     const arquivos: qualquer = importar("cgd:arquivos")
     const texMod: qualquer = importar("cgd:textos")
     const tempoMod: qualquer = importar("cgd:tempo")
+    const ambMod: qualquer = importar("cgd:ambiente")
+    const procMod: qualquer = importar("cgd:processo")
+    const memMod: qualquer = importar("cgd:memoria")
 
     se (args.tamanho() == 0) {
         escreverErro("dcc: error: nenhum arquivo de entrada especificado (use --help)")
@@ -155,7 +442,10 @@ funcao executarDriverDCC(args: texto[]): inteiro {
     var formatoJson: logico = falso
     var catsDesab: dicionario = {}
     var timeReport: logico = falso
+    var memReport: logico = ambMod.Ambiente.obter("DCC_MEM_REPORT", "") == "1"
     var verbose: logico = falso
+    var jobsSolicitado: inteiro = 0 // 0 = auto, 1 = sequencial, >1 = explicito
+    var jobsDefinidoCli: logico = falso
 
     var i: inteiro = 0
     enquanto (i < args.tamanho()) {
@@ -164,7 +454,7 @@ funcao executarDriverDCC(args: texto[]): inteiro {
             imprimirAjuda()
             retorna 0
         } senao se (a == "--version") {
-            escreva("dcc (Delegua C Compiler) 0.2.0")
+            escreva("dcc (Delegua C Compiler) 0.3.0")
             escreva("Target: x86_64-linux-gnu (System V AMD64 ABI)")
             escreva("Implementation: Delegua / CGD")
             retorna 0
@@ -175,6 +465,46 @@ funcao executarDriverDCC(args: texto[]): inteiro {
             }
             caminhoSaida = args[i + 1]
             i = i + 2
+        } senao se (a == "-j") {
+            se (i + 1 >= args.tamanho()) {
+                escreverErro("dcc: error: argumento ausente apos '-j'")
+                retorna 1
+            }
+            const vj: texto = args[i + 1]
+            se (vj == "auto") {
+                jobsSolicitado = 0
+            } senao {
+                const nj: inteiro = parseIntPositivoEstrito(vj)
+                se (nj <= 0) {
+                    escreverErro("dcc: error: valor invalido para '-j': '${vj}'")
+                    retorna 1
+                }
+                jobsSolicitado = nj
+            }
+            jobsDefinidoCli = verdadeiro
+            i = i + 2
+        } senao se (a.tamanho() > 2 e texMod.Textos.comecaCom(a, "-j")) {
+            const vj2: texto = a.fatiar(2, a.tamanho())
+            se (vj2 == "auto") {
+                jobsSolicitado = 0
+            } senao {
+                const nj2: inteiro = parseIntPositivoEstrito(vj2)
+                se (nj2 <= 0) {
+                    escreverErro("dcc: error: valor invalido para '-j': '${vj2}'")
+                    retorna 1
+                }
+                jobsSolicitado = nj2
+            }
+            jobsDefinidoCli = verdadeiro
+            i++
+        } senao se (a == "--parallel=off") {
+            jobsSolicitado = 1
+            jobsDefinidoCli = verdadeiro
+            i++
+        } senao se (a == "--parallel=auto") {
+            jobsSolicitado = 0
+            jobsDefinidoCli = verdadeiro
+            i++
         } senao se (a == "-I") {
             se (i + 1 >= args.tamanho()) {
                 escreverErro("dcc: error: diretorio ausente apos '-I'")
@@ -276,6 +606,9 @@ funcao executarDriverDCC(args: texto[]): inteiro {
         } senao se (a == "-ftime-report") {
             timeReport = verdadeiro
             i++
+        } senao se (a == "-fmem-report") {
+            memReport = verdadeiro
+            i++
         } senao se (a == "-v") {
             verbose = verdadeiro
             i++
@@ -291,6 +624,18 @@ funcao executarDriverDCC(args: texto[]): inteiro {
         }
     }
 
+    se (!jobsDefinidoCli) {
+        const envJobs: texto = ambMod.Ambiente.obter("DCC_JOBS", "")
+        se (envJobs.tamanho() > 0) {
+            se (envJobs == "off") jobsSolicitado = 1
+            senao se (envJobs == "auto") jobsSolicitado = 0
+            senao {
+                const njEnv: inteiro = parseIntPositivoEstrito(envJobs)
+                se (njEnv > 0) jobsSolicitado = njEnv
+            }
+        }
+    }
+
     se (entradas.tamanho() == 0) {
         escreverErro("dcc: error: nenhum arquivo de entrada especificado")
         retorna 1
@@ -299,6 +644,12 @@ funcao executarDriverDCC(args: texto[]): inteiro {
     se ((somenteObjeto ou somenteAsm) e entradas.tamanho() > 1 e caminhoSaida.tamanho() > 0) {
         escreverErro("dcc: error: nao e possivel usar '-o' com '-c' ou '-S' e multiplos arquivos de entrada")
         retorna 1
+    }
+
+    const workersEfetivos: inteiro = resolverWorkersEfetivos(jobsSolicitado, 134217728)
+    se (verbose) {
+        const recSys: dicionario = memMod.Memoria.sistema()
+        escreverErro("[dcc] recursos: cpusEff=${recSys["cpusEfetivas"]} memDispMiB=${inteiro(recSys["efetivaDisponivelBytes"]) \ 1048576} pressao=${recSys["pressao"]} workers=${workersEfetivos} (solicitado=${jobsSolicitado == 0 ? "auto" : texto(jobsSolicitado)})")
     }
 
     tente {
@@ -324,6 +675,25 @@ funcao executarDriverDCC(args: texto[]): inteiro {
             retorna 0
         }
 
+        // Valida existencia e compatibilidade de entradas antes de disparar qualquer paralelismo
+        var indicesC: inteiro[] = []
+        para (var k: inteiro = 0; k < entradas.tamanho(); k++) {
+            const arqPath: texto = entradas[k]
+            se (!arquivos.Arquivo(arqPath).existe()) {
+                escreverErro("dcc: error: arquivo nao encontrado: '${arqPath}'")
+                retorna 1
+            }
+            se (texMod.Textos.terminaCom(arqPath, ".o") ou texMod.Textos.terminaCom(arqPath,
+                ".a")) {
+                se (somenteObjeto ou somenteAsm) {
+                    escreverErro("dcc: error: arquivo binario '${arqPath}' nao pode ser usado com -c ou -S")
+                    retorna 1
+                }
+            } senao {
+                indicesC.empilhar(k)
+            }
+        }
+
         var objetosLinkar: qualquer[] = []
         var nomesObjetos: texto[] = []
         var tPre: real = 0.0
@@ -337,107 +707,175 @@ funcao executarDriverDCC(args: texto[]): inteiro {
         var tLnk: real = 0.0
         const cron: qualquer = tempoMod.Cronometro()
 
-        para (var k: inteiro = 0; k < entradas.tamanho(); k++) {
-            const arqPath: texto = entradas[k]
-            se (!arquivos.Arquivo(arqPath).existe()) {
-                escreverErro("dcc: error: arquivo nao encontrado: '${arqPath}'")
+        // Paralelismo multi-TU via pool limitado de subprocessos isolados (Processo.executarLote)
+        const usarMultiTuPar: logico = indicesC.tamanho() >= 2 e workersEfetivos > 1
+        se (usarMultiTuPar) {
+            const selfExe: texto = arquivos.Arquivo("/proc/self/exe").existe() ? "/proc/self/exe" : procMod.Processo.executavel()
+            const pidAtual: inteiro = procMod.Processo.identificador()
+            var maxProc: inteiro = workersEfetivos < indicesC.tamanho() ? workersEfetivos : indicesC.tamanho()
+            const recMem: dicionario = memMod.Memoria.sistema()
+            const ramDispMb: inteiro = inteiro(recMem["efetivaDisponivelBytes"]) \ 1048576
+            var limMemProc: inteiro = 1
+            se (ramDispMb >= 512) limMemProc = ramDispMb \ 256
+            se (jobsSolicitado == 0 e limMemProc < maxProc) maxProc = limMemProc
+            se (maxProc < 1) maxProc = 1
+
+            var tarefasProc: dicionario[] = []
+            var destinosTU: texto[] = []
+            var tempsLimpar: texto[] = []
+            para (var c: inteiro = 0; c < indicesC.tamanho(); c++) {
+                const arqC: texto = entradas[indicesC[c]]
+                var destC: texto = ""
+                se (somenteAsm) {
+                    destC = trocarExtensaoLocal(arqC, ".s")
+                } senao se (somenteObjeto) {
+                    destC = trocarExtensaoLocal(arqC, ".o")
+                } senao {
+                    destC = "/tmp/dcc_tu_${pidAtual}_${c}.o"
+                    tempsLimpar.empilhar(destC)
+                }
+                destinosTU.empilhar(destC)
+                const subArgs: texto[] = construirArgsSubprocessoTU(arqC, destC, somenteAsm,
+                    dirsInclude, defsCli, undefsCli, modoGnu, nivelOpt, wall, wextra, werror,
+                    modoCor, formatoJson, catsDesab)
+                tarefasProc.empilhar({
+                    programa: selfExe,
+                    argumentos: subArgs,
+                    timeout: 300000,
+                    limite: 16777216
+                })
+            }
+
+            se (verbose) escreverErro("[dcc] compilando ${indicesC.tamanho()} TUs em paralelo (maxProc=${maxProc})")
+            cron.reiniciar()
+            const resultadosProc: dicionario[] = procMod.Processo.executarLote(tarefasProc,
+                maxProc)
+            tCg = tCg + cron.milisegundos()
+
+            // Emite diagnosticos estritamente na ordem da linha de comando e verifica falhas
+            var falhouTU: logico = falso
+            para (var c: inteiro = 0; c < resultadosProc.tamanho(); c++) {
+                const resC: dicionario = resultadosProc[c]
+                const errTxt: texto = texto(resC["stderr"])
+                se (errTxt.tamanho() > 0) {
+                    // Preserva quebras de linha exatas sem duplicar linha vazia
+                    const ioMod: qualquer = importar("cgd:io")
+                    ioMod.IO.erro(errTxt)
+                }
+                se (resC["timeout"] ou resC["limite"] ou resC["codigo"] != 0) {
+                    falhouTU = verdadeiro
+                }
+            }
+
+            se (falhouTU) {
+                para (var t: inteiro = 0; t < tempsLimpar.tamanho(); t++) {
+                    const fTmp: qualquer = arquivos.Arquivo(tempsLimpar[t])
+                    se (fTmp.existe()) fTmp.remover()
+                }
                 retorna 1
             }
 
-            se (texMod.Textos.terminaCom(arqPath, ".o") ou texMod.Textos.terminaCom(arqPath,
-                ".a")) {
-                se (somenteObjeto ou somenteAsm) {
-                    escreverErro("dcc: error: arquivo binario '${arqPath}' nao pode ser usado com -c ou -S")
-                    retorna 1
+            se (!somenteAsm e !somenteObjeto) {
+                var mapaCTemp: dicionario = {}
+                para (var c: inteiro = 0; c < indicesC.tamanho(); c++) {
+                    mapaCTemp[texto(indicesC[c])] = destinosTU[c]
                 }
-                se (verbose) escreverErro("[dcc] lendo binario ELF64/ar: ${arqPath}")
-                objetosLinkar.empilhar(lerBinario(arqPath))
-                nomesObjetos.empilhar(arqPath)
-                continua
-            }
-
-            const diag: qualquer = diagMod.ContextoDiag(wall, wextra, werror, modoCor, formatoJson,
-                catsDesab)
-            se (verbose) escreverErro("[dcc] pre-processando ${arqPath} (std=${modoGnu ? "gnu99" : "c99"})")
-
-            cron.reiniciar()
-            var resPre: qualquer = preMod.preprocessarDCC(arquivos.Arquivo(arqPath).ler(),
-                arqPath, dirsInclude, defsCli, undefsCli, diag, modoGnu)
-            tPre = tPre + cron.milisegundos()
-            se (verbose) escreverErro("[dcc] preprocess concluido em ${inteiro(tPre)}ms (includes=${resPre[1]})")
-
-            cron.reiniciar()
-            var tokens: qualquer = lexMod.tokenizarDCC(resPre[0], diag, modoGnu)
-            resPre = nulo
-            tLex = tLex + cron.milisegundos()
-            se (verbose) escreverErro("[dcc] lex concluido em ${inteiro(tLex)}ms (tokens=${tokens.tamanho()})")
-
-            cron.reiniciar()
-            var ast: qualquer = parMod.analisarSintaxeDCC(tokens, diag, modoGnu)
-            tokens = nulo
-            tPar = tPar + cron.milisegundos()
-            se (verbose) escreverErro("[dcc] parse concluido em ${inteiro(tPar)}ms (decls=${ast.filhos.tamanho()})")
-
-            cron.reiniciar()
-            var resSema: qualquer = semMod.analisarSemanticaDCC(ast, diag, falso)
-            tSem = tSem + cron.milisegundos()
-            se (verbose) escreverErro("[dcc] sema concluido em ${inteiro(tSem)}ms")
-
-            cron.reiniciar()
-            var moduloSSA: qualquer = irMod.construirModuloSSA(ast, resSema.tabela)
-            ast = nulo
-            resSema = nulo
-            tIr = tIr + cron.milisegundos()
-            se (verbose) escreverErro("[dcc] ir concluido em ${inteiro(tIr)}ms (fns=${moduloSSA.funcoes.tamanho()})")
-
-            cron.reiniciar()
-            se (nivelOpt > 0) {
-                para (var p: inteiro = 0; p < nivelOpt; p++) {
-                    irMod.otimizarModuloSSA(moduloSSA)
+                para (var k: inteiro = 0; k < entradas.tamanho(); k++) {
+                    const ks: texto = texto(k)
+                    se (mapaCTemp.contem(ks)) {
+                        const tmpObjPath: texto = texto(mapaCTemp[ks])
+                        objetosLinkar.empilhar(lerBinarioBytes(tmpObjPath))
+                        nomesObjetos.empilhar(entradas[k])
+                        arquivos.Arquivo(tmpObjPath).remover()
+                    } senao {
+                        se (verbose) escreverErro("[dcc] lendo binario ELF64/ar: ${entradas[k]}")
+                        objetosLinkar.empilhar(lerBinarioBytes(entradas[k]))
+                        nomesObjetos.empilhar(entradas[k])
+                    }
                 }
             }
-            irMod.verificarModuloSSA(moduloSSA)
-            tOpt = tOpt + cron.milisegundos()
-            se (verbose) escreverErro("[dcc] opt+verify concluido em ${inteiro(tOpt)}ms")
+        } senao {
+            para (var k: inteiro = 0; k < entradas.tamanho(); k++) {
+                const arqPath: texto = entradas[k]
 
-            emitirAvisosDiag(diag)
+                se (texMod.Textos.terminaCom(arqPath, ".o") ou texMod.Textos.terminaCom(arqPath,
+                    ".a")) {
+                    se (verbose) escreverErro("[dcc] lendo binario ELF64/ar: ${arqPath}")
+                    objetosLinkar.empilhar(lerBinarioBytes(arqPath))
+                    nomesObjetos.empilhar(arqPath)
+                    continua
+                }
 
-            se (somenteAsm) {
+                const diag: qualquer = diagMod.ContextoDiag(wall, wextra, werror, modoCor,
+                    formatoJson, catsDesab)
+                se (verbose) escreverErro("[dcc] pre-processando ${arqPath} (std=${modoGnu ? "gnu99" : "c99"})")
+
+                se (somenteAsm) {
+                    var temposFront: real[] = [0.0, 0.0, 0.0, 0.0, 0.0]
+                    const resMeio: (qualquer, inteiro) = executarSemaEIR(arqPath, dirsInclude,
+                        defsCli, undefsCli, diag, modoGnu, verbose, memReport, temposFront)
+                    tPre = tPre + temposFront[0]
+                    tLex = tLex + temposFront[1]
+                    tPar = tPar + temposFront[2]
+                    tSem = tSem + temposFront[3]
+                    tIr = tIr + temposFront[4]
+                    var moduloSSA: qualquer = resMeio[0]
+                    const nTokensTU: inteiro = resMeio[1]
+                    se (nTokensTU > 20000) memMod.Memoria.coletar(verdadeiro)
+
+                    cron.reiniciar()
+                    se (nivelOpt > 0) {
+                        para (var p: inteiro = 0; p < nivelOpt; p++) {
+                            irMod.otimizarModuloSSA(moduloSSA)
+                        }
+                    }
+                    irMod.verificarModuloSSA(moduloSSA)
+                    tOpt = tOpt + cron.milisegundos()
+
+                    emitirAvisosDiag(diag)
+
+                    cron.reiniciar()
+                    const codigoAsm: texto = asmMod.emitirAssemblyX86_64(moduloSSA)
+                    moduloSSA = nulo
+                    tCg = tCg + cron.milisegundos()
+                    const destAsm: texto = caminhoSaida.tamanho() > 0 ? caminhoSaida : trocarExtensaoLocal(arqPath,
+                        ".s")
+                    arquivos.Arquivo(destAsm).escrever(codigoAsm)
+                    se (verbose) escreverErro("[dcc] assembly emitido em ${destAsm}")
+                    continua
+                }
+
+                var temposTU: real[] = [0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0]
+                var codObj: qualquer = aguardar compilarTUStreamingAsync(arqPath, dirsInclude,
+                    defsCli, undefsCli, diag, modoGnu, nivelOpt, workersEfetivos, verbose, memReport,
+                    temposTU)
+                tPre = tPre + temposTU[0]
+                tLex = tLex + temposTU[1]
+                tPar = tPar + temposTU[2]
+                tSem = tSem + temposTU[3]
+                tIr = tIr + temposTU[4]
+                tOpt = tOpt + temposTU[5]
+                tCg = tCg + temposTU[6]
+
+                emitirAvisosDiag(diag)
+
                 cron.reiniciar()
-                const codigoAsm: texto = asmMod.emitirAssemblyX86_64(moduloSSA)
-                moduloSSA = nulo
-                tCg = tCg + cron.milisegundos()
-                const destAsm: texto = caminhoSaida.tamanho() > 0 ? caminhoSaida : trocarExtensaoLocal(arqPath,
-                    ".s")
-                arquivos.Arquivo(destAsm).escrever(codigoAsm)
-                se (verbose) escreverErro("[dcc] assembly emitido em ${destAsm}")
-                continua
-            }
-
-            cron.reiniciar()
-            var codObj: qualquer = cgMod.gerarCodigoObjetoX86_64(moduloSSA)
-            moduloSSA = nulo
-            tCg = tCg + cron.milisegundos()
-            se (verbose) escreverErro("[dcc] codegen concluido em ${inteiro(tCg)}ms (text=${codObj.textBytes.tamanho()}B)")
-
-            se (somenteObjeto) {
-                cron.reiniciar()
+                registrarMemoriaFase(memReport, "ELF_START")
                 const bytesObjB: qualquer = elfObjMod.emitirObjetoELF64Bytes(codObj)
                 codObj = nulo
                 tElf = tElf + cron.milisegundos()
+                registrarMemoriaFase(memReport, "ELF_END", "elfBytes=${bytesObjB.tamanho()}B")
                 se (verbose) escreverErro("[dcc] elf_obj concluido em ${inteiro(tElf)}ms (${bytesObjB.tamanho()}B)")
-                const destObj: texto = caminhoSaida.tamanho() > 0 ? caminhoSaida : trocarExtensaoLocal(arqPath,
-                    ".o")
-                gravarBinarioBytes(destObj, bytesObjB, falso)
-                se (verbose) escreverErro("[dcc] objeto ELF64 emitido em ${destObj} (${bytesObjB.tamanho()} bytes)")
-            } senao {
-                cron.reiniciar()
-                const bytesObj: inteiro[] = elfObjMod.emitirObjetoELF64(codObj)
-                codObj = nulo
-                tElf = tElf + cron.milisegundos()
-                se (verbose) escreverErro("[dcc] elf_obj concluido em ${inteiro(tElf)}ms (${bytesObj.tamanho()}B)")
-                objetosLinkar.empilhar(bytesObj)
-                nomesObjetos.empilhar(arqPath)
+
+                se (somenteObjeto) {
+                    const destObj: texto = caminhoSaida.tamanho() > 0 ? caminhoSaida : trocarExtensaoLocal(arqPath,
+                        ".o")
+                    gravarBinarioBytes(destObj, bytesObjB, falso)
+                    se (verbose) escreverErro("[dcc] objeto ELF64 emitido em ${destObj} (${bytesObjB.tamanho()} bytes)")
+                } senao {
+                    objetosLinkar.empilhar(bytesObjB)
+                    nomesObjetos.empilhar(arqPath)
+                }
             }
         }
 
@@ -446,7 +884,7 @@ funcao executarDriverDCC(args: texto[]): inteiro {
             para (var k: inteiro = 0; k < libsCli.tamanho(); k++) {
                 const resLib: (texto, logico) = resolverBibliotecaCli(libsCli[k], dirsLib)
                 se (resLib[1]) {
-                    objetosLinkar.empilhar(lerBinario(resLib[0]))
+                    objetosLinkar.empilhar(lerBinarioBytes(resLib[0]))
                     nomesObjetos.empilhar(resLib[0])
                 } senao {
                     libsDinamicas.empilhar(resLib[0])
@@ -454,19 +892,19 @@ funcao executarDriverDCC(args: texto[]): inteiro {
             }
             const diagLink: qualquer = diagMod.ContextoDiag(wall, wextra, werror, modoCor,
                 formatoJson, catsDesab)
-            se (verbose) escreverErro("[dcc] linkando ${objetosLinkar.tamanho()} entrada(s) ELF64/ar -> executavel")
+            se (verbose) escreverErro("[dcc] linkando ${objetosLinkar.tamanho()} entrada(s) ELF64/ar -> executavel (workers=${workersEfetivos})")
             cron.reiniciar()
-            const elfExec: inteiro[] = lnkMod.linkarObjetosELF64(objetosLinkar, nomesObjetos,
-                libsDinamicas, diagLink)
+            const elfExecBytes: qualquer = aguardar lnkMod.linkarObjetosELF64BytesAsync(objetosLinkar,
+                nomesObjetos, libsDinamicas, diagLink, workersEfetivos)
             tLnk = tLnk + cron.milisegundos()
             const destExec: texto = caminhoSaida.tamanho() > 0 ? caminhoSaida : "a.out"
-            gravarBinario(destExec, elfExec, verdadeiro)
-            se (verbose) escreverErro("[dcc] executavel ELF64 gerado em ${destExec} (${elfExec.tamanho()} bytes)")
+            gravarBinarioBytes(destExec, elfExecBytes, verdadeiro)
+            se (verbose) escreverErro("[dcc] executavel ELF64 gerado em ${destExec} (${elfExecBytes.tamanho()} bytes)")
         }
 
         se (timeReport) {
             const totalMs: real = tPre + tLex + tPar + tSem + tIr + tOpt + tCg + tElf + tLnk
-            escreverErro("[dcc-time] preprocess=${inteiro(tPre)}ms lex=${inteiro(tLex)}ms parse=${inteiro(tPar)}ms sema=${inteiro(tSem)}ms ir=${inteiro(tIr)}ms opt+verify=${inteiro(tOpt)}ms codegen=${inteiro(tCg)}ms elf_obj=${inteiro(tElf)}ms link=${inteiro(tLnk)}ms total=${inteiro(totalMs)}ms")
+            escreverErro("[dcc-time] preprocess=${inteiro(tPre)}ms lex=${inteiro(tLex)}ms parse=${inteiro(tPar)}ms sema=${inteiro(tSem)}ms ir=${inteiro(tIr)}ms opt+verify=${inteiro(tOpt)}ms codegen=${inteiro(tCg)}ms elf_obj=${inteiro(tElf)}ms link=${inteiro(tLnk)}ms total=${inteiro(totalMs)}ms jobs=${workersEfetivos}")
         }
         retorna 0
     } pegue (erro: Excecao) {

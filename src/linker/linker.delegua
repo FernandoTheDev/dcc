@@ -1,7 +1,7 @@
 // Linker nativo ELF64 (x86-64 Linux) do DCC (Delegua C Compiler).
-// Le arquivos objeto ET_REL (.o) e bibliotecas estaticas GNU ar (.a) com validacao estrita,
-// resolve simbolos locais/globais/fracos/COMMON, sintetiza _start (com argc/argv) + stubs PLT/GOT,
-// aplica relocacoes x86-64 com checagem de limites e estouro, e emite executavel ELF64 W^X.
+// Opera diretamente sobre cgd:bytes.Bytes (1 B/byte em GC_MALLOC_ATOMIC), suporta leitura/validacao
+// paralela de multiplos .o e membros .a via rotinas CGD (Bytes congelado zero-copy) e preparacao
+// concorrente de patches de relocacoes com verificacao de limites, estouro e ausencia de sobreposicao.
 
 funcao coletarSimbolosIndefinidos(objsAtivos: qualquer[], definidos: dicionario): dicionario {
     var indefs: dicionario = {}
@@ -27,34 +27,209 @@ funcao registrarDefinidosObjeto(obj: qualquer, definidos: dicionario): vazio {
     }
 }
 
-funcao linkarObjetosELF64(listaDados: qualquer[], nomesArquivos: texto[], libsEntrada: texto[],
-    diag: qualquer): inteiro[] {
+// Worker paralelo para preparar patches de relocacoes ELF64 sobre um lote de entradas pre-resolvidas.
+// Entrada binaria (Bytes congelado):
+//   u32 count
+//   Para cada relocacao (80 bytes):
+//     u32 objIdx, u32 relIdx, u8 dstSecId (1=TEXT,2=DATA,3=RODATA), u8 ehDinamico, u8 temPlt, u8 temGot
+//     u32 rType, u64 P, u64 S, u64 L, u64 G, i64 addend, u64 rOff, u64 secSize, u64 patchOff
+// Saida binaria (Bytes congelado):
+//   u8 status (1=OK, 0=ERRO)
+//   Se ERRO: u32 objIdx, u32 relIdx, u32 errCodeId (1=E5012,2=E5013,3=E5014,4=E5015), u32 rType
+//   Se OK:   u32 count, [u8 dstSecId, u8 largura, u64 patchOff, i64 valPatch] (18 bytes por patch)
+funcao prepararPatchesRelocWorker(loteRaw: qualquer): qualquer {
+    const BytesMod = importar("cgd:bytes")
+    const inp = BytesMod.Bytes.deRecurso(loteRaw)
+    const count: inteiro = inp.lerU32LE(0)
+    const out = BytesMod.Bytes.criarReservado(5 + count * 18)
+    out.anexarByte(1)
+    out.anexarU32LE(count)
+    var cur: inteiro = 4
+    para (var i: inteiro = 0; i < count; i++) {
+        const objIdx: inteiro = inp.lerU32LE(cur)
+        const relIdx: inteiro = inp.lerU32LE(cur + 4)
+        const dstSecId: inteiro = inp.obter(cur + 8)
+        const ehDin: logico = inp.obter(cur + 9) != 0
+        const temPlt: logico = inp.obter(cur + 10) != 0
+        const temGot: logico = inp.obter(cur + 11) != 0
+        const rType: inteiro = inp.lerU32LE(cur + 12)
+        const P: inteiro = inp.lerU64LE(cur + 16)
+        const S: inteiro = inp.lerU64LE(cur + 24)
+        const L: inteiro = inp.lerU64LE(cur + 32)
+        const G: inteiro = inp.lerU64LE(cur + 40)
+        const rAdd: inteiro = inp.lerU64LE(cur + 48)
+        const rOff: inteiro = inp.lerU64LE(cur + 56)
+        const secSz: inteiro = inp.lerU64LE(cur + 64)
+        const patchOff: inteiro = inp.lerU64LE(cur + 72)
+        cur = cur + 80
+
+        var valPatch: inteiro = 0
+        var largura: inteiro = 4
+        var checarS32: logico = verdadeiro
+        var errId: inteiro = 0
+
+        se (rType == 1) {
+            se (ehDin) {
+                se (temPlt) valPatch = L + rAdd
+                senao errId = 2
+            } senao {
+                valPatch = S + rAdd
+            }
+            largura = 8
+            checarS32 = falso
+        } senao se (rType == 2 ou rType == 4) {
+            se (ehDin) valPatch = L + rAdd - P
+            senao valPatch = S + rAdd - P
+        } senao se (rType == 9 ou rType == 41 ou rType == 42) {
+            se (!temGot) errId = 1
+            senao valPatch = G + rAdd - P
+        } senao se (rType == 10) {
+            valPatch = S + rAdd
+            checarS32 = falso
+            se (valPatch < 0 ou valPatch > 4294967295) errId = 3
+        } senao se (rType == 11) {
+            valPatch = S + rAdd
+        } senao {
+            errId = 2
+        }
+
+        se (errId == 0 e checarS32 e (valPatch < -2147483648 ou valPatch > 2147483647)) {
+            errId = 3
+        }
+        se (errId == 0 e (rOff < 0 ou rOff + largura > secSz)) {
+            errId = 4
+        }
+
+        se (errId != 0) {
+            const errBuf = BytesMod.Bytes.criarReservado(20)
+            errBuf.anexarByte(0)
+            errBuf.anexarU32LE(objIdx)
+            errBuf.anexarU32LE(relIdx)
+            errBuf.anexarU32LE(errId)
+            errBuf.anexarU32LE(rType)
+            retorna errBuf.congelar().recursoInterno()
+        }
+
+        out.anexarByte(dstSecId)
+        out.anexarByte(largura)
+        out.anexarU64LE(patchOff)
+        out.anexarU64LE(valPatch)
+    }
+
+    retorna out.congelar().recursoInterno()
+}
+
+classe EstadoLink {
+    objs: qualquer[]
+    totalRelocsLink: inteiro
+    baseVaddr: inteiro
+    numPhdrs: inteiro
+    rxSize: inteiro
+    rwFileOff: inteiro
+    rwVaddr: inteiro
+    rwFileSize: inteiro
+    mergedBssSize: inteiro
+    offInterp: inteiro
+    lenInterp: inteiro
+    offDynstr: inteiro
+    lenDynstr: inteiro
+    offDynsym: inteiro
+    lenDynsym: inteiro
+    offHash: inteiro
+    lenHash: inteiro
+    offRela: inteiro
+    lenRela: inteiro
+    offRodata: inteiro
+    lenRodata: inteiro
+    rodataVaddr: inteiro
+    posRodataNoBuf: inteiro
+    offText: inteiro
+    lenText: inteiro
+    textVaddr: inteiro
+    userTextBaseOff: inteiro
+    offDynamic: inteiro
+    vaddrDynamic: inteiro
+    lenDynamic: inteiro
+    offGot: inteiro
+    vaddrGot: inteiro
+    lenGot: inteiro
+    offData: inteiro
+    dataVaddr: inteiro
+    lenData: inteiro
+    posDataNoRW: inteiro
+    offBss: inteiro
+    bssVaddr: inteiro
+    corpoPreText: qualquer
+    finalText: qualquer
+    segRW: qualquer
+    secTipoDest: dicionario
+    secOffDest: dicionario
+    secFinalVaddr: dicionario
+    globFinalVaddr: dicionario
+    pltOffsets: dicionario
+    gotVaddrs: dicionario
+    localGotPosRW: dicionario
+
+    construtor() {
+        isto.objs = []
+        isto.totalRelocsLink = 0
+        isto.baseVaddr = 0
+        isto.numPhdrs = 0
+        isto.rxSize = 0
+        isto.rwFileOff = 0
+        isto.rwVaddr = 0
+        isto.rwFileSize = 0
+        isto.mergedBssSize = 0
+        isto.offInterp = 0
+        isto.lenInterp = 0
+        isto.offDynstr = 0
+        isto.lenDynstr = 0
+        isto.offDynsym = 0
+        isto.lenDynsym = 0
+        isto.offHash = 0
+        isto.lenHash = 0
+        isto.offRela = 0
+        isto.lenRela = 0
+        isto.offRodata = 0
+        isto.lenRodata = 0
+        isto.rodataVaddr = 0
+        isto.posRodataNoBuf = 0
+        isto.offText = 0
+        isto.lenText = 0
+        isto.textVaddr = 0
+        isto.userTextBaseOff = 0
+        isto.offDynamic = 0
+        isto.vaddrDynamic = 0
+        isto.lenDynamic = 0
+        isto.offGot = 0
+        isto.vaddrGot = 0
+        isto.lenGot = 0
+        isto.offData = 0
+        isto.dataVaddr = 0
+        isto.lenData = 0
+        isto.posDataNoRW = 0
+        isto.offBss = 0
+        isto.bssVaddr = 0
+        isto.corpoPreText = nulo
+        isto.finalText = nulo
+        isto.segRW = nulo
+        isto.secTipoDest = {}
+        isto.secOffDest = {}
+        isto.secFinalVaddr = {}
+        isto.globFinalVaddr = {}
+        isto.pltOffsets = {}
+        isto.gotVaddrs = {}
+        isto.localGotPosRW = {}
+    }
+}
+
+funcao prepararEstadoLink(objs: qualquer[], arquivosAr: qualquer[], defsPrevia: dicionario,
+    libsEntrada: texto[], diag: qualquer): EstadoLink {
     const bytesMod: qualquer = importar("cgd:bytes")
     const texMod: qualquer = importar("cgd:textos")
     const ec: qualquer = importar("../object/elf/elf_comum.delegua")
-    const leitor: qualquer = importar("elf_leitor.delegua")
 
-    // 0. Le objetos .o diretos e extrai membros de bibliotecas estaticas .a sob demanda
-    var objs: qualquer[] = []
-    var arquivosAr: qualquer[] = []
-    var defsPrevia: dicionario = {}
-
-    para (var i: inteiro = 0; i < listaDados.tamanho(); i++) {
-        const dadosIn: inteiro[] = listaDados[i]
-        const nomeIn: texto = nomesArquivos[i]
-        se (leitor.ehArquivoAr(dadosIn)) {
-            const membrosAr: qualquer[] = leitor.extrairObjetosDeAr(dadosIn, nomeIn, diag)
-            para (var m: inteiro = 0; m < membrosAr.tamanho(); m++) {
-                arquivosAr.empilhar(membrosAr[m])
-            }
-        } senao {
-            const objLido: qualquer = leitor.lerObjetoELF64(dadosIn, nomeIn, diag)
-            objs.empilhar(objLido)
-            registrarDefinidosObjeto(objLido, defsPrevia)
-        }
-    }
-
-    // Ponto fixo para puxar membros de .a que resolvam simbolos indefinidos
+    // 0b. Ponto fixo deterministico para puxar membros de .a que resolvam simbolos indefinidos
     se (arquivosAr.tamanho() > 0) {
         var membroUsado: dicionario = {}
         var progresso: logico = verdadeiro
@@ -84,14 +259,15 @@ funcao linkarObjetosELF64(listaDados: qualquer[], nomesArquivos: texto[], libsEn
         }
     }
 
-    // 1. Mescla secoes alocaveis (.text, .rodata, .data, .bss) de todos os .o ativos
-    var userText: inteiro[] = []
-    var mergedRodata: inteiro[] = []
-    var mergedData: inteiro[] = []
+    // 1. Calculo prefixado de offsets de secoes (.text, .rodata, .data, .bss) e pre-alocacao exata
+    var totalUserText: inteiro = 0
+    var totalRodata: inteiro = 0
+    var totalData: inteiro = 0
     var mergedBssSize: inteiro = 0
 
     var secTipoDest: dicionario = {}
     var secOffDest: dicionario = {}
+    var planosCopia: qualquer[] = [] // tupla([destId, objIdx, shOffset, shSize, alinh])
 
     para (var o: inteiro = 0; o < objs.tamanho(); o++) {
         const obj: qualquer = objs[o]
@@ -106,20 +282,23 @@ funcao linkarObjetosELF64(listaDados: qualquer[], nomesArquivos: texto[], libsEn
             const alinh: inteiro = sec.shAlign > 1 ? sec.shAlign : 1
 
             se ((sec.shFlags & ec.SHF_EXECINSTR) != 0 e sec.shType == ec.SHT_PROGBITS) {
-                ec.preencherAlinh(userText, alinh, 144) // NOP 0x90
+                totalUserText = ec.alinharValor(totalUserText, alinh)
                 secTipoDest[chave] = "TEXT"
-                secOffDest[chave] = userText.tamanho()
-                para (var k: inteiro = 0; k < sec.shSize; k++) userText.empilhar(obj.dados[sec.shOffset + k])
+                secOffDest[chave] = totalUserText
+                planosCopia.empilhar(tupla([1, o, sec.shOffset, sec.shSize, alinh]))
+                totalUserText = totalUserText + sec.shSize
             } senao se ((sec.shFlags & ec.SHF_WRITE) == 0 e sec.shType == ec.SHT_PROGBITS) {
-                ec.preencherAlinh(mergedRodata, alinh, 0)
+                totalRodata = ec.alinharValor(totalRodata, alinh)
                 secTipoDest[chave] = "RODATA"
-                secOffDest[chave] = mergedRodata.tamanho()
-                para (var k: inteiro = 0; k < sec.shSize; k++) mergedRodata.empilhar(obj.dados[sec.shOffset + k])
+                secOffDest[chave] = totalRodata
+                planosCopia.empilhar(tupla([2, o, sec.shOffset, sec.shSize, alinh]))
+                totalRodata = totalRodata + sec.shSize
             } senao se ((sec.shFlags & ec.SHF_WRITE) != 0 e sec.shType == ec.SHT_PROGBITS) {
-                ec.preencherAlinh(mergedData, alinh, 0)
+                totalData = ec.alinharValor(totalData, alinh)
                 secTipoDest[chave] = "DATA"
-                secOffDest[chave] = mergedData.tamanho()
-                para (var k: inteiro = 0; k < sec.shSize; k++) mergedData.empilhar(obj.dados[sec.shOffset + k])
+                secOffDest[chave] = totalData
+                planosCopia.empilhar(tupla([3, o, sec.shOffset, sec.shSize, alinh]))
+                totalData = totalData + sec.shSize
             } senao se ((sec.shFlags & ec.SHF_WRITE) != 0 e sec.shType == ec.SHT_NOBITS) {
                 mergedBssSize = ec.alinharValor(mergedBssSize, alinh)
                 secTipoDest[chave] = "BSS"
@@ -129,7 +308,30 @@ funcao linkarObjetosELF64(listaDados: qualquer[], nomesArquivos: texto[], libsEn
         }
     }
 
-    // 2. Resolucao de simbolos globais, fracos, ABS e SHN_COMMON entre todos os .o
+    const userText: qualquer = bytesMod.Bytes.criarReservado(totalUserText)
+    const mergedRodata: qualquer = bytesMod.Bytes.criarReservado(totalRodata)
+    const mergedData: qualquer = bytesMod.Bytes.criarReservado(totalData)
+
+    para (var p: inteiro = 0; p < planosCopia.tamanho(); p++) {
+        const pl: qualquer = planosCopia[p]
+        const dId: inteiro = inteiro(pl[0])
+        const objSrc: qualquer = objs[inteiro(pl[1])]
+        const sOff: inteiro = inteiro(pl[2])
+        const sSz: inteiro = inteiro(pl[3])
+        const alP: inteiro = inteiro(pl[4])
+        se (dId == 1) {
+            ec.preencherAlinhBytes(userText, alP, 144)
+            se (sSz > 0) userText.anexarBytesFatia(objSrc.dados, sOff, sSz)
+        } senao se (dId == 2) {
+            ec.preencherAlinhBytes(mergedRodata, alP, 0)
+            se (sSz > 0) mergedRodata.anexarBytesFatia(objSrc.dados, sOff, sSz)
+        } senao {
+            ec.preencherAlinhBytes(mergedData, alP, 0)
+            se (sSz > 0) mergedData.anexarBytesFatia(objSrc.dados, sOff, sSz)
+        }
+    }
+
+    // 2. Resolucao deterministica de simbolos globais, fracos, ABS e SHN_COMMON
     var globDefObj: dicionario = {}
     var globDefSec: dicionario = {}
     var globDefVal: dicionario = {}
@@ -196,6 +398,7 @@ funcao linkarObjetosELF64(listaDados: qualquer[], nomesArquivos: texto[], libsEn
     var mapaPltSyms: dicionario = {}
     var localGotSyms: texto[] = []
     var mapaLocalGot: dicionario = {}
+    var totalRelocsLink: inteiro = 0
 
     mapaDynSyms["exit"] = 0
     dynSyms.empilhar("exit")
@@ -204,6 +407,7 @@ funcao linkarObjetosELF64(listaDados: qualquer[], nomesArquivos: texto[], libsEn
 
     para (var o: inteiro = 0; o < objs.tamanho(); o++) {
         const obj: qualquer = objs[o]
+        totalRelocsLink = totalRelocsLink + obj.relocs.tamanho()
         para (var r: inteiro = 0; r < obj.relocs.tamanho(); r++) {
             const rel: qualquer = obj.relocs[r]
             const chaveAlvo: texto = "${o}:${rel.alvoSecIdx}"
@@ -236,54 +440,46 @@ funcao linkarObjetosELF64(listaDados: qualquer[], nomesArquivos: texto[], libsEn
         }
     }
 
-    // 4. Monta _start (passando argc em rdi e argv em rsi!) + stubs PLT + userText em finalText
-    var finalText: inteiro[] = []
-    // _start (rsp esta alinhado em 16B pelo kernel Linux):
-    //   mov rdi, [rsp]     -> 48 8B 3C 24      (argc)
-    //   lea rsi, [rsp + 8] -> 48 8D 74 24 08   (argv)
-    //   call main          -> E8 <rel32>
-    //   mov rdi, rax       -> 48 89 C7
-    //   xor eax, eax       -> 31 C0
-    //   call exit@plt      -> E8 <rel32>
-    finalText.empilhar(72)
-    finalText.empilhar(139)
-    finalText.empilhar(60)
-    finalText.empilhar(36)
-    finalText.empilhar(72)
-    finalText.empilhar(141)
-    finalText.empilhar(116)
-    finalText.empilhar(36)
-    finalText.empilhar(8)
-    finalText.empilhar(232)
+    // 4. Monta _start (passando argc em rdi e argv em rsi) + stubs PLT + userText em finalText (Bytes)
+    const finalText: qualquer = bytesMod.Bytes.criarReservado(64 + pltSyms.tamanho() * 6 + totalUserText)
+    finalText.anexarByte(72)
+    finalText.anexarByte(139)
+    finalText.anexarByte(60)
+    finalText.anexarByte(36)
+    finalText.anexarByte(72)
+    finalText.anexarByte(141)
+    finalText.anexarByte(116)
+    finalText.anexarByte(36)
+    finalText.anexarByte(8)
+    finalText.anexarByte(232)
     const posCallMain: inteiro = finalText.tamanho()
-    ec.anexarU32(finalText, 0)
-    finalText.empilhar(72)
-    finalText.empilhar(137)
-    finalText.empilhar(199)
-    finalText.empilhar(49)
-    finalText.empilhar(192)
-    finalText.empilhar(232)
+    finalText.anexarU32LE(0)
+    finalText.anexarByte(72)
+    finalText.anexarByte(137)
+    finalText.anexarByte(199)
+    finalText.anexarByte(49)
+    finalText.anexarByte(192)
+    finalText.anexarByte(232)
     const posCallExit: inteiro = finalText.tamanho()
-    ec.anexarU32(finalText, 0)
-    ec.preencherAlinh(finalText, 16, 144)
+    finalText.anexarU32LE(0)
+    ec.preencherAlinhBytes(finalText, 16, 144)
 
-    // Stubs PLT (6 bytes cada: FF 25 <disp32> = jmp qword ptr [rip + disp32])
     var pltOffsets: dicionario = {}
     var pltDispPos: inteiro[] = []
     para (var i: inteiro = 0; i < pltSyms.tamanho(); i++) {
         pltOffsets[pltSyms[i]] = finalText.tamanho()
-        finalText.empilhar(255)
-        finalText.empilhar(37)
+        finalText.anexarByte(255)
+        finalText.anexarByte(37)
         pltDispPos.empilhar(finalText.tamanho())
-        ec.anexarU32(finalText, 0)
+        finalText.anexarU32LE(0)
     }
 
-    ec.preencherAlinh(finalText, 16, 144)
-
+    ec.preencherAlinhBytes(finalText, 16, 144)
     const userTextBaseOff: inteiro = finalText.tamanho()
-    para (var i: inteiro = 0; i < userText.tamanho(); i++) finalText.empilhar(userText[i])
+    se (userText.tamanho() > 0) finalText.anexarBytes(userText)
+    userText.liberar()
 
-    // 5. Layout do Segmento 1 (R+X)
+    // 5. Layout do Segmento 1 (R+X) em Bytes
     const baseVaddr: inteiro = 4194304 // 0x400000
     const numPhdrs: inteiro = 5
     const headersFim: inteiro = 64 + numPhdrs * 56
@@ -298,66 +494,68 @@ funcao linkarObjetosELF64(listaDados: qualquer[], nomesArquivos: texto[], libsEn
         }
     }
 
-    var corpoPreText: inteiro[] = []
+    const corpoPreText: qualquer = bytesMod.Bytes.criarReservado(4096 + totalRodata)
 
     const offInterp: inteiro = headersFim + corpoPreText.tamanho()
-    ec.anexarCString(corpoPreText, "/lib64/ld-linux-x86-64.so.2", bytesMod)
+    ec.anexarCStringBytes(corpoPreText, "/lib64/ld-linux-x86-64.so.2")
     const lenInterp: inteiro = (headersFim + corpoPreText.tamanho()) - offInterp
 
     const offDynstr: inteiro = headersFim + corpoPreText.tamanho()
-    var dynstrBuf: inteiro[] = [0]
+    const dynstrBuf: qualquer = bytesMod.Bytes.criarReservado(256 + dynSyms.tamanho() * 16)
+    dynstrBuf.anexarByte(0)
     var libNameOffs: inteiro[] = []
     para (var i: inteiro = 0; i < libsFinais.tamanho(); i++) {
-        libNameOffs.empilhar(ec.anexarCString(dynstrBuf, libsFinais[i], bytesMod))
+        libNameOffs.empilhar(ec.anexarCStringBytes(dynstrBuf, libsFinais[i]))
     }
 
     var dynSymNameOffs: inteiro[] = []
     para (var i: inteiro = 0; i < dynSyms.tamanho(); i++) {
-        dynSymNameOffs.empilhar(ec.anexarCString(dynstrBuf, dynSyms[i], bytesMod))
+        dynSymNameOffs.empilhar(ec.anexarCStringBytes(dynstrBuf, dynSyms[i]))
     }
 
     const lenDynstr: inteiro = dynstrBuf.tamanho()
-    para (var i: inteiro = 0; i < dynstrBuf.tamanho(); i++) corpoPreText.empilhar(dynstrBuf[i])
+    corpoPreText.anexarBytes(dynstrBuf)
 
-    ec.preencherAlinh(corpoPreText, 8, 0)
+    ec.preencherAlinhBytes(corpoPreText, 8, 0)
     const offDynsym: inteiro = headersFim + corpoPreText.tamanho()
     const numDyn: inteiro = dynSyms.tamanho()
-    para (var z: inteiro = 0; z < 24; z++) corpoPreText.empilhar(0)
+    corpoPreText.anexarZeros(24)
     para (var i: inteiro = 0; i < numDyn; i++) {
-        ec.anexarU32(corpoPreText, dynSymNameOffs[i])
+        corpoPreText.anexarU32LE(dynSymNameOffs[i])
         const ehFnDyn: logico = mapaPltSyms.contem(dynSyms[i])
         const infoDyn: inteiro = (ec.STB_GLOBAL << 4) | (ehFnDyn ? ec.STT_FUNC : ec.STT_NOTYPE)
-        corpoPreText.empilhar(infoDyn)
-        corpoPreText.empilhar(0)
-        ec.anexarU16(corpoPreText, ec.SHN_UNDEF)
-        ec.anexarU64(corpoPreText, 0)
-        ec.anexarU64(corpoPreText, 0)
+        corpoPreText.anexarByte(infoDyn)
+        corpoPreText.anexarByte(0)
+        corpoPreText.anexarU16LE(ec.SHN_UNDEF)
+        corpoPreText.anexarU64LE(0)
+        corpoPreText.anexarU64LE(0)
     }
 
     const lenDynsym: inteiro = (numDyn + 1) * 24
 
-    ec.preencherAlinh(corpoPreText, 8, 0)
+    ec.preencherAlinhBytes(corpoPreText, 8, 0)
     const offHash: inteiro = headersFim + corpoPreText.tamanho()
-    ec.anexarU32(corpoPreText, 1)
-    ec.anexarU32(corpoPreText, numDyn + 1)
-    ec.anexarU32(corpoPreText, 0)
-    para (var i: inteiro = 0; i < numDyn + 1; i++) ec.anexarU32(corpoPreText, 0)
+    corpoPreText.anexarU32LE(1)
+    corpoPreText.anexarU32LE(numDyn + 1)
+    corpoPreText.anexarU32LE(0)
+    para (var i: inteiro = 0; i < numDyn + 1; i++) corpoPreText.anexarU32LE(0)
     const lenHash: inteiro = (3 + numDyn + 1) * 4
 
-    ec.preencherAlinh(corpoPreText, 8, 0)
+    ec.preencherAlinhBytes(corpoPreText, 8, 0)
     const posRelaNoBuf: inteiro = corpoPreText.tamanho()
     const offRela: inteiro = headersFim + posRelaNoBuf
     const lenRela: inteiro = numDyn * 24
-    para (var z: inteiro = 0; z < lenRela; z++) corpoPreText.empilhar(0)
+    se (lenRela > 0) corpoPreText.anexarZeros(lenRela)
 
-    ec.preencherAlinh(corpoPreText, 8, 0)
+    ec.preencherAlinhBytes(corpoPreText, 8, 0)
     const posRodataNoBuf: inteiro = corpoPreText.tamanho()
     const offRodata: inteiro = headersFim + posRodataNoBuf
     const rodataVaddr: inteiro = baseVaddr + offRodata
-    para (var i: inteiro = 0; i < mergedRodata.tamanho(); i++) corpoPreText.empilhar(mergedRodata[i])
     const lenRodata: inteiro = mergedRodata.tamanho()
+    se (lenRodata > 0) corpoPreText.anexarBytes(mergedRodata)
+    mergedRodata.liberar()
 
-    ec.preencherAlinh(corpoPreText, 16, 0)
+    ec.preencherAlinhBytes(corpoPreText, 16, 0)
     const offText: inteiro = headersFim + corpoPreText.tamanho()
     const textVaddr: inteiro = baseVaddr + offText
     const lenText: inteiro = finalText.tamanho()
@@ -366,61 +564,62 @@ funcao linkarObjetosELF64(listaDados: qualquer[], nomesArquivos: texto[], libsEn
     // 6. Layout do Segmento 2 (R+W, pagina separada 4096 -> W^X estrito)
     const rwFileOff: inteiro = ec.alinharValor(rxSize, 4096)
     const rwVaddr: inteiro = baseVaddr + rwFileOff
-    var segRW: inteiro[] = []
+    const segRW: qualquer = bytesMod.Bytes.criarReservado(1024 + (numDyn + localGotSyms.tamanho()) * 8 + totalData)
 
     const offDynamic: inteiro = rwFileOff + segRW.tamanho()
     const vaddrDynamic: inteiro = rwVaddr + segRW.tamanho()
     para (var i: inteiro = 0; i < libNameOffs.tamanho(); i++) {
-        ec.anexarU64(segRW, ec.DT_NEEDED)
-        ec.anexarU64(segRW, libNameOffs[i])
+        segRW.anexarU64LE(ec.DT_NEEDED)
+        segRW.anexarU64LE(libNameOffs[i])
     }
 
-    ec.anexarU64(segRW, ec.DT_HASH)
-    ec.anexarU64(segRW, baseVaddr + offHash)
-    ec.anexarU64(segRW, ec.DT_STRTAB)
-    ec.anexarU64(segRW, baseVaddr + offDynstr)
-    ec.anexarU64(segRW, ec.DT_SYMTAB)
-    ec.anexarU64(segRW, baseVaddr + offDynsym)
-    ec.anexarU64(segRW, ec.DT_RELA)
-    ec.anexarU64(segRW, baseVaddr + offRela)
-    ec.anexarU64(segRW, ec.DT_RELASZ)
-    ec.anexarU64(segRW, lenRela)
-    ec.anexarU64(segRW, ec.DT_RELAENT)
-    ec.anexarU64(segRW, 24)
-    ec.anexarU64(segRW, ec.DT_STRSZ)
-    ec.anexarU64(segRW, lenDynstr)
-    ec.anexarU64(segRW, ec.DT_SYMENT)
-    ec.anexarU64(segRW, 24)
-    ec.anexarU64(segRW, ec.DT_NULL)
-    ec.anexarU64(segRW, 0)
+    segRW.anexarU64LE(ec.DT_HASH)
+    segRW.anexarU64LE(baseVaddr + offHash)
+    segRW.anexarU64LE(ec.DT_STRTAB)
+    segRW.anexarU64LE(baseVaddr + offDynstr)
+    segRW.anexarU64LE(ec.DT_SYMTAB)
+    segRW.anexarU64LE(baseVaddr + offDynsym)
+    segRW.anexarU64LE(ec.DT_RELA)
+    segRW.anexarU64LE(baseVaddr + offRela)
+    segRW.anexarU64LE(ec.DT_RELASZ)
+    segRW.anexarU64LE(lenRela)
+    segRW.anexarU64LE(ec.DT_RELAENT)
+    segRW.anexarU64LE(24)
+    segRW.anexarU64LE(ec.DT_STRSZ)
+    segRW.anexarU64LE(lenDynstr)
+    segRW.anexarU64LE(ec.DT_SYMENT)
+    segRW.anexarU64LE(24)
+    segRW.anexarU64LE(ec.DT_NULL)
+    segRW.anexarU64LE(0)
     const lenDynamic: inteiro = (libNameOffs.tamanho() + 9) * 16
 
-    ec.preencherAlinh(segRW, 8, 0)
+    ec.preencherAlinhBytes(segRW, 8, 0)
     const offGot: inteiro = rwFileOff + segRW.tamanho()
     const vaddrGot: inteiro = rwVaddr + segRW.tamanho()
     var gotVaddrs: dicionario = {}
     para (var i: inteiro = 0; i < numDyn; i++) {
         gotVaddrs[dynSyms[i]] = vaddrGot + i * 8
-        ec.anexarU64(segRW, 0)
+        segRW.anexarU64LE(0)
     }
 
     var localGotPosRW: dicionario = {}
     para (var i: inteiro = 0; i < localGotSyms.tamanho(); i++) {
         gotVaddrs[localGotSyms[i]] = vaddrGot + (numDyn + i) * 8
         localGotPosRW[localGotSyms[i]] = segRW.tamanho()
-        ec.anexarU64(segRW, 0)
+        segRW.anexarU64LE(0)
     }
 
     const lenGot: inteiro = (numDyn + localGotSyms.tamanho()) * 8
 
-    ec.preencherAlinh(segRW, 8, 0)
+    ec.preencherAlinhBytes(segRW, 8, 0)
     const posDataNoRW: inteiro = segRW.tamanho()
     const offData: inteiro = rwFileOff + posDataNoRW
     const dataVaddr: inteiro = rwVaddr + posDataNoRW
-    para (var i: inteiro = 0; i < mergedData.tamanho(); i++) segRW.empilhar(mergedData[i])
     const lenData: inteiro = mergedData.tamanho()
+    se (lenData > 0) segRW.anexarBytes(mergedData)
+    mergedData.liberar()
 
-    ec.preencherAlinh(segRW, 8, 0)
+    ec.preencherAlinhBytes(segRW, 8, 0)
     const rwFileSize: inteiro = segRW.tamanho()
     const offBss: inteiro = rwFileOff + rwFileSize
     const bssVaddr: inteiro = rwVaddr + rwFileSize
@@ -455,7 +654,7 @@ funcao linkarObjetosELF64(listaDados: qualquer[], nomesArquivos: texto[], libsEn
     para (var i: inteiro = 0; i < localGotSyms.tamanho(); i++) {
         const nm: texto = localGotSyms[i]
         se (globFinalVaddr.contem(nm)) {
-            ec.gravarU64(segRW, inteiro(localGotPosRW[nm]), inteiro(globFinalVaddr[nm]))
+            segRW.definirU64LE(inteiro(localGotPosRW[nm]), inteiro(globFinalVaddr[nm]))
         }
     }
 
@@ -464,25 +663,252 @@ funcao linkarObjetosELF64(listaDados: qualquer[], nomesArquivos: texto[], libsEn
         const rOffG: inteiro = vaddrGot + i * 8
         const rInfoG: inteiro = ((i + 1) << 32) | ec.R_X86_64_GLOB_DAT
         const pR: inteiro = posRelaNoBuf + i * 24
-        ec.gravarU64(corpoPreText, pR, rOffG)
-        ec.gravarU64(corpoPreText, pR + 8, rInfoG)
-        ec.gravarU64(corpoPreText, pR + 16, 0)
+        corpoPreText.definirU64LE(pR, rOffG)
+        corpoPreText.definirU64LE(pR + 8, rInfoG)
+        corpoPreText.definirU64LE(pR + 16, 0)
     }
 
     const mainVaddr: inteiro = inteiro(globFinalVaddr["main"])
-    ec.gravarU32(finalText, posCallMain, mainVaddr - (textVaddr + posCallMain + 4))
+    finalText.definirU32LE(posCallMain, mainVaddr - (textVaddr + posCallMain + 4))
     const exitPltVaddr: inteiro = textVaddr + inteiro(pltOffsets["exit"])
-    ec.gravarU32(finalText, posCallExit, exitPltVaddr - (textVaddr + posCallExit + 4))
+    finalText.definirU32LE(posCallExit, exitPltVaddr - (textVaddr + posCallExit + 4))
 
     para (var i: inteiro = 0; i < pltSyms.tamanho(); i++) {
         const nm: texto = pltSyms[i]
         const gotA: inteiro = inteiro(gotVaddrs[nm])
         const dispPos: inteiro = pltDispPos[i]
         const ripApos: inteiro = textVaddr + dispPos + 4
-        ec.gravarU32(finalText, dispPos, gotA - ripApos)
+        finalText.definirU32LE(dispPos, gotA - ripApos)
     }
 
-    // 8. Aplica todas as relocacoes x86-64 (.text, .data e .rodata) com validacao rigorosa
+    const est: EstadoLink = EstadoLink()
+    est.objs = objs
+    est.totalRelocsLink = totalRelocsLink
+    est.baseVaddr = baseVaddr
+    est.numPhdrs = numPhdrs
+    est.rxSize = rxSize
+    est.rwFileOff = rwFileOff
+    est.rwVaddr = rwVaddr
+    est.rwFileSize = rwFileSize
+    est.mergedBssSize = mergedBssSize
+    est.offInterp = offInterp
+    est.lenInterp = lenInterp
+    est.offDynstr = offDynstr
+    est.lenDynstr = lenDynstr
+    est.offDynsym = offDynsym
+    est.lenDynsym = lenDynsym
+    est.offHash = offHash
+    est.lenHash = lenHash
+    est.offRela = offRela
+    est.lenRela = lenRela
+    est.offRodata = offRodata
+    est.lenRodata = lenRodata
+    est.rodataVaddr = rodataVaddr
+    est.posRodataNoBuf = posRodataNoBuf
+    est.offText = offText
+    est.lenText = lenText
+    est.textVaddr = textVaddr
+    est.userTextBaseOff = userTextBaseOff
+    est.offDynamic = offDynamic
+    est.vaddrDynamic = vaddrDynamic
+    est.lenDynamic = lenDynamic
+    est.offGot = offGot
+    est.vaddrGot = vaddrGot
+    est.lenGot = lenGot
+    est.offData = offData
+    est.dataVaddr = dataVaddr
+    est.lenData = lenData
+    est.posDataNoRW = posDataNoRW
+    est.offBss = offBss
+    est.bssVaddr = bssVaddr
+    est.corpoPreText = corpoPreText
+    est.finalText = finalText
+    est.segRW = segRW
+    est.secTipoDest = secTipoDest
+    est.secOffDest = secOffDest
+    est.secFinalVaddr = secFinalVaddr
+    est.globFinalVaddr = globFinalVaddr
+    est.pltOffsets = pltOffsets
+    est.gotVaddrs = gotVaddrs
+    est.localGotPosRW = localGotPosRW
+    retorna est
+}
+
+// 8a. Aplicacao paralela de relocacoes por lotes (ativada em links grandes com workers > 1)
+assincrona funcao aplicarRelocacoesParAsync(est: EstadoLink, workers: inteiro, diag: qualquer): vazio {
+    const bytesMod: qualquer = importar("cgd:bytes")
+    const ec: qualquer = importar("../object/elf/elf_comum.delegua")
+    const objs: qualquer[] = est.objs
+    const secTipoDest: dicionario = est.secTipoDest
+    const secOffDest: dicionario = est.secOffDest
+    const secFinalVaddr: dicionario = est.secFinalVaddr
+    const globFinalVaddr: dicionario = est.globFinalVaddr
+    const pltOffsets: dicionario = est.pltOffsets
+    const gotVaddrs: dicionario = est.gotVaddrs
+    const localGotPosRW: dicionario = est.localGotPosRW
+    const corpoPreText: qualquer = est.corpoPreText
+    const finalText: qualquer = est.finalText
+    const segRW: qualquer = est.segRW
+    const textVaddr: inteiro = est.textVaddr
+    const userTextBaseOff: inteiro = est.userTextBaseOff
+    const posDataNoRW: inteiro = est.posDataNoRW
+    const posRodataNoBuf: inteiro = est.posRodataNoBuf
+
+    const nLotes: inteiro = workers < objs.tamanho() ? workers : (objs.tamanho() > 0 ? objs.tamanho() : 1)
+    var lotesBufs: qualquer[] = []
+    var lotesCounts: inteiro[] = []
+    para (var l: inteiro = 0; l < nLotes; l++) {
+        const lb: qualquer = bytesMod.Bytes.criarReservado(4096)
+        lb.anexarU32LE(0)
+        lotesBufs.empilhar(lb)
+        lotesCounts.empilhar(0)
+    }
+
+    para (var o: inteiro = 0; o < objs.tamanho(); o++) {
+        const obj: qualquer = objs[o]
+        const loteIdx: inteiro = o % nLotes
+        const lb: qualquer = lotesBufs[loteIdx]
+        para (var r: inteiro = 0; r < obj.relocs.tamanho(); r++) {
+            const rel: qualquer = obj.relocs[r]
+            const chAlvo: texto = "${o}:${rel.alvoSecIdx}"
+            se (!secTipoDest.contem(chAlvo)) continua
+            const secAlvo: qualquer = obj.secoes[rel.alvoSecIdx]
+            const dstSecNome: texto = texto(secTipoDest[chAlvo])
+            const P: inteiro = inteiro(secFinalVaddr[chAlvo]) + rel.rOffset
+            const sym: qualquer = obj.simbolos[rel.symIdx]
+            var S: inteiro = 0
+            var ehDin: logico = falso
+            var nomeGot: texto = sym.nome
+            se (sym.shndx == ec.SHN_UNDEF) {
+                se (globFinalVaddr.contem(sym.nome)) S = inteiro(globFinalVaddr[sym.nome])
+                senao ehDin = verdadeiro
+            } senao se (sym.shndx == ec.SHN_ABS) {
+                S = sym.valor
+            } senao se (sym.bind == ec.STB_LOCAL) {
+                const chSymSec: texto = "${o}:${sym.shndx}"
+                se (!secFinalVaddr.contem(chSymSec)) {
+                    diag.erroDireto(obj.nomeArquivo, 0, 0, "relocacao referencia simbolo local em secao nao alocavel #${sym.shndx}",
+                        "", "", "E5012")
+                }
+                S = inteiro(secFinalVaddr[chSymSec]) + sym.valor
+                nomeGot = "__loc_${o}_${rel.symIdx}"
+                se (localGotPosRW.contem(nomeGot)) {
+                    segRW.definirU64LE(inteiro(localGotPosRW[nomeGot]), S)
+                }
+            } senao {
+                se (!globFinalVaddr.contem(sym.nome)) {
+                    diag.erroDireto(obj.nomeArquivo, 0, 0, "simbolo global '${sym.nome}' sem endereco resolvido em relocacao",
+                        "", "", "E5012")
+                }
+                S = inteiro(globFinalVaddr[sym.nome])
+            }
+            const dstId: inteiro = dstSecNome == "TEXT" ? 1 : (dstSecNome == "DATA" ? 2 : 3)
+            var patchOff: inteiro = posRodataNoBuf + inteiro(secOffDest[chAlvo]) + rel.rOffset
+            se (dstId == 1) patchOff = userTextBaseOff + inteiro(secOffDest[chAlvo]) + rel.rOffset
+            senao se (dstId == 2) patchOff = posDataNoRW + inteiro(secOffDest[chAlvo]) + rel.rOffset
+            const temPlt: logico = pltOffsets.contem(sym.nome)
+            const Lval: inteiro = temPlt ? textVaddr + inteiro(pltOffsets[sym.nome]) : 0
+            const temGot: logico = gotVaddrs.contem(nomeGot)
+            const Gval: inteiro = temGot ? inteiro(gotVaddrs[nomeGot]) : 0
+            lb.anexarU32LE(o)
+            lb.anexarU32LE(r)
+            lb.anexarByte(dstId)
+            lb.anexarByte(ehDin ? 1 : 0)
+            lb.anexarByte(temPlt ? 1 : 0)
+            lb.anexarByte(temGot ? 1 : 0)
+            lb.anexarU32LE(rel.rType)
+            lb.anexarU64LE(P)
+            lb.anexarU64LE(S)
+            lb.anexarU64LE(Lval)
+            lb.anexarU64LE(Gval)
+            lb.anexarU64LE(rel.rAddend)
+            lb.anexarU64LE(rel.rOffset)
+            lb.anexarU64LE(secAlvo.shSize)
+            lb.anexarU64LE(patchOff)
+            lotesCounts[loteIdx] = lotesCounts[loteIdx] + 1
+        }
+    }
+
+    var tarefasRel: qualquer[] = []
+    para (var l: inteiro = 0; l < nLotes; l++) {
+        lotesBufs[l].definirU32LE(0, lotesCounts[l])
+        const congL: qualquer = lotesBufs[l].congelar()
+        tarefasRel.empilhar(rotina prepararPatchesRelocWorker(congL.recursoInterno()))
+    }
+
+    const resLotes: qualquer[] = aguardar Promessa.todas(tarefasRel)
+    var vistosPatch: dicionario = {}
+    para (var l: inteiro = 0; l < resLotes.tamanho(); l++) {
+        const rb: qualquer = bytesMod.Bytes.deRecurso(resLotes[l])
+        se (rb.obter(0) == 0) {
+            const oErr: inteiro = rb.lerU32LE(1)
+            const rErr: inteiro = rb.lerU32LE(5)
+            const eId: inteiro = rb.lerU32LE(9)
+            const rTp: inteiro = rb.lerU32LE(13)
+            const objE: qualquer = objs[oErr]
+            const codE: texto = eId == 1 ? "E5012" : (eId == 2 ? "E5013" : (eId == 3 ? "E5014" : "E5015"))
+            diag.erroDireto(objE.nomeArquivo, 0, 0, "falha em relocacao #${rErr} tipo ${rTp}",
+                "", "", codE)
+        }
+        const nP: inteiro = rb.lerU32LE(1)
+        var curP: inteiro = 5
+        para (var p: inteiro = 0; p < nP; p++) {
+            const dId: inteiro = rb.obter(curP)
+            const larg: inteiro = rb.obter(curP + 1)
+            const offP: inteiro = rb.lerU64LE(curP + 2)
+            const valP: inteiro = rb.lerU64LE(curP + 10)
+            curP = curP + 18
+            const kPatch: texto = "${dId}:${offP}"
+            se (vistosPatch.contem(kPatch)) {
+                diag.erroDireto("", 0, 0, "sobreposicao de patch de relocacao em ${kPatch}",
+                    "", "", "E5015")
+            }
+            vistosPatch[kPatch] = verdadeiro
+            se (dId == 1) {
+                se (offP < 0 ou offP + larg > finalText.tamanho()) {
+                    diag.erroDireto("", 0, 0, "patch fora dos limites de .text", "", "",
+                        "E5015")
+                }
+                se (larg == 8) finalText.definirU64LE(offP, valP)
+                senao finalText.definirU32LE(offP, valP)
+            } senao se (dId == 2) {
+                se (offP < 0 ou offP + larg > segRW.tamanho()) {
+                    diag.erroDireto("", 0, 0, "patch fora dos limites de .data", "", "",
+                        "E5015")
+                }
+                se (larg == 8) segRW.definirU64LE(offP, valP)
+                senao segRW.definirU32LE(offP, valP)
+            } senao {
+                se (offP < 0 ou offP + larg > corpoPreText.tamanho()) {
+                    diag.erroDireto("", 0, 0, "patch fora dos limites de .rodata", "", "",
+                        "E5015")
+                }
+                se (larg == 8) corpoPreText.definirU64LE(offP, valP)
+                senao corpoPreText.definirU32LE(offP, valP)
+            }
+        }
+    }
+}
+
+// 8b. Aplicacao sequencial direta de relocacoes
+funcao aplicarRelocacoesSeq(est: EstadoLink, diag: qualquer): vazio {
+    const ec: qualquer = importar("../object/elf/elf_comum.delegua")
+    const objs: qualquer[] = est.objs
+    const secTipoDest: dicionario = est.secTipoDest
+    const secOffDest: dicionario = est.secOffDest
+    const secFinalVaddr: dicionario = est.secFinalVaddr
+    const globFinalVaddr: dicionario = est.globFinalVaddr
+    const pltOffsets: dicionario = est.pltOffsets
+    const gotVaddrs: dicionario = est.gotVaddrs
+    const localGotPosRW: dicionario = est.localGotPosRW
+    const corpoPreText: qualquer = est.corpoPreText
+    const finalText: qualquer = est.finalText
+    const segRW: qualquer = est.segRW
+    const textVaddr: inteiro = est.textVaddr
+    const userTextBaseOff: inteiro = est.userTextBaseOff
+    const posDataNoRW: inteiro = est.posDataNoRW
+    const posRodataNoBuf: inteiro = est.posRodataNoBuf
+
     para (var o: inteiro = 0; o < objs.tamanho(); o++) {
         const obj: qualquer = objs[o]
         para (var r: inteiro = 0; r < obj.relocs.tamanho(); r++) {
@@ -515,7 +941,7 @@ funcao linkarObjetosELF64(listaDados: qualquer[], nomesArquivos: texto[], libsEn
                 S = inteiro(secFinalVaddr[chSymSec]) + sym.valor
                 nomeGot = "__loc_${o}_${rel.symIdx}"
                 se (localGotPosRW.contem(nomeGot)) {
-                    ec.gravarU64(segRW, inteiro(localGotPosRW[nomeGot]), S)
+                    segRW.definirU64LE(inteiro(localGotPosRW[nomeGot]), S)
                 }
             } senao {
                 se (!globFinalVaddr.contem(sym.nome)) {
@@ -595,111 +1021,282 @@ funcao linkarObjetosELF64(listaDados: qualquer[], nomesArquivos: texto[], libsEn
                     diag.erroDireto(obj.nomeArquivo, 0, 0, "patch fora dos limites de .text",
                         "", "", "E5015")
                 }
-                se (larguraPatch == 8) ec.gravarU64(finalText, offPatchT, valPatch)
-                senao ec.gravarU32(finalText, offPatchT, valPatch)
+                se (larguraPatch == 8) finalText.definirU64LE(offPatchT, valPatch)
+                senao finalText.definirU32LE(offPatchT, valPatch)
             } senao se (dstSecNome == "DATA") {
                 const offPatchD: inteiro = posDataNoRW + inteiro(secOffDest[chAlvo]) + rel.rOffset
                 se (offPatchD < 0 ou offPatchD + larguraPatch > segRW.tamanho()) {
                     diag.erroDireto(obj.nomeArquivo, 0, 0, "patch fora dos limites de .data",
                         "", "", "E5015")
                 }
-                se (larguraPatch == 8) ec.gravarU64(segRW, offPatchD, valPatch)
-                senao ec.gravarU32(segRW, offPatchD, valPatch)
+                se (larguraPatch == 8) segRW.definirU64LE(offPatchD, valPatch)
+                senao segRW.definirU32LE(offPatchD, valPatch)
             } senao se (dstSecNome == "RODATA") {
                 const offPatchR: inteiro = posRodataNoBuf + inteiro(secOffDest[chAlvo]) + rel.rOffset
                 se (offPatchR < 0 ou offPatchR + larguraPatch > corpoPreText.tamanho()) {
                     diag.erroDireto(obj.nomeArquivo, 0, 0, "patch fora dos limites de .rodata",
                         "", "", "E5015")
                 }
-                se (larguraPatch == 8) ec.gravarU64(corpoPreText, offPatchR, valPatch)
-                senao ec.gravarU32(corpoPreText, offPatchR, valPatch)
+                se (larguraPatch == 8) corpoPreText.definirU64LE(offPatchR, valPatch)
+                senao corpoPreText.definirU32LE(offPatchR, valPatch)
             }
         }
     }
+}
 
-    // 9. Tabela .shstrtab e 13 Section Headers
-    var shstrtab: inteiro[] = [0]
-    const nInterp: inteiro = ec.anexarCString(shstrtab, ".interp", bytesMod)
-    const nDynstr: inteiro = ec.anexarCString(shstrtab, ".dynstr", bytesMod)
-    const nDynsym: inteiro = ec.anexarCString(shstrtab, ".dynsym", bytesMod)
-    const nHash: inteiro = ec.anexarCString(shstrtab, ".hash", bytesMod)
-    const nRela: inteiro = ec.anexarCString(shstrtab, ".rela.dyn", bytesMod)
-    const nRodata: inteiro = ec.anexarCString(shstrtab, ".rodata", bytesMod)
-    const nText: inteiro = ec.anexarCString(shstrtab, ".text", bytesMod)
-    const nDynamic: inteiro = ec.anexarCString(shstrtab, ".dynamic", bytesMod)
-    const nGot: inteiro = ec.anexarCString(shstrtab, ".got", bytesMod)
-    const nData: inteiro = ec.anexarCString(shstrtab, ".data", bytesMod)
-    const nBss: inteiro = ec.anexarCString(shstrtab, ".bss", bytesMod)
-    const nShstrtab: inteiro = ec.anexarCString(shstrtab, ".shstrtab", bytesMod)
+// 9-10. Monta o binario ELF64 executavel final em uma unica alocacao Bytes pre-dimensionada
+funcao finalizarElfLink(est: EstadoLink): qualquer {
+    const bytesMod: qualquer = importar("cgd:bytes")
+    const ec: qualquer = importar("../object/elf/elf_comum.delegua")
+    const baseVaddr: inteiro = est.baseVaddr
+    const numPhdrs: inteiro = est.numPhdrs
+    const rxSize: inteiro = est.rxSize
+    const rwFileOff: inteiro = est.rwFileOff
+    const rwVaddr: inteiro = est.rwVaddr
+    const rwFileSize: inteiro = est.rwFileSize
+    const mergedBssSize: inteiro = est.mergedBssSize
+    const offInterp: inteiro = est.offInterp
+    const lenInterp: inteiro = est.lenInterp
+    const offDynstr: inteiro = est.offDynstr
+    const lenDynstr: inteiro = est.lenDynstr
+    const offDynsym: inteiro = est.offDynsym
+    const lenDynsym: inteiro = est.lenDynsym
+    const offHash: inteiro = est.offHash
+    const lenHash: inteiro = est.lenHash
+    const offRela: inteiro = est.offRela
+    const lenRela: inteiro = est.lenRela
+    const offRodata: inteiro = est.offRodata
+    const lenRodata: inteiro = est.lenRodata
+    const rodataVaddr: inteiro = est.rodataVaddr
+    const offText: inteiro = est.offText
+    const lenText: inteiro = est.lenText
+    const textVaddr: inteiro = est.textVaddr
+    const offDynamic: inteiro = est.offDynamic
+    const vaddrDynamic: inteiro = est.vaddrDynamic
+    const lenDynamic: inteiro = est.lenDynamic
+    const offGot: inteiro = est.offGot
+    const vaddrGot: inteiro = est.vaddrGot
+    const lenGot: inteiro = est.lenGot
+    const offData: inteiro = est.offData
+    const dataVaddr: inteiro = est.dataVaddr
+    const lenData: inteiro = est.lenData
+    const offBss: inteiro = est.offBss
+    const bssVaddr: inteiro = est.bssVaddr
+    const corpoPreText: qualquer = est.corpoPreText
+    const finalText: qualquer = est.finalText
+    const segRW: qualquer = est.segRW
+    const shstrtab: qualquer = bytesMod.Bytes.criarReservado(128)
+    shstrtab.anexarByte(0)
+    const nInterp: inteiro = ec.anexarCStringBytes(shstrtab, ".interp")
+    const nDynstr: inteiro = ec.anexarCStringBytes(shstrtab, ".dynstr")
+    const nDynsym: inteiro = ec.anexarCStringBytes(shstrtab, ".dynsym")
+    const nHash: inteiro = ec.anexarCStringBytes(shstrtab, ".hash")
+    const nRela: inteiro = ec.anexarCStringBytes(shstrtab, ".rela.dyn")
+    const nRodata: inteiro = ec.anexarCStringBytes(shstrtab, ".rodata")
+    const nText: inteiro = ec.anexarCStringBytes(shstrtab, ".text")
+    const nDynamic: inteiro = ec.anexarCStringBytes(shstrtab, ".dynamic")
+    const nGot: inteiro = ec.anexarCStringBytes(shstrtab, ".got")
+    const nData: inteiro = ec.anexarCStringBytes(shstrtab, ".data")
+    const nBss: inteiro = ec.anexarCStringBytes(shstrtab, ".bss")
+    const nShstrtab: inteiro = ec.anexarCStringBytes(shstrtab, ".shstrtab")
 
     const offShstrtab: inteiro = rwFileOff + rwFileSize
     const lenShstrtab: inteiro = shstrtab.tamanho()
     const offShdrs: inteiro = ec.alinharValor(offShstrtab + lenShstrtab, 8)
     const numShdrs: inteiro = 13
 
-    // 10. Monta o binario ELF64 executavel final
-    var elf: inteiro[] = [
-        ec.ELF_MAGIC_0, ec.ELF_MAGIC_1, ec.ELF_MAGIC_2, ec.ELF_MAGIC_3,
-        ec.ELFCLASS64, ec.ELFDATA2LSB, ec.EV_CURRENT, 0,
-        0, 0, 0, 0, 0, 0, 0, 0
-    ]
-    ec.anexarU16(elf, ec.ET_EXEC)
-    ec.anexarU16(elf, ec.EM_X86_64)
-    ec.anexarU32(elf, ec.EV_CURRENT)
-    ec.anexarU64(elf, textVaddr)
-    ec.anexarU64(elf, 64)
-    ec.anexarU64(elf, offShdrs)
-    ec.anexarU32(elf, 0)
-    ec.anexarU16(elf, 64)
-    ec.anexarU16(elf, 56)
-    ec.anexarU16(elf, numPhdrs)
-    ec.anexarU16(elf, 64)
-    ec.anexarU16(elf, numShdrs)
-    ec.anexarU16(elf, 12)
+    // 10. Monta o binario ELF64 executavel final em uma unica alocacao Bytes pre-dimensionada
+    const tamFinalElf: inteiro = offShdrs + numShdrs * 64
+    const elf: qualquer = bytesMod.Bytes.criarReservado(tamFinalElf)
+    elf.anexarByte(ec.ELF_MAGIC_0)
+    elf.anexarByte(ec.ELF_MAGIC_1)
+    elf.anexarByte(ec.ELF_MAGIC_2)
+    elf.anexarByte(ec.ELF_MAGIC_3)
+    elf.anexarByte(ec.ELFCLASS64)
+    elf.anexarByte(ec.ELFDATA2LSB)
+    elf.anexarByte(ec.EV_CURRENT)
+    elf.anexarZeros(9)
+    elf.anexarU16LE(ec.ET_EXEC)
+    elf.anexarU16LE(ec.EM_X86_64)
+    elf.anexarU32LE(ec.EV_CURRENT)
+    elf.anexarU64LE(textVaddr)
+    elf.anexarU64LE(64)
+    elf.anexarU64LE(offShdrs)
+    elf.anexarU32LE(0)
+    elf.anexarU16LE(64)
+    elf.anexarU16LE(56)
+    elf.anexarU16LE(numPhdrs)
+    elf.anexarU16LE(64)
+    elf.anexarU16LE(numShdrs)
+    elf.anexarU16LE(12)
 
     // 5 Program Headers (W^X: segmento RX e segmento RW em paginas separadas)
-    ec.anexarPhdr(elf, ec.PT_PHDR, ec.PF_R, 64, baseVaddr + 64, numPhdrs * 56, numPhdrs * 56,
+    ec.anexarPhdrBytes(elf, ec.PT_PHDR, ec.PF_R, 64, baseVaddr + 64, numPhdrs * 56, numPhdrs * 56,
         8)
-    ec.anexarPhdr(elf, ec.PT_INTERP, ec.PF_R, offInterp, baseVaddr + offInterp, lenInterp,
+    ec.anexarPhdrBytes(elf, ec.PT_INTERP, ec.PF_R, offInterp, baseVaddr + offInterp, lenInterp,
         lenInterp, 1)
-    ec.anexarPhdr(elf, ec.PT_LOAD, ec.PF_R | ec.PF_X, 0, baseVaddr, rxSize, rxSize, 4096)
-    ec.anexarPhdr(elf, ec.PT_LOAD, ec.PF_R | ec.PF_W, rwFileOff, rwVaddr, rwFileSize, rwFileSize + mergedBssSize,
+    ec.anexarPhdrBytes(elf, ec.PT_LOAD, ec.PF_R | ec.PF_X, 0, baseVaddr, rxSize, rxSize,
         4096)
-    ec.anexarPhdr(elf, ec.PT_DYNAMIC, ec.PF_R | ec.PF_W, offDynamic, vaddrDynamic, lenDynamic,
+    ec.anexarPhdrBytes(elf, ec.PT_LOAD, ec.PF_R | ec.PF_W, rwFileOff, rwVaddr, rwFileSize,
+        rwFileSize + mergedBssSize, 4096)
+    ec.anexarPhdrBytes(elf, ec.PT_DYNAMIC, ec.PF_R | ec.PF_W, offDynamic, vaddrDynamic, lenDynamic,
         lenDynamic, 8)
 
-    para (var i: inteiro = 0; i < corpoPreText.tamanho(); i++) elf.empilhar(corpoPreText[i])
-    para (var i: inteiro = 0; i < finalText.tamanho(); i++) elf.empilhar(finalText[i])
-    enquanto (elf.tamanho() < rwFileOff) elf.empilhar(0)
-    para (var i: inteiro = 0; i < segRW.tamanho(); i++) elf.empilhar(segRW[i])
-    para (var i: inteiro = 0; i < shstrtab.tamanho(); i++) elf.empilhar(shstrtab[i])
-    enquanto (elf.tamanho() < offShdrs) elf.empilhar(0)
+    elf.anexarBytes(corpoPreText)
+    elf.anexarBytes(finalText)
+    const padRw: inteiro = rwFileOff - elf.tamanho()
+    se (padRw > 0) elf.anexarZeros(padRw)
+    elf.anexarBytes(segRW)
+    elf.anexarBytes(shstrtab)
+    const padSh: inteiro = offShdrs - elf.tamanho()
+    se (padSh > 0) elf.anexarZeros(padSh)
 
-    ec.anexarShdr(elf, 0, ec.SHT_NULL, 0, 0, 0, 0, 0, 0, 0, 0)
-    ec.anexarShdr(elf, nInterp, ec.SHT_PROGBITS, ec.SHF_ALLOC, baseVaddr + offInterp, offInterp,
-        lenInterp, 0, 0, 1, 0)
-    ec.anexarShdr(elf, nDynstr, ec.SHT_STRTAB, ec.SHF_ALLOC, baseVaddr + offDynstr, offDynstr,
-        lenDynstr, 0, 0, 1, 0)
-    ec.anexarShdr(elf, nDynsym, ec.SHT_DYNSYM, ec.SHF_ALLOC, baseVaddr + offDynsym, offDynsym,
-        lenDynsym, 2, 1, 8, 24)
-    ec.anexarShdr(elf, nHash, ec.SHT_HASH, ec.SHF_ALLOC, baseVaddr + offHash, offHash, lenHash,
-        3, 0, 8, 4)
-    ec.anexarShdr(elf, nRela, ec.SHT_RELA, ec.SHF_ALLOC, baseVaddr + offRela, offRela, lenRela,
-        3, 0, 8, 24)
-    ec.anexarShdr(elf, nRodata, ec.SHT_PROGBITS, ec.SHF_ALLOC, rodataVaddr, offRodata, lenRodata,
-        0, 0, 8, 0)
-    ec.anexarShdr(elf, nText, ec.SHT_PROGBITS, ec.SHF_ALLOC | ec.SHF_EXECINSTR, textVaddr,
+    ec.anexarShdrBytes(elf, 0, ec.SHT_NULL, 0, 0, 0, 0, 0, 0, 0, 0)
+    ec.anexarShdrBytes(elf, nInterp, ec.SHT_PROGBITS, ec.SHF_ALLOC, baseVaddr + offInterp,
+        offInterp, lenInterp, 0, 0, 1, 0)
+    ec.anexarShdrBytes(elf, nDynstr, ec.SHT_STRTAB, ec.SHF_ALLOC, baseVaddr + offDynstr,
+        offDynstr, lenDynstr, 0, 0, 1, 0)
+    ec.anexarShdrBytes(elf, nDynsym, ec.SHT_DYNSYM, ec.SHF_ALLOC, baseVaddr + offDynsym,
+        offDynsym, lenDynsym, 2, 1, 8, 24)
+    ec.anexarShdrBytes(elf, nHash, ec.SHT_HASH, ec.SHF_ALLOC, baseVaddr + offHash, offHash,
+        lenHash, 3, 0, 8, 4)
+    ec.anexarShdrBytes(elf, nRela, ec.SHT_RELA, ec.SHF_ALLOC, baseVaddr + offRela, offRela,
+        lenRela, 3, 0, 8, 24)
+    ec.anexarShdrBytes(elf, nRodata, ec.SHT_PROGBITS, ec.SHF_ALLOC, rodataVaddr, offRodata,
+        lenRodata, 0, 0, 8, 0)
+    ec.anexarShdrBytes(elf, nText, ec.SHT_PROGBITS, ec.SHF_ALLOC | ec.SHF_EXECINSTR, textVaddr,
         offText, lenText, 0, 0, 16, 0)
-    ec.anexarShdr(elf, nDynamic, ec.SHT_DYNAMIC, ec.SHF_ALLOC | ec.SHF_WRITE, vaddrDynamic,
+    ec.anexarShdrBytes(elf, nDynamic, ec.SHT_DYNAMIC, ec.SHF_ALLOC | ec.SHF_WRITE, vaddrDynamic,
         offDynamic, lenDynamic, 2, 0, 8, 16)
-    ec.anexarShdr(elf, nGot, ec.SHT_PROGBITS, ec.SHF_ALLOC | ec.SHF_WRITE, vaddrGot, offGot,
-        lenGot, 0, 0, 8, 8)
-    ec.anexarShdr(elf, nData, ec.SHT_PROGBITS, ec.SHF_ALLOC | ec.SHF_WRITE, dataVaddr, offData,
-        lenData, 0, 0, 8, 0)
-    ec.anexarShdr(elf, nBss, ec.SHT_NOBITS, ec.SHF_ALLOC | ec.SHF_WRITE, bssVaddr, offBss,
+    ec.anexarShdrBytes(elf, nGot, ec.SHT_PROGBITS, ec.SHF_ALLOC | ec.SHF_WRITE, vaddrGot,
+        offGot, lenGot, 0, 0, 8, 8)
+    ec.anexarShdrBytes(elf, nData, ec.SHT_PROGBITS, ec.SHF_ALLOC | ec.SHF_WRITE, dataVaddr,
+        offData, lenData, 0, 0, 8, 0)
+    ec.anexarShdrBytes(elf, nBss, ec.SHT_NOBITS, ec.SHF_ALLOC | ec.SHF_WRITE, bssVaddr, offBss,
         mergedBssSize, 0, 0, 8, 0)
-    ec.anexarShdr(elf, nShstrtab, ec.SHT_STRTAB, 0, 0, offShstrtab, lenShstrtab, 0, 0, 1,
-        0)
+    ec.anexarShdrBytes(elf, nShstrtab, ec.SHT_STRTAB, 0, 0, offShstrtab, lenShstrtab, 0,
+        0, 1, 0)
 
     retorna elf
+}
+
+// Entrada assincrona principal do linker: suporta leitura/validacao concorrente de .o e membros .a
+// via `rotina` (Bytes congelado zero-copy) preservando a ordem exata da linha de comando.
+assincrona funcao linkarObjetosELF64BytesAsync(listaDados: qualquer[], nomesArquivos: texto[],
+    libsEntrada: texto[], diag: qualquer, workers: inteiro = 1): qualquer {
+    const leitor: qualquer = importar("elf_leitor.delegua")
+    const asyncMod: qualquer = importar("cgd:assincrono")
+
+    const ambMod: qualquer = importar("cgd:ambiente")
+    const forcarParLnk: logico = ambMod.Ambiente.obter("DCC_FORCE_PAR_LINKER", "") == "1"
+
+    var objs: qualquer[] = []
+    var arquivosAr: qualquer[] = []
+    var defsPrevia: dicionario = {}
+    var totalBytesEntrada: inteiro = 0
+
+    // Expande entradas em tarefas unitarias preservando ordem e origem (0=objeto direto, 1=membro .a)
+    var itensOrig: qualquer[] = [] // tupla([bytesBuf, nomeArq, ehDeAr])
+    para (var i: inteiro = 0; i < listaDados.tamanho(); i++) {
+        const dadosIn: qualquer = leitor.assegurarBytesElf(listaDados[i])
+        const nomeIn: texto = nomesArquivos[i]
+        totalBytesEntrada = totalBytesEntrada + dadosIn.tamanho()
+        se (leitor.ehArquivoAr(dadosIn)) {
+            const fatias: qualquer[] = leitor.fatiarMembrosDeAr(dadosIn, nomeIn, diag)
+            para (var m: inteiro = 0; m < fatias.tamanho(); m++) {
+                itensOrig.empilhar(tupla([fatias[m][0], texto(fatias[m][1]), verdadeiro]))
+            }
+        } senao {
+            itensOrig.empilhar(tupla([dadosIn, nomeIn, falso]))
+        }
+    }
+
+    // Limiar empirico: leitura paralela apenas quando ha volume real (>= 16 itens e >= 16 MiB)
+    // para evitar pagar overhead de spawn/serializacao em links rapidos (< 30 ms sequenciais).
+    const usarLeituraParalela: logico = workers > 1 e ((itensOrig.tamanho() >= 16 e totalBytesEntrada >= 16777216) ou (forcarParLnk e itensOrig.tamanho() >= 4))
+    se (usarLeituraParalela) {
+        asyncMod.Rotinas.configurar(workers, 512)
+        // Processa em janelas de ate 128 tarefas para respeitar backpressure de fila e memoria
+        var baseIdx: inteiro = 0
+        enquanto (baseIdx < itensOrig.tamanho()) {
+            const candFim: inteiro = baseIdx + 128
+            const fimIdx: inteiro = candFim < itensOrig.tamanho() ? candFim : itensOrig.tamanho()
+            var tarefas: qualquer[] = []
+            var bufsCong: qualquer[] = []
+            para (var k: inteiro = baseIdx; k < fimIdx; k++) {
+                const bCong: qualquer = itensOrig[k][0].congelar()
+                bufsCong.empilhar(bCong)
+                tarefas.empilhar(rotina leitor.validarESerializarElfWorker(bCong.recursoInterno()))
+            }
+            const pacotes: qualquer[] = aguardar Promessa.todas(tarefas)
+            para (var k: inteiro = baseIdx; k < fimIdx; k++) {
+                const loc: inteiro = k - baseIdx
+                const objLido: qualquer = leitor.materializarObjetoDeWorker(bufsCong[loc],
+                    texto(itensOrig[k][1]), pacotes[loc], diag)
+                se (itensOrig[k][2]) {
+                    arquivosAr.empilhar(objLido)
+                } senao {
+                    objs.empilhar(objLido)
+                    registrarDefinidosObjeto(objLido, defsPrevia)
+                }
+            }
+            baseIdx = fimIdx
+        }
+    } senao {
+        para (var k: inteiro = 0; k < itensOrig.tamanho(); k++) {
+            const objLido: qualquer = leitor.lerObjetoELF64(itensOrig[k][0], texto(itensOrig[k][1]),
+                diag)
+            se (itensOrig[k][2]) {
+                arquivosAr.empilhar(objLido)
+            } senao {
+                objs.empilhar(objLido)
+                registrarDefinidosObjeto(objLido, defsPrevia)
+            }
+        }
+    }
+
+    const est: EstadoLink = prepararEstadoLink(objs, arquivosAr, defsPrevia, libsEntrada,
+        diag)
+    se (workers > 1 e (est.totalRelocsLink >= 20000 ou (forcarParLnk e est.totalRelocsLink >= 2000))) {
+        aguardar aplicarRelocacoesParAsync(est, workers, diag)
+    } senao {
+        aplicarRelocacoesSeq(est, diag)
+    }
+
+    retorna finalizarElfLink(est)
+}
+
+funcao linkarObjetosELF64Bytes(listaDados: qualquer[], nomesArquivos: texto[], libsEntrada: texto[],
+    diag: qualquer): qualquer {
+    const leitor: qualquer = importar("elf_leitor.delegua")
+    var objs: qualquer[] = []
+    var arquivosAr: qualquer[] = []
+    var defsPrevia: dicionario = {}
+
+    para (var i: inteiro = 0; i < listaDados.tamanho(); i++) {
+        const dadosIn: qualquer = leitor.assegurarBytesElf(listaDados[i])
+        const nomeIn: texto = nomesArquivos[i]
+        se (leitor.ehArquivoAr(dadosIn)) {
+            const membrosAr: qualquer[] = leitor.extrairObjetosDeAr(dadosIn, nomeIn, diag)
+            para (var m: inteiro = 0; m < membrosAr.tamanho(); m++) {
+                arquivosAr.empilhar(membrosAr[m])
+            }
+        } senao {
+            const objLido: qualquer = leitor.lerObjetoELF64(dadosIn, nomeIn, diag)
+            objs.empilhar(objLido)
+            registrarDefinidosObjeto(objLido, defsPrevia)
+        }
+    }
+
+    const est: EstadoLink = prepararEstadoLink(objs, arquivosAr, defsPrevia, libsEntrada,
+        diag)
+    aplicarRelocacoesSeq(est, diag)
+    retorna finalizarElfLink(est)
+}
+
+funcao linkarObjetosELF64(listaDados: qualquer[], nomesArquivos: texto[], libsEntrada: texto[],
+    diag: qualquer): inteiro[] {
+    const elfBytes: qualquer = linkarObjetosELF64Bytes(listaDados, nomesArquivos, libsEntrada,
+        diag)
+    retorna elfBytes.paraVetor()
 }

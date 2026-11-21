@@ -2,6 +2,23 @@
 
 Todas as mudanças notáveis do **DCC — Delégua C Compiler** são documentadas neste arquivo seguindo versionamento semântico (`MAJOR.MINOR.PATCH`).
 
+## [0.3.0] - 2026-11-21
+
+### Paralelismo Adaptativo e CLI
+- Novas opções de paralelismo com política conservadora baseada em afinidade de CPU (`sched_getaffinity`), quotas cgroup v2/v1, memória disponível e pressão de memória: `-j <N|auto>`, `-j<N>`, `--parallel=off`, `--parallel=auto` e variável `DCC_JOBS`.
+- Compilação concorrente Multi-TU via pool limitado de subprocessos isolados (`cgd:processo.Processo.executarLote`), com ordenação determinística de diagnósticos/erros, limpeza garantida de temporários e aceleração de **1,85× (`-j4`) a 2,36× (`-j8`)** em 17 arquivos `.c` preservando SHA-256 bit a bit idêntico.
+
+### Memória, Streaming e Otimização Profunda
+- Pipeline streaming função-a-função (`verificarCorpoFuncao` → `construirFuncaoSSA` → `otimizarFuncaoSSA` → `verificarFuncaoSSA` → `emitirFuncaoStreaming`), liberação progressiva de `TokenC99` no parser com `Memoria.coletarSeAcima()` mid-parse e resolução imediata de labels locais no emissor (`resolverPatchesFuncao`).
+- Otimizador e verificador SSA (`ir_opt.delegua`, `ir_verify.delegua`) migrados para `cgd:memoria.Arena` (`FatiaBytes`/`FatiaInt64`, zero churn GC), DCE reversa por contagem de usos e despacho $O(1)$ de `OpIR` por faixa inteira (`opt+verify` **4,31× mais rápido** em `frozen_dcc.c`).
+- Emissor x86-64 e ELF64 operando diretamente sobre `cgd:bytes.Bytes` (`GC_MALLOC_ATOMIC`), removendo subprocessos `base64` e adicionando `CallInfoSSA` preguiçoso, rastreamento intra-bloco de `RAX` e telemetria `-fmem-report`.
+- Em `frozen_dcc.c` (`clang -O2`, `-j1`): tempo mediano reduzido para **`8,66 s`** (`-28,5%` vs Ciclo IV nos mesmos headers) e pico RSS para **`572.960 KB` (`559,5 MiB`, `-42,4%`)**, mantendo determinismo bit a bit entre Clang, GCC e TinyCC (`0.9.28rc`).
+
+### Linker Nativo ELF64 em `Bytes` e Paralelo
+- Migração integral de `elf_leitor.delegua`, `linker.delegua` e `elf_comum.delegua` de `inteiro[]` para `cgd:bytes.Bytes` com pré-alocação por prefix-sum (`300 .o`: **`0,20 s / 154,6 MB → 0,03 s / 22,1 MB`**, `6,7×` mais rápido e `-85,7%` RSS).
+- Leitura/validação paralela de `.o`/`.a` (`validarESerializarElfWorker`) e preparação paralela de patches de relocação (`prepararPatchesRelocWorker`) via `rotina` CGD + `Bytes` congelado *zero-copy*, com detecção de sobreposição de patches e rejeição de ELFs hostis.
+- Nova suíte `tests/test_paralelismo.py`, benchmark `scripts/bench_paralelismo.py` e relatórios técnicos dos Ciclos IV e V.
+
 ## [0.2.0] - 2026-11-21
 
 ### Arquitetura e Refatoração

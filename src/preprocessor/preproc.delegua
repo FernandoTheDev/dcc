@@ -67,6 +67,7 @@ funcao fasesIniciaisELimpezaLinhasPP(fonte: texto, nomeArquivo: texto, diag: qua
     bytesModArg: qualquer = nulo): texto[] {
     var bytesMod: qualquer = bytesModArg
     se (bytesMod == nulo) bytesMod = importar("cgd:bytes")
+    const texMod: qualquer = importar("cgd:textos")
 
     const linhasBrutas: texto[] = fonte.dividir("\n")
     const totalLin: inteiro = linhasBrutas.tamanho()
@@ -77,7 +78,8 @@ funcao fasesIniciaisELimpezaLinhasPP(fonte: texto, nomeArquivo: texto, diag: qua
 
     enquanto (idx < totalLin) {
         var lin: texto = linhasBrutas[idx]
-        const temEspecial: logico = lin.contem("\r") ou lin.contem("??") ou lin.contem("/*") ou lin.contem("//") ou lin.contem("\\")
+        const temEspecial: logico = lin.contem("\r") ou lin.contem("??") ou lin.contem("/*") ou lin.contem("//") ou texMod.Textos.terminaCom(lin,
+            "\\")
 
         // Caminho rapido O(1): linha comum fora de comentario de bloco
         se (!emBlocoCom e !temEspecial) {
@@ -400,19 +402,19 @@ classe PreprocessadorDCC {
         retorna tupla(["", -1])
     }
 
-    // Verificacao rapida O(N) sobre bytes (evita indexacao UTF-8 O(L^2) em linhas de 360+ KiB):
+    // Verificacao rapida O(N) diretamente sobre cgd:bytes (zero alocacao de inteiro[] ou idB[]):
     // retorna verdadeiro apenas se a linha contiver algum identificador em isto.macros ou predefinida.
     linhaContemMacroAtiva(linhaStr: texto): logico {
-        const raw: inteiro[] = isto.bytesMod.Bytes.deTexto(linhaStr).paraVetor()
+        const raw: qualquer = isto.bytesMod.Bytes.deTexto(linhaStr)
         const n: inteiro = raw.tamanho()
         var i: inteiro = 0
         enquanto (i < n) {
-            const b: inteiro = raw[i]
+            const b: inteiro = raw.obter(i)
             se (b == 34 ou b == 39) {
                 const delim: inteiro = b
                 i++
                 enquanto (i < n) {
-                    const ch: inteiro = raw[i]
+                    const ch: inteiro = raw.obter(i)
                     i++
                     se (ch == 92 e i < n) i++
                     senao se (ch == delim) sustar
@@ -420,18 +422,17 @@ classe PreprocessadorDCC {
                 continua
             }
             se ((b >= 65 e b <= 90) ou (b >= 97 e b <= 122) ou b == 95 ou b == 36) {
-                var idB: inteiro[] = [b]
+                const iniId: inteiro = i
                 i++
                 enquanto (i < n) {
-                    const c: inteiro = raw[i]
+                    const c: inteiro = raw.obter(i)
                     se ((c >= 65 e c <= 90) ou (c >= 97 e c <= 122) ou (c >= 48 e c <= 57) ou c == 95 ou c == 36) {
-                        idB.empilhar(c)
                         i++
                     } senao {
                         sustar
                     }
                 }
-                const id: texto = isto.bytesMod.Bytes.deVetor(idB).paraTexto()
+                const id: texto = raw.fatiarTexto(iniId, i)
                 se (isto.macros.contem(id) ou id == "__LINE__" ou id == "__FILE__" ou id == "_Pragma") {
                     retorna verdadeiro
                 }

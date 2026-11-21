@@ -244,7 +244,7 @@ classe AnalisadorSemanticoDCC {
         senao isto.tabela.structs[no.nome] = ag
     }
 
-    verificarPrograma(prog: qualquer, exigirMain: logico = falso): ResultadoSemantica {
+    prepararGlobaisEAssinaturas(prog: qualquer, exigirMain: logico = falso): ResultadoSemantica {
         var numFuncoes: inteiro = 0
         var numStructs: inteiro = 0
         var numUnions: inteiro = 0
@@ -361,22 +361,33 @@ classe AnalisadorSemanticoDCC {
             }
         }
 
+        retorna ResultadoSemantica(isto.tabela, isto.globais, numFuncoes, numStructs, numUnions)
+    }
+
+    verificarCorpoFuncao(no: qualquer): vazio {
+        se (no.kind != isto.Kind.Funcao) retorna
+        var escopos: dicionario[] = [isto.globais, {}]
+        const pLista: qualquer = no.filhos[0]
+        para (var p: inteiro = 0; p < pLista.filhos.tamanho(); p++) {
+            const pNo: qualquer = pLista.filhos[p]
+            escopos[1][pNo.nome] = pNo.tipoC
+        }
+        var labels: dicionario = {}
+        isto.coletarLabels(no.filhos[1], labels)
+        isto.verificarStmt(no.filhos[1], escopos, no.tipoC, 0, 0, labels)
+    }
+
+    verificarPrograma(prog: qualquer, exigirMain: logico = falso): ResultadoSemantica {
+        const res: ResultadoSemantica = isto.prepararGlobaisEAssinaturas(prog, exigirMain)
+
         // Passe 2: verifica corpos das funcoes
         para (var i: inteiro = 0; i < prog.filhos.tamanho(); i++) {
             const no: qualquer = prog.filhos[i]
             se (no.kind != isto.Kind.Funcao) continua
-            var escopos: dicionario[] = [isto.globais, {}]
-            const pLista: qualquer = no.filhos[0]
-            para (var p: inteiro = 0; p < pLista.filhos.tamanho(); p++) {
-                const pNo: qualquer = pLista.filhos[p]
-                escopos[1][pNo.nome] = pNo.tipoC
-            }
-            var labels: dicionario = {}
-            isto.coletarLabels(no.filhos[1], labels)
-            isto.verificarStmt(no.filhos[1], escopos, no.tipoC, 0, 0, labels)
+            isto.verificarCorpoFuncao(no)
         }
 
-        retorna ResultadoSemantica(isto.tabela, isto.globais, numFuncoes, numStructs, numUnions)
+        retorna res
     }
 
     coletarLabels(stmt: qualquer, labels: dicionario): vazio {
@@ -909,6 +920,10 @@ classe AnalisadorSemanticoDCC {
         }
         retorna isto.tMod.TipoC.tipoInt(falso)
     }
+}
+
+funcao criarAnalisadorSemanticoDCC(diag: qualquer): AnalisadorSemanticoDCC {
+    retorna AnalisadorSemanticoDCC(diag)
 }
 
 funcao analisarSemanticaDCC(prog: qualquer, diag: qualquer, exigirMain: logico = falso): ResultadoSemantica {

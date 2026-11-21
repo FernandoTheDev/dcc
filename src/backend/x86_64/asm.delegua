@@ -33,8 +33,9 @@ funcao formatarBytesLista(vals: inteiro[]): texto {
 
 funcao emitirCallAsm(linhas: qualquer, fn: qualquer, inst: qualquer, alvoCall: texto, ehIndireto: logico,
     ehExtern: logico): vazio {
+    const ci: qualquer = inst.callInfo
     const abiInt: texto[] = ["rdi", "rsi", "rdx", "rcx", "r8", "r9"]
-    var intIdx: inteiro = (inst.callRetStructModo == 3 e inst.callSretReg >= 0) ? 1 : 0
+    var intIdx: inteiro = (ci.retStructModo == 3 e ci.sretReg >= 0) ? 1 : 0
     var fltIdx: inteiro = 0
     var stackArgs: inteiro[] = []
     var regIntSlots: inteiro[] = []
@@ -43,10 +44,10 @@ funcao emitirCallAsm(linhas: qualquer, fn: qualquer, inst: qualquer, alvoCall: t
     var regFltNums: inteiro[] = []
     var regFltEh32: logico[] = []
 
-    para (var k: inteiro = 0; k < inst.callArgs.tamanho(); k++) {
-        const regArg: inteiro = inst.callArgs[k]
-        const ehFlt: logico = k < inst.callArgFloats.tamanho() ? inst.callArgFloats[k] : falso
-        const largA: inteiro = k < inst.callArgLarguras.tamanho() ? inst.callArgLarguras[k] : 8
+    para (var k: inteiro = 0; k < ci.args.tamanho(); k++) {
+        const regArg: inteiro = ci.args[k]
+        const ehFlt: logico = k < ci.argFloats.tamanho() ? ci.argFloats[k] : falso
+        const largA: inteiro = k < ci.argLarguras.tamanho() ? ci.argLarguras[k] : 8
         se (ehFlt) {
             se (fltIdx < 8) {
                 regFltNums.empilhar(fltIdx)
@@ -77,8 +78,8 @@ funcao emitirCallAsm(linhas: qualquer, fn: qualquer, inst: qualquer, alvoCall: t
         linhas.empilhar("    push rax")
     }
 
-    se (inst.callRetStructModo == 3 e inst.callSretReg >= 0) {
-        linhas.empilhar("    mov rdi, [rbp - ${offsetReg(fn.tamanhoLocaisBytes, inst.callSretReg)}]")
+    se (ci.retStructModo == 3 e ci.sretReg >= 0) {
+        linhas.empilhar("    mov rdi, [rbp - ${offsetReg(fn.tamanhoLocaisBytes, ci.sretReg)}]")
     }
 
     para (var i: inteiro = 0; i < regIntNums.tamanho(); i++) {

@@ -103,10 +103,9 @@ funcao ehContIdent(c: texto): logico {
 
 // Decodifica sequencia de escape C99 diretamente sobre vetor de bytes (O(1) por byte, sem O(L^2) UTF-8).
 // Retorna (valorByte, quantidadeDeBytesConsumidosAposBarra).
-funcao decodificarEscapeBytesC99(raw: inteiro[], posEsc: inteiro, n: inteiro): (inteiro,
-    inteiro) {
+funcao decodificarEscapeBytesC99(raw: qualquer, posEsc: inteiro, n: inteiro): (inteiro, inteiro) {
     se (posEsc >= n) retorna tupla([0, 0])
-    const b: inteiro = raw[posEsc]
+    const b: inteiro = raw.obter(posEsc)
     se (b == 110) retorna tupla([10, 1]) // 'n'
     se (b == 116) retorna tupla([9, 1]) // 't'
     se (b == 114) retorna tupla([13, 1]) // 'r'
@@ -124,7 +123,7 @@ funcao decodificarEscapeBytesC99(raw: inteiro[], posEsc: inteiro, n: inteiro): (
         var valH: inteiro = 0
         var p: inteiro = posEsc + 1
         enquanto (p < n) {
-            const c: inteiro = raw[p]
+            const c: inteiro = raw.obter(p)
             var d: inteiro = -1
             se (c >= 48 e c <= 57) d = c - 48
             senao se (c >= 65 e c <= 70) d = c - 55
@@ -141,8 +140,10 @@ funcao decodificarEscapeBytesC99(raw: inteiro[], posEsc: inteiro, n: inteiro): (
         var valO: inteiro = b - 48
         var p: inteiro = posEsc + 1
         var cnt: inteiro = 1
-        enquanto (p < n e cnt < 3 e raw[p] >= 48 e raw[p] <= 55) {
-            valO = (valO << 3) | (raw[p] - 48)
+        enquanto (p < n e cnt < 3) {
+            const co: inteiro = raw.obter(p)
+            se (co < 48 ou co > 55) sustar
+            valO = (valO << 3) | (co - 48)
             p++
             cnt++
         }

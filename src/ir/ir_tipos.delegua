@@ -1,5 +1,26 @@
 // Estruturas de dados da IR SSA tipada (CFG + instrucoes + globais + relocacoes de dados) do DCC.
 
+classe CallInfoSSA {
+    args: qualquer
+    argFloats: qualquer
+    argLarguras: qualquer
+    argEhStruct: qualquer
+    ehVariadica: logico
+    retStructModo: inteiro // 0=escalar, 1=<=8B(rax), 2=9..16B(rax:rdx), 3=>16B(sret)
+    sretReg: inteiro
+
+    construtor(args: qualquer, argFloats: qualquer, argLarguras: qualquer, argEhStruct: qualquer,
+        ehVariadica: logico, retStructModo: inteiro, sretReg: inteiro) {
+        isto.args = args
+        isto.argFloats = argFloats
+        isto.argLarguras = argLarguras
+        isto.argEhStruct = argEhStruct
+        isto.ehVariadica = ehVariadica
+        isto.retStructModo = retStructModo
+        isto.sretReg = sretReg
+    }
+}
+
 classe InstSSA {
     op: qualquer
     dst: inteiro
@@ -13,13 +34,7 @@ classe InstSSA {
     ehVolatile: logico
     alvo1: texto
     alvo2: texto
-    callArgs: qualquer
-    callArgFloats: qualquer
-    callArgLarguras: qualquer
-    callArgEhStruct: qualquer
-    callEhVariadica: logico
-    callRetStructModo: inteiro // 0=escalar, 1=<=8B(rax), 2=9..16B(rax:rdx), 3=>16B(sret)
-    callSretReg: inteiro
+    callInfo: qualquer
 
     construtor(op: qualquer, dst: inteiro = -1, a: inteiro = 0, b: inteiro = 0, alvo1: texto = "",
         alvo2: texto = "") {
@@ -35,13 +50,7 @@ classe InstSSA {
         isto.ehVolatile = falso
         isto.alvo1 = alvo1
         isto.alvo2 = alvo2
-        isto.callArgs = nulo
-        isto.callArgFloats = nulo
-        isto.callArgLarguras = nulo
-        isto.callArgEhStruct = nulo
-        isto.callEhVariadica = falso
-        isto.callRetStructModo = 0
-        isto.callSretReg = -1
+        isto.callInfo = nulo
     }
 }
 

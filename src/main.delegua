@@ -7,10 +7,13 @@ classe estrangeira LibCExit {
     estatico sair(codigo: inteiro): vazio;
 }
 
-const procMod: qualquer = importar("cgd:processo")
-const cliMod: qualquer = importar("driver/cli.delegua")
-
-const codigo: inteiro = cliMod.executarDriverDCC(procMod.Processo.argumentos())
-se (codigo != 0) {
-    LibCExit.sair(codigo)
+assincrona funcao principal(): vazio {
+    const procMod: qualquer = importar("cgd:processo")
+    const cliMod: qualquer = importar("driver/cli.delegua")
+    const codigo: inteiro = aguardar cliMod.executarDriverDCCAsync(procMod.Processo.argumentos())
+    se (codigo != 0) {
+        LibCExit.sair(codigo)
+    }
 }
+
+principal()

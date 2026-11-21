@@ -48,9 +48,9 @@ classe RelocObj {
 }
 
 classe CodigoObjeto {
-    textBytes: inteiro[]
-    rodataBytes: inteiro[]
-    dataBytes: inteiro[]
+    textBytes: qualquer
+    rodataBytes: qualquer
+    dataBytes: qualquer
     bssSize: inteiro
     simbolos: SimboloObj[]
     relocsText: RelocObj[]
@@ -58,9 +58,10 @@ classe CodigoObjeto {
     libsExternas: texto[]
 
     construtor() {
-        isto.textBytes = []
-        isto.rodataBytes = []
-        isto.dataBytes = []
+        const bytesMod: qualquer = importar("cgd:bytes")
+        isto.textBytes = bytesMod.Bytes.criarReservado(0)
+        isto.rodataBytes = bytesMod.Bytes.criarReservado(4096)
+        isto.dataBytes = bytesMod.Bytes.criarReservado(4096)
         isto.bssSize = 0
         isto.simbolos = []
         isto.relocsText = []
@@ -70,15 +71,18 @@ classe CodigoObjeto {
 }
 
 classe EmissorX86_64 {
-    code: inteiro[]
+    code: qualquer
     labels: dicionario
+    labelsLocais: dicionario
     patchesRel32: PatchRel32[]
     relocs: RelocObj[]
     contAux: inteiro
 
     construtor() {
-        isto.code = []
+        const bytesMod: qualquer = importar("cgd:bytes")
+        isto.code = bytesMod.Bytes.criarReservado(65536)
         isto.labels = {}
+        isto.labelsLocais = {}
         isto.patchesRel32 = []
         isto.relocs = []
         isto.contAux = 0
@@ -90,23 +94,23 @@ classe EmissorX86_64 {
     }
 
     u8(b: inteiro): vazio {
-        isto.code.empilhar(b & 255)
+        isto.code.anexarByte(b & 255)
     }
 
     u32(v: inteiro): vazio {
-        isto.u8(v)
-        isto.u8(v >> 8)
-        isto.u8(v >> 16)
-        isto.u8(v >> 24)
+        isto.code.anexarU32LE(v)
     }
 
     u64(v: inteiro): vazio {
-        isto.u32(v)
-        isto.u32(v >> 32)
+        isto.code.anexarU64LE(v)
     }
 
     marcarLabel(nome: texto): vazio {
-        isto.labels[nome] = isto.code.tamanho()
+        se (nome.tamanho() >= 3 e nome[0] == "f" e nome[1] == "n" e nome[2] == "_") {
+            isto.labels[nome] = isto.code.tamanho()
+        } senao {
+            isto.labelsLocais[nome] = isto.code.tamanho()
+        }
     }
 
     pushRbp(): vazio {
@@ -887,22 +891,55 @@ classe EmissorX86_64 {
         }
     }
 
+    resolverPatchesFuncao(inicioPatchIdx: inteiro): vazio {
+        const diagMod: qualquer = importar("../../diagnostics/diag.delegua")
+        const total: inteiro = isto.patchesRel32.tamanho()
+        var writeIdx: inteiro = inicioPatchIdx
+        para (var i: inteiro = inicioPatchIdx; i < total; i++) {
+            const p: PatchRel32 = isto.patchesRel32[i]
+            se (isto.labelsLocais.contem(p.alvo)) {
+                const alvoAddr: inteiro = inteiro(isto.labelsLocais[p.alvo])
+                const rel32: inteiro = alvoAddr - (p.pos + 4)
+                se (rel32 < -2147483648 ou rel32 > 2147483647) {
+                    falhar diagMod.ErroDCC("Backend x86-64: deslocamento relativo rel32 fora de alcance (${rel32}) para '${p.alvo}'",
+                        "", 0, 0, "E4002", falso)
+                }
+                isto.code.definirU32LE(p.pos, rel32)
+            } senao {
+                se (writeIdx != i) {
+                    isto.patchesRel32[writeIdx] = p
+                }
+                writeIdx++
+            }
+        }
+        enquanto (isto.patchesRel32.tamanho() > writeIdx) {
+            isto.patchesRel32.removerUltimo()
+        }
+        isto.labelsLocais = {}
+    }
+
     resolverPatchesInternos(): vazio {
-        const elfComum: qualquer = importar("../../object/elf/elf_comum.delegua")
         const diagMod: qualquer = importar("../../diagnostics/diag.delegua")
         para (var i: inteiro = 0; i < isto.patchesRel32.tamanho(); i++) {
             const p: PatchRel32 = isto.patchesRel32[i]
-            se (!isto.labels.contem(p.alvo)) {
+            var temAlvo: logico = isto.labels.contem(p.alvo)
+            var alvoAddr: inteiro = 0
+            se (temAlvo) {
+                alvoAddr = inteiro(isto.labels[p.alvo])
+            } senao se (isto.labelsLocais.contem(p.alvo)) {
+                temAlvo = verdadeiro
+                alvoAddr = inteiro(isto.labelsLocais[p.alvo])
+            }
+            se (!temAlvo) {
                 falhar diagMod.ErroDCC("Backend x86-64 (ICE): label interno inexistente '${p.alvo}'",
                     "", 0, 0, "E9010", verdadeiro)
             }
-            const alvoAddr: inteiro = inteiro(isto.labels[p.alvo])
             const rel32: inteiro = alvoAddr - (p.pos + 4)
             se (rel32 < -2147483648 ou rel32 > 2147483647) {
                 falhar diagMod.ErroDCC("Backend x86-64: deslocamento relativo rel32 fora de alcance (${rel32}) para '${p.alvo}'",
                     "", 0, 0, "E4002", falso)
             }
-            elfComum.gravarU32(isto.code, p.pos, rel32)
+            isto.code.definirU32LE(p.pos, rel32)
         }
     }
 }

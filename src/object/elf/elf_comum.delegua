@@ -198,3 +198,57 @@ funcao anexarSym64(buf: qualquer, stName: inteiro, stInfo: inteiro, stShndx: int
     anexarU64(buf, stValue)
     anexarU64(buf, stSize)
 }
+
+// Helpers compactos operando diretamente sobre cgd:bytes.Bytes (1 B/byte em GC_MALLOC_ATOMIC).
+funcao preencherAlinhBytes(buf: qualquer, modAlinh: inteiro, bytePad: inteiro = 0): vazio {
+    se (modAlinh <= 1) retorna
+    const rem: inteiro = buf.tamanho() % modAlinh
+    se (rem == 0) retorna
+    const pad: inteiro = modAlinh - rem
+    se (bytePad == 0) buf.anexarZeros(pad)
+    senao buf.anexarPreenchimento(bytePad & 255, pad)
+}
+
+funcao anexarCStringBytes(buf: qualquer, s: texto): inteiro {
+    const ini: inteiro = buf.tamanho()
+    se (s.tamanho() > 0) buf.anexarTexto(s)
+    buf.anexarByte(0)
+    retorna ini
+}
+
+funcao anexarPhdrBytes(buf: qualquer, pType: inteiro, pFlags: inteiro, pOff: inteiro, pVaddr: inteiro,
+    pFilesz: inteiro, pMemsz: inteiro, pAlign: inteiro): vazio {
+    buf.anexarU32LE(pType)
+    buf.anexarU32LE(pFlags)
+    buf.anexarU64LE(pOff)
+    buf.anexarU64LE(pVaddr)
+    buf.anexarU64LE(pVaddr)
+    buf.anexarU64LE(pFilesz)
+    buf.anexarU64LE(pMemsz)
+    buf.anexarU64LE(pAlign)
+}
+
+funcao anexarShdrBytes(buf: qualquer, shName: inteiro, shType: inteiro, shFlags: inteiro,
+    shAddr: inteiro, shOffset: inteiro, shSize: inteiro, shLink: inteiro, shInfo: inteiro, shAddrAlign: inteiro,
+    shEntSize: inteiro): vazio {
+    buf.anexarU32LE(shName)
+    buf.anexarU32LE(shType)
+    buf.anexarU64LE(shFlags)
+    buf.anexarU64LE(shAddr)
+    buf.anexarU64LE(shOffset)
+    buf.anexarU64LE(shSize)
+    buf.anexarU32LE(shLink)
+    buf.anexarU32LE(shInfo)
+    buf.anexarU64LE(shAddrAlign)
+    buf.anexarU64LE(shEntSize)
+}
+
+funcao anexarSym64Bytes(buf: qualquer, stName: inteiro, stInfo: inteiro, stShndx: inteiro,
+    stValue: inteiro, stSize: inteiro): vazio {
+    buf.anexarU32LE(stName)
+    buf.anexarByte(stInfo & 255)
+    buf.anexarByte(0) // st_other = STV_DEFAULT
+    buf.anexarU16LE(stShndx)
+    buf.anexarU64LE(stValue)
+    buf.anexarU64LE(stSize)
+}

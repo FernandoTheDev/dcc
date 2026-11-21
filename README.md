@@ -4,7 +4,7 @@
 
 O DCC possui pré-processador, lexer, parser, analisador semântico, IR SSA tipada, otimizador, verificador de invariantes, gerador de código de máquina x86-64, emissor de objetos relocáveis ELF64 (`.o` / `ET_REL`), emissor de Assembly x86-64 (`-S`), leitor de arquivos `.o`/`.a` e linker nativo ELF64 (`ET_EXEC`) próprios — sem delegar pré-processamento, compilação, montagem ou linkagem a GCC, Clang, NASM ou `ld`.
 
-> **Aviso de maturidade**: o DCC é um compilador **experimental / educacional / em desenvolvimento ativo** (v0.2.0). Ele **não** é certificado para uso em produção crítica nem oferece cobertura completa de 100% do padrão ISO C99 ou de extensões GNU.
+> **Aviso de maturidade**: o DCC é um compilador **experimental / educacional / em desenvolvimento ativo** (v0.3.0). Ele **não** é certificado para uso em produção crítica nem oferece cobertura completa de 100% do padrão ISO C99 ou de extensões GNU.
 
 ---
 

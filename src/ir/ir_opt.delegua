@@ -4,56 +4,13 @@
 // Respeita rigorosamente acessos 'volatile' e instrucoes com efeitos colaterais.
 
 funcao ehOpBinariaIntPura(op: qualquer, OpI: qualquer): logico {
-    escolha (op) {
-        caso OpI.Add:
-        caso OpI.Sub:
-        caso OpI.Mul:
-        caso OpI.SDiv:
-        caso OpI.UDiv:
-        caso OpI.SMod:
-        caso OpI.UMod:
-        caso OpI.BitAnd:
-        caso OpI.BitOr:
-        caso OpI.BitXor:
-        caso OpI.Shl:
-        caso OpI.AShr:
-        caso OpI.LShr:
-        caso OpI.Eq:
-        caso OpI.Neq:
-        caso OpI.SLt:
-        caso OpI.SLe:
-        caso OpI.SGt:
-        caso OpI.SGe:
-        caso OpI.ULt:
-        caso OpI.ULe:
-        caso OpI.UGt:
-        caso OpI.UGe:
-        retorna verdadeiro
-        padrao:
-        retorna falso
-    }
-
-    retorna falso
+    const v: inteiro = inteiro(op)
+    retorna v >= inteiro(OpI.Add) e v <= inteiro(OpI.UGe)
 }
 
 funcao ehOpBinariaFloat(op: qualquer, OpI: qualquer): logico {
-    escolha (op) {
-        caso OpI.FAdd:
-        caso OpI.FSub:
-        caso OpI.FMul:
-        caso OpI.FDiv:
-        caso OpI.FEq:
-        caso OpI.FNeq:
-        caso OpI.FLt:
-        caso OpI.FLe:
-        caso OpI.FGt:
-        caso OpI.FGe:
-        retorna verdadeiro
-        padrao:
-        retorna falso
-    }
-
-    retorna falso
+    const v: inteiro = inteiro(op)
+    retorna (v >= inteiro(OpI.FAdd) e v <= inteiro(OpI.FDiv)) ou (v >= inteiro(OpI.FEq) e v <= inteiro(OpI.FGe))
 }
 
 funcao normalizarLarguraInt(v: inteiro, largura: inteiro, semSinal: logico): inteiro {
@@ -93,223 +50,353 @@ funcao dobrarOpInt(op: qualquer, OpI: qualquer, a: inteiro, b: inteiro, largura:
     retorna normalizarLarguraInt(r, largura, semSinal)
 }
 
-funcao substituirReg(reg: inteiro, copias: dicionario): inteiro {
+funcao substituirRegArena(reg: inteiro, copias: qualquer, nRegs: inteiro): inteiro {
     var cur: inteiro = reg
     var passos: inteiro = 0
-    enquanto (copias.contem(texto(cur)) e passos < 32) {
-        cur = inteiro(copias[texto(cur)])
+    enquanto (cur >= 0 e cur < nRegs e passos < 32) {
+        const nxt: inteiro = copias.obter(cur)
+        se (nxt < 0) sustar
+        cur = nxt
         passos++
     }
 
     retorna cur
 }
 
-funcao otimizarModuloSSA(modulo: qualquer): qualquer {
-    const tMod: qualquer = importar("../types/tipos.delegua")
-    const irTipos: qualquer = importar("ir_tipos.delegua")
-    const OpI: qualquer = tMod.OpIR
-    const stats: qualquer = irTipos.StatsSSA()
+funcao otimizarFuncaoSSA(fn: qualquer, stats: qualquer, arena: qualquer = nulo): vazio {
+    se (fn.blocos.tamanho() == 0) retorna
+    const tMod = importar("../types/tipos.delegua")
+    const memMod = importar("cgd:memoria")
+    const OpI = tMod.OpIR
     const int64Min: inteiro = -9223372036854775807 - 1
 
-    para (var f: inteiro = 0; f < modulo.funcoes.tamanho(); f++) {
-        const fn: qualquer = modulo.funcoes[f]
-        se (fn.blocos.tamanho() == 0) continua
+    const ar = memMod.Arena(16384, 67108864)
+    const nRegs: inteiro = fn.numRegs > 0 ? fn.numRegs : 1
 
-        // 1. Constant Propagation, Folding, Simplificacao Algebrica e Copy Propagation
-        var consts: dicionario = {}
-        var copias: dicionario = {}
-        para (var b: inteiro = 0; b < fn.blocos.tamanho(); b++) {
-            const bb: qualquer = fn.blocos[b]
-            para (var i: inteiro = 0; i < bb.insts.tamanho(); i++) {
-                const inst: qualquer = bb.insts[i]
+    // Cache de codigos inteiros de OpIR para verificacoes O(1) sem lookup de propriedade em loops quentes
+    const cConst: inteiro = inteiro(OpI.Const)
+    const cFConst: inteiro = inteiro(OpI.FConst)
+    const cCopy: inteiro = inteiro(OpI.Copy)
+    const cAddrSlot: inteiro = inteiro(OpI.AddrSlot)
+    const cAddrStr: inteiro = inteiro(OpI.AddrStr)
+    const cAlloca: inteiro = inteiro(OpI.Alloca)
+    const cLoad: inteiro = inteiro(OpI.Load)
+    const cStore: inteiro = inteiro(OpI.Store)
+    const cFLoad: inteiro = inteiro(OpI.FLoad)
+    const cFStore: inteiro = inteiro(OpI.FStore)
+    const cAdd: inteiro = inteiro(OpI.Add)
+    const cSub: inteiro = inteiro(OpI.Sub)
+    const cMul: inteiro = inteiro(OpI.Mul)
+    const cSDiv: inteiro = inteiro(OpI.SDiv)
+    const cUDiv: inteiro = inteiro(OpI.UDiv)
+    const cSMod: inteiro = inteiro(OpI.SMod)
+    const cUMod: inteiro = inteiro(OpI.UMod)
+    const cShl: inteiro = inteiro(OpI.Shl)
+    const cAShr: inteiro = inteiro(OpI.AShr)
+    const cLShr: inteiro = inteiro(OpI.LShr)
+    const cULt: inteiro = inteiro(OpI.ULt)
+    const cUGe: inteiro = inteiro(OpI.UGe)
+    const cNeg: inteiro = inteiro(OpI.Neg)
+    const cLogNot: inteiro = inteiro(OpI.LogNot)
+    const cBitNot: inteiro = inteiro(OpI.BitNot)
+    const cFAdd: inteiro = inteiro(OpI.FAdd)
+    const cFDiv: inteiro = inteiro(OpI.FDiv)
+    const cFNeg: inteiro = inteiro(OpI.FNeg)
+    const cFEq: inteiro = inteiro(OpI.FEq)
+    const cFGe: inteiro = inteiro(OpI.FGe)
+    const cItoF: inteiro = inteiro(OpI.ItoF)
+    const cToBool: inteiro = inteiro(OpI.ToBool)
+    const cCall: inteiro = inteiro(OpI.Call)
+    const cCallIndirect: inteiro = inteiro(OpI.CallIndirect)
+    const cBr: inteiro = inteiro(OpI.Br)
+    const cBrCond: inteiro = inteiro(OpI.BrCond)
+    const cRet: inteiro = inteiro(OpI.Ret)
+    const cRetPair: inteiro = inteiro(OpI.RetPair)
+    const cFRet: inteiro = inteiro(OpI.FRet)
 
-                // Aplica propagacao de copias nos operandos
-                se (inst.op != OpI.Const e inst.op != OpI.FConst e inst.op != OpI.AddrSlot e inst.op != OpI.AddrRbpDisp e inst.op != OpI.AddrGlobal e inst.op != OpI.AddrExternGlobal e inst.op != OpI.AddrFunc e inst.op != OpI.AddrStr e inst.op != OpI.Br) {
-                    const novoA: inteiro = substituirReg(inst.a, copias)
-                    se (novoA != inst.a) {
-                        inst.a = novoA
+    // 1. Constant Propagation, Folding, Simplificacao Algebrica e Copy Propagation (em Arena nativa, 0 GC churn)
+    const constFlag = ar.criarBytes(nRegs)
+    const constVals = ar.criarInt64(nRegs, 0)
+    const copias = ar.criarInt64(nRegs, -1)
+    var temCopias: logico = falso
+
+    para (var b: inteiro = 0; b < fn.blocos.tamanho(); b++) {
+        const bb: qualquer = fn.blocos[b]
+        para (var i: inteiro = 0; i < bb.insts.tamanho(); i++) {
+            const inst: qualquer = bb.insts[i]
+            const opI: inteiro = inteiro(inst.op)
+            const ehBinInt: logico = opI >= cAdd e opI <= cUGe
+            const ehBinFlt: logico = (opI >= cFAdd e opI <= cFDiv) ou (opI >= cFEq e opI <= cFGe)
+
+            // Aplica propagacao de copias nos operandos (apenas quando existem copias na funcao)
+            se (temCopias e opI != cConst e opI != cFConst e !(opI >= cAddrSlot e opI <= cAddrStr) e opI != cBr) {
+                var curA: inteiro = inst.a
+                var pA: inteiro = 0
+                enquanto (curA >= 0 e curA < nRegs e pA < 32) {
+                    const nxtA: inteiro = copias.obter(curA)
+                    se (nxtA < 0) sustar
+                    curA = nxtA
+                    pA++
+                }
+                se (curA != inst.a) {
+                    inst.a = curA
+                    stats.copiasPropagadas++
+                }
+                se (opI == cStore ou opI == cFStore ou opI == cRetPair ou ehBinInt ou ehBinFlt) {
+                    var curB: inteiro = inst.b
+                    var pB: inteiro = 0
+                    enquanto (curB >= 0 e curB < nRegs e pB < 32) {
+                        const nxtB: inteiro = copias.obter(curB)
+                        se (nxtB < 0) sustar
+                        curB = nxtB
+                        pB++
+                    }
+                    se (curB != inst.b) {
+                        inst.b = curB
                         stats.copiasPropagadas++
                     }
-                    se (inst.op == OpI.Store ou inst.op == OpI.FStore ou inst.op == OpI.RetPair ou ehOpBinariaIntPura(inst.op,
-                        OpI) ou ehOpBinariaFloat(inst.op, OpI)) {
-                        const novoB: inteiro = substituirReg(inst.b, copias)
-                        se (novoB != inst.b) {
-                            inst.b = novoB
+                }
+                se (opI >= cCall e opI <= cCallIndirect) {
+                    const ci: qualquer = inst.callInfo
+                    se (ci.sretReg >= 0) {
+                        var curSr: inteiro = ci.sretReg
+                        var pSr: inteiro = 0
+                        enquanto (curSr >= 0 e curSr < nRegs e pSr < 32) {
+                            const nxtSr: inteiro = copias.obter(curSr)
+                            se (nxtSr < 0) sustar
+                            curSr = nxtSr
+                            pSr++
+                        }
+                        se (curSr != ci.sretReg) {
+                            ci.sretReg = curSr
                             stats.copiasPropagadas++
                         }
                     }
-                    se (inst.op == OpI.Call ou inst.op == OpI.CallExtern ou inst.op == OpI.CallIndirect) {
-                        se (inst.callSretReg >= 0) {
-                            const novoSr: inteiro = substituirReg(inst.callSretReg, copias)
-                            se (novoSr != inst.callSretReg) {
-                                inst.callSretReg = novoSr
-                                stats.copiasPropagadas++
-                            }
+                    para (var k: inteiro = 0; k < ci.args.tamanho(); k++) {
+                        var curK: inteiro = ci.args[k]
+                        var pK: inteiro = 0
+                        enquanto (curK >= 0 e curK < nRegs e pK < 32) {
+                            const nxtK: inteiro = copias.obter(curK)
+                            se (nxtK < 0) sustar
+                            curK = nxtK
+                            pK++
                         }
-                        para (var k: inteiro = 0; k < inst.callArgs.tamanho(); k++) {
-                            const nArg: inteiro = substituirReg(inst.callArgs[k], copias)
-                            se (nArg != inst.callArgs[k]) {
-                                inst.callArgs[k] = nArg
-                                stats.copiasPropagadas++
-                            }
+                        se (curK != ci.args[k]) {
+                            ci.args[k] = curK
+                            stats.copiasPropagadas++
                         }
                     }
                 }
+            }
 
-                se (inst.op == OpI.Const) {
-                    consts[texto(inst.dst)] = inst.a
-                } senao se (inst.op == OpI.Copy) {
-                    copias[texto(inst.dst)] = inst.a
-                } senao se (ehOpBinariaIntPura(inst.op, OpI)) {
-                    const ka: texto = texto(inst.a)
-                    const kb: texto = texto(inst.b)
-                    se (consts.contem(ka) e consts.contem(kb)) {
-                        const va: inteiro = inteiro(consts[ka])
-                        const vb: inteiro = inteiro(consts[kb])
-                        const opUnsigned: logico = inst.op == OpI.UDiv ou inst.op == OpI.UMod ou inst.op == OpI.LShr ou inst.op == OpI.ULt ou inst.op == OpI.ULe ou inst.op == OpI.UGt ou inst.op == OpI.UGe
-                        const ehShift: logico = inst.op == OpI.Shl ou inst.op == OpI.AShr
-                        const maxSh: inteiro = inst.largura == 4 ? 32 : 64
-                        const shiftOk: logico = !ehShift ou (vb >= 0 e vb < maxSh)
-                        const divOk: logico = (inst.op != OpI.SDiv e inst.op != OpI.SMod) ou (vb != 0 e !(va == int64Min e vb == -1) e !(inst.largura == 4 e va == -2147483648 e vb == -1))
-                        se (!opUnsigned e shiftOk e divOk) {
-                            const res: inteiro = dobrarOpInt(inst.op, OpI, va, vb, inst.largura,
-                                inst.ehSemSinal)
-                            inst.op = OpI.Const
-                            inst.a = res
-                            inst.b = 0
-                            consts[texto(inst.dst)] = res
-                            stats.dobras++
-                        }
-                    } senao se (consts.contem(kb) e inst.largura == 8) {
-                        const vb: inteiro = inteiro(consts[kb])
-                        se ((inst.op == OpI.Add ou inst.op == OpI.Sub) e vb == 0) {
-                            inst.op = OpI.Copy
-                            inst.b = 0
-                            copias[texto(inst.dst)] = inst.a
-                            stats.simplificacoes++
-                        } senao se (inst.op == OpI.Mul e vb == 1) {
-                            inst.op = OpI.Copy
-                            inst.b = 0
-                            copias[texto(inst.dst)] = inst.a
-                            stats.simplificacoes++
-                        } senao se (inst.op == OpI.Mul e vb == 0) {
-                            inst.op = OpI.Const
-                            inst.a = 0
-                            inst.b = 0
-                            consts[texto(inst.dst)] = 0
-                            stats.simplificacoes++
-                        }
-                    }
-                } senao se (inst.op == OpI.Neg ou inst.op == OpI.LogNot ou inst.op == OpI.BitNot ou inst.op == OpI.ToBool) {
-                    const ka: texto = texto(inst.a)
-                    se (consts.contem(ka)) {
-                        const va: inteiro = inteiro(consts[ka])
-                        var res: inteiro = -va
-                        se (inst.op == OpI.LogNot) res = va == 0 ? 1 : 0
-                        senao se (inst.op == OpI.BitNot) res = normalizarLarguraInt(~va,
-                            inst.largura, inst.ehSemSinal)
-                        senao se (inst.op == OpI.Neg) res = normalizarLarguraInt(-va, inst.largura,
+            se (opI == cConst) {
+                se (inst.dst >= 0 e inst.dst < nRegs) {
+                    constFlag.definir(inst.dst, 1)
+                    constVals.definir(inst.dst, inst.a)
+                }
+            } senao se (opI == cCopy) {
+                se (inst.dst >= 0 e inst.dst < nRegs e inst.a >= 0) {
+                    copias.definir(inst.dst, inst.a)
+                    temCopias = verdadeiro
+                }
+            } senao se (ehBinInt) {
+                const temA: logico = inst.a >= 0 e inst.a < nRegs e constFlag.obter(inst.a) != 0
+                const temB: logico = inst.b >= 0 e inst.b < nRegs e constFlag.obter(inst.b) != 0
+                se (temA e temB) {
+                    const va: inteiro = constVals.obter(inst.a)
+                    const vb: inteiro = constVals.obter(inst.b)
+                    const opUnsigned: logico = opI == cUDiv ou opI == cUMod ou opI == cLShr ou (opI >= cULt e opI <= cUGe)
+                    const ehShift: logico = opI == cShl ou opI == cAShr
+                    const maxSh: inteiro = inst.largura == 4 ? 32 : 64
+                    const shiftOk: logico = !ehShift ou (vb >= 0 e vb < maxSh)
+                    const divOk: logico = (opI != cSDiv e opI != cSMod) ou (vb != 0 e !(va == int64Min e vb == -1) e !(inst.largura == 4 e va == -2147483648 e vb == -1))
+                    se (!opUnsigned e shiftOk e divOk) {
+                        const res: inteiro = dobrarOpInt(inst.op, OpI, va, vb, inst.largura,
                             inst.ehSemSinal)
-                        senao se (inst.op == OpI.ToBool) res = va != 0 ? 1 : 0
                         inst.op = OpI.Const
                         inst.a = res
-                        consts[texto(inst.dst)] = res
-                        stats.dobras++
-                    }
-                } senao se (inst.op == OpI.BrCond) {
-                    const ka: texto = texto(inst.a)
-                    se (consts.contem(ka)) {
-                        const condVal: inteiro = inteiro(consts[ka])
-                        inst.op = OpI.Br
-                        inst.alvo1 = condVal != 0 ? inst.alvo1 : inst.alvo2
-                        inst.alvo2 = ""
-                        inst.a = 0
-                        stats.dobras++
-                    }
-                }
-            }
-        }
-
-        // 2. Eliminacao de blocos inalcancaveis no CFG
-        var mapaBlocos: dicionario = {}
-        para (var b: inteiro = 0; b < fn.blocos.tamanho(); b++) {
-            mapaBlocos[fn.blocos[b].nome] = fn.blocos[b]
-        }
-        var alcancaveis: dicionario = {}
-        var fila: texto[] = [fn.blocos[0].nome]
-        alcancaveis[fn.blocos[0].nome] = verdadeiro
-        enquanto (fila.tamanho() > 0) {
-            const atualNome: texto = fila.removerUltimo()
-            const bb: qualquer = mapaBlocos[atualNome]
-            para (var i: inteiro = 0; i < bb.insts.tamanho(); i++) {
-                const inst: qualquer = bb.insts[i]
-                se (inst.op == OpI.Br ou inst.op == OpI.BrCond) {
-                    se (!alcancaveis.contem(inst.alvo1)) {
-                        alcancaveis[inst.alvo1] = verdadeiro
-                        fila.empilhar(inst.alvo1)
-                    }
-                }
-                se (inst.op == OpI.BrCond e !alcancaveis.contem(inst.alvo2)) {
-                    alcancaveis[inst.alvo2] = verdadeiro
-                    fila.empilhar(inst.alvo2)
-                }
-            }
-        }
-        var vivos: qualquer[] = []
-        para (var b: inteiro = 0; b < fn.blocos.tamanho(); b++) {
-            se (alcancaveis.contem(fn.blocos[b].nome)) {
-                vivos.empilhar(fn.blocos[b])
-            } senao {
-                stats.blocosMortos++
-            }
-        }
-        fn.blocos = vivos
-
-        // 3. Dead Code Elimination (DCE) iterativa (preserva Call, Load, FLoad, Alloca, volatile)
-        var mudou: logico = verdadeiro
-        enquanto (mudou) {
-            mudou = falso
-            var usados: dicionario = {}
-            para (var b: inteiro = 0; b < fn.blocos.tamanho(); b++) {
-                const bb: qualquer = fn.blocos[b]
-                para (var i: inteiro = 0; i < bb.insts.tamanho(); i++) {
-                    const inst: qualquer = bb.insts[i]
-                    se (inst.op == OpI.Store ou inst.op == OpI.FStore ou inst.op == OpI.RetPair) {
-                        usados[texto(inst.a)] = verdadeiro
-                        usados[texto(inst.b)] = verdadeiro
-                    } senao se (inst.op == OpI.Load ou inst.op == OpI.FLoad ou inst.op == OpI.Alloca ou inst.op == OpI.Ret ou inst.op == OpI.FRet ou inst.op == OpI.BrCond ou inst.op == OpI.Neg ou inst.op == OpI.FNeg ou inst.op == OpI.LogNot ou inst.op == OpI.BitNot ou inst.op == OpI.ItoF ou inst.op == OpI.UItoF ou inst.op == OpI.FtoI ou inst.op == OpI.FtoUI ou inst.op == OpI.TruncSext ou inst.op == OpI.TruncZext ou inst.op == OpI.ToBool ou inst.op == OpI.Copy) {
-                        usados[texto(inst.a)] = verdadeiro
-                    } senao se (ehOpBinariaIntPura(inst.op, OpI) ou ehOpBinariaFloat(inst.op,
-                        OpI)) {
-                        usados[texto(inst.a)] = verdadeiro
-                        usados[texto(inst.b)] = verdadeiro
-                    } senao se (inst.op == OpI.Call ou inst.op == OpI.CallExtern ou inst.op == OpI.CallIndirect) {
-                        se (inst.op == OpI.CallIndirect) usados[texto(inst.a)] = verdadeiro
-                        se (inst.callSretReg >= 0) usados[texto(inst.callSretReg)] = verdadeiro
-                        para (var k: inteiro = 0; k < inst.callArgs.tamanho(); k++) {
-                            usados[texto(inst.callArgs[k])] = verdadeiro
+                        inst.b = 0
+                        se (inst.dst >= 0 e inst.dst < nRegs) {
+                            constFlag.definir(inst.dst, 1)
+                            constVals.definir(inst.dst, res)
                         }
+                        stats.dobras++
+                    }
+                } senao se (temB e inst.largura == 8) {
+                    const vb: inteiro = constVals.obter(inst.b)
+                    se ((opI == cAdd ou opI == cSub) e vb == 0) {
+                        inst.op = OpI.Copy
+                        inst.b = 0
+                        se (inst.dst >= 0 e inst.dst < nRegs e inst.a >= 0) {
+                            copias.definir(inst.dst, inst.a)
+                            temCopias = verdadeiro
+                        }
+                        stats.simplificacoes++
+                    } senao se (opI == cMul e vb == 1) {
+                        inst.op = OpI.Copy
+                        inst.b = 0
+                        se (inst.dst >= 0 e inst.dst < nRegs e inst.a >= 0) {
+                            copias.definir(inst.dst, inst.a)
+                            temCopias = verdadeiro
+                        }
+                        stats.simplificacoes++
+                    } senao se (opI == cMul e vb == 0) {
+                        inst.op = OpI.Const
+                        inst.a = 0
+                        inst.b = 0
+                        se (inst.dst >= 0 e inst.dst < nRegs) {
+                            constFlag.definir(inst.dst, 1)
+                            constVals.definir(inst.dst, 0)
+                        }
+                        stats.simplificacoes++
+                    }
+                }
+            } senao se (opI == cNeg ou opI == cLogNot ou opI == cBitNot ou opI == cToBool) {
+                se (inst.a >= 0 e inst.a < nRegs e constFlag.obter(inst.a) != 0) {
+                    const va: inteiro = constVals.obter(inst.a)
+                    var res: inteiro = -va
+                    se (opI == cLogNot) res = va == 0 ? 1 : 0
+                    senao se (opI == cBitNot) res = normalizarLarguraInt(~va, inst.largura,
+                        inst.ehSemSinal)
+                    senao se (opI == cNeg) res = normalizarLarguraInt(-va, inst.largura,
+                        inst.ehSemSinal)
+                    senao se (opI == cToBool) res = va != 0 ? 1 : 0
+                    inst.op = OpI.Const
+                    inst.a = res
+                    se (inst.dst >= 0 e inst.dst < nRegs) {
+                        constFlag.definir(inst.dst, 1)
+                        constVals.definir(inst.dst, res)
+                    }
+                    stats.dobras++
+                }
+            } senao se (opI == cBrCond) {
+                se (inst.a >= 0 e inst.a < nRegs e constFlag.obter(inst.a) != 0) {
+                    const condVal: inteiro = constVals.obter(inst.a)
+                    inst.op = OpI.Br
+                    inst.alvo1 = condVal != 0 ? inst.alvo1 : inst.alvo2
+                    inst.alvo2 = ""
+                    inst.a = 0
+                    stats.dobras++
+                }
+            }
+        }
+    }
+
+    // 2. Eliminacao de blocos inalcancaveis no CFG
+    var mapaBlocos: dicionario = {}
+    para (var b: inteiro = 0; b < fn.blocos.tamanho(); b++) {
+        mapaBlocos[fn.blocos[b].nome] = fn.blocos[b]
+    }
+
+    var alcancaveis: dicionario = {}
+    var fila: texto[] = [fn.blocos[0].nome]
+    alcancaveis[fn.blocos[0].nome] = verdadeiro
+    enquanto (fila.tamanho() > 0) {
+        const atualNome: texto = fila.removerUltimo()
+        const bb: qualquer = mapaBlocos[atualNome]
+        const nI: inteiro = bb.insts.tamanho()
+        se (nI > 0) {
+            const ult: qualquer = bb.insts[nI - 1]
+            const opU: inteiro = inteiro(ult.op)
+            se (opU == cBr ou opU == cBrCond) {
+                se (!alcancaveis.contem(ult.alvo1)) {
+                    alcancaveis[ult.alvo1] = verdadeiro
+                    fila.empilhar(ult.alvo1)
+                }
+                se (opU == cBrCond e !alcancaveis.contem(ult.alvo2)) {
+                    alcancaveis[ult.alvo2] = verdadeiro
+                    fila.empilhar(ult.alvo2)
+                }
+            }
+        }
+    }
+
+    var vivos: qualquer[] = []
+    para (var b: inteiro = 0; b < fn.blocos.tamanho(); b++) {
+        se (alcancaveis.contem(fn.blocos[b].nome)) {
+            vivos.empilhar(fn.blocos[b])
+        } senao {
+            stats.blocosMortos++
+        }
+    }
+
+    fn.blocos = vivos
+
+    // 3. Dead Code Elimination (DCE) por contagem de usos em Arena nativa (O(1) sem lookups de enum)
+    ar.limpar()
+    const usos = ar.criarInt64(nRegs, 0)
+    para (var b: inteiro = 0; b < fn.blocos.tamanho(); b++) {
+        const bb: qualquer = fn.blocos[b]
+        para (var i: inteiro = 0; i < bb.insts.tamanho(); i++) {
+            const inst: qualquer = bb.insts[i]
+            const opI: inteiro = inteiro(inst.op)
+            se (opI == cStore ou opI == cFStore ou opI == cRetPair ou (opI >= cAdd e opI <= cUGe) ou (opI >= cFAdd e opI <= cFDiv) ou (opI >= cFEq e opI <= cFGe)) {
+                se (inst.a >= 0 e inst.a < fn.numRegs) usos.definir(inst.a, usos.obter(inst.a) + 1)
+                se (inst.b >= 0 e inst.b < fn.numRegs) usos.definir(inst.b, usos.obter(inst.b) + 1)
+            } senao se (opI == cLoad ou opI == cFLoad ou opI == cAlloca ou opI == cCopy ou opI == cBrCond ou opI == cRet ou opI == cFRet ou (opI >= cNeg e opI <= cBitNot) ou opI == cFNeg ou (opI >= cItoF e opI <= cToBool)) {
+                se (inst.a >= 0 e inst.a < fn.numRegs) usos.definir(inst.a, usos.obter(inst.a) + 1)
+            } senao se (opI >= cCall e opI <= cCallIndirect) {
+                const ci: qualquer = inst.callInfo
+                se (opI == cCallIndirect e inst.a >= 0 e inst.a < fn.numRegs) usos.definir(inst.a,
+                    usos.obter(inst.a) + 1)
+                se (ci.sretReg >= 0 e ci.sretReg < fn.numRegs) usos.definir(ci.sretReg, usos.obter(ci.sretReg) + 1)
+                para (var k: inteiro = 0; k < ci.args.tamanho(); k++) {
+                    const ra: inteiro = ci.args[k]
+                    se (ra >= 0 e ra < fn.numRegs) usos.definir(ra, usos.obter(ra) + 1)
+                }
+            }
+        }
+    }
+
+    var mudou: logico = verdadeiro
+    enquanto (mudou) {
+        mudou = falso
+        para (var b: inteiro = fn.blocos.tamanho() - 1; b >= 0; b--) {
+            const bb: qualquer = fn.blocos[b]
+            const nInstsB: inteiro = bb.insts.tamanho()
+            var removidosB: inteiro = 0
+            const flagsDrop = ar.criarBytes(nInstsB > 0 ? nInstsB : 1)
+            para (var i: inteiro = nInstsB - 1; i >= 0; i--) {
+                const inst: qualquer = bb.insts[i]
+                se (inst.dst < 0 ou inst.dst2 >= 0 ou inst.ehVolatile) continua
+                const opI: inteiro = inteiro(inst.op)
+                const ehSideEff: logico = opI == cLoad ou opI == cFLoad ou opI == cAlloca ou (opI >= cSDiv e opI <= cUMod) ou (opI >= cCall e opI <= cCallIndirect)
+                se (!ehSideEff e inst.dst < fn.numRegs e usos.obter(inst.dst) == 0) {
+                    flagsDrop.definir(i, 1)
+                    removidosB++
+                    stats.dceRemovidas++
+                    mudou = verdadeiro
+                    se (opI == cCopy ou (opI >= cNeg e opI <= cBitNot) ou opI == cFNeg ou (opI >= cItoF e opI <= cToBool)) {
+                        se (inst.a >= 0 e inst.a < fn.numRegs) usos.definir(inst.a, usos.obter(inst.a) - 1)
+                    } senao se ((opI >= cAdd e opI <= cUGe) ou (opI >= cFAdd e opI <= cFDiv) ou (opI >= cFEq e opI <= cFGe)) {
+                        se (inst.a >= 0 e inst.a < fn.numRegs) usos.definir(inst.a, usos.obter(inst.a) - 1)
+                        se (inst.b >= 0 e inst.b < fn.numRegs) usos.definir(inst.b, usos.obter(inst.b) - 1)
                     }
                 }
             }
-            para (var b: inteiro = 0; b < fn.blocos.tamanho(); b++) {
-                const bb: qualquer = fn.blocos[b]
+            se (removidosB > 0) {
                 var novas: qualquer[] = []
-                para (var i: inteiro = 0; i < bb.insts.tamanho(); i++) {
-                    const inst: qualquer = bb.insts[i]
-                    const ehDiv: logico = inst.op == OpI.SDiv ou inst.op == OpI.UDiv ou inst.op == OpI.SMod ou inst.op == OpI.UMod
-                    const ehPura: logico = !inst.ehVolatile e !ehDiv e inst.dst >= 0 e inst.dst2 < 0 e inst.op != OpI.Call e inst.op != OpI.CallExtern e inst.op != OpI.CallIndirect e inst.op != OpI.Load e inst.op != OpI.FLoad e inst.op != OpI.Alloca
-                    se (ehPura e !usados.contem(texto(inst.dst))) {
-                        stats.dceRemovidas++
-                        mudou = verdadeiro
-                    } senao {
-                        novas.empilhar(inst)
-                    }
+                para (var i: inteiro = 0; i < nInstsB; i++) {
+                    se (flagsDrop.obter(i) == 0) novas.empilhar(bb.insts[i])
                 }
                 bb.insts = novas
             }
         }
     }
 
+    ar.liberar()
+}
+
+funcao otimizarModuloSSA(modulo: qualquer): qualquer {
+    const irTipos: qualquer = importar("ir_tipos.delegua")
+    const memMod: qualquer = importar("cgd:memoria")
+    const stats: qualquer = irTipos.StatsSSA()
+    const arena: qualquer = memMod.Arena(65536, 67108864)
+
+    para (var f: inteiro = 0; f < modulo.funcoes.tamanho(); f++) {
+        otimizarFuncaoSSA(modulo.funcoes[f], stats, arena)
+    }
+
+    arena.liberar()
     retorna stats
 }

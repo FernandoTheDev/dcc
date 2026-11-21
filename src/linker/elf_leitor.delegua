@@ -1,6 +1,6 @@
 // Leitor seguro e validado de arquivos objeto ELF64 (ET_REL) e arquivos estaticos GNU ar (.a).
-// Trata toda entrada binaria como potencialmente maliciosa: valida magic, classe 64-bit,
-// endianness, offsets, tamanhos, alinhamentos, indices de secoes/simbolos e relocacoes.
+// Opera diretamente sobre cgd:bytes.Bytes (1 B/byte em GC_MALLOC_ATOMIC) e oferece worker
+// isolado para validacao/parsing concorrente de multiplos .o com zero-copy (Bytes congelado).
 
 classe SecaoElfLida {
     indice: inteiro
@@ -66,12 +66,12 @@ classe RelocElfLida {
 
 classe ObjetoElfLido {
     nomeArquivo: texto
-    dados: inteiro[]
+    dados: qualquer
     secoes: SecaoElfLida[]
     simbolos: SimboloElfLido[]
     relocs: RelocElfLida[]
 
-    construtor(nomeArquivo: texto, dados: inteiro[]) {
+    construtor(nomeArquivo: texto, dados: qualquer) {
         isto.nomeArquivo = nomeArquivo
         isto.dados = dados
         isto.secoes = []
@@ -80,31 +80,33 @@ classe ObjetoElfLido {
     }
 }
 
-funcao ehArquivoAr(dados: inteiro[]): logico {
-    // "!<arch>\n" = 33, 60, 97, 114, 99, 104, 62, 10
-    se (dados.tamanho() < 8) retorna falso
-    retorna dados[0] == 33 e dados[1] == 60 e dados[2] == 97 e dados[3] == 114 e dados[4] == 99 e dados[5] == 104 e dados[6] == 62 e dados[7] == 10
-}
-
-funcao lerTextoAsciiFaixa(dados: qualquer, ini: inteiro, tam: inteiro, bytesMod: qualquer): texto {
-    var bs: inteiro[] = []
-    para (var i: inteiro = 0; i < tam e ini + i < dados.tamanho(); i++) {
-        bs.empilhar(dados[ini + i] & 255)
+funcao assegurarBytesElf(dados: qualquer): qualquer {
+    se ((tipo de dados) == "vetor") {
+        const bytesMod: qualquer = importar("cgd:bytes")
+        retorna bytesMod.Bytes.deVetor(dados)
     }
 
-    se (bs.tamanho() == 0) retorna ""
-    retorna bytesMod.Bytes.deVetor(bs).paraTexto()
+    retorna dados
+}
+
+funcao ehArquivoAr(dadosIn: qualquer): logico {
+    const dados: qualquer = assegurarBytesElf(dadosIn)
+    // "!<arch>\n" = 33, 60, 97, 114, 99, 104, 62, 10
+    se (dados.tamanho() < 8) retorna falso
+    retorna dados.obter(0) == 33 e dados.obter(1) == 60 e dados.obter(2) == 97 e dados.obter(3) == 114 e dados.obter(4) == 99 e dados.obter(5) == 104 e dados.obter(6) == 62 e dados.obter(7) == 10
 }
 
 funcao parseDecimalAr(s: texto): inteiro {
     const t: texto = s.aparar()
     se (t.tamanho() == 0) retorna -1
+    const bytesMod: qualquer = importar("cgd:bytes")
+    const tb: qualquer = bytesMod.Bytes.deTexto(t)
+    const n: inteiro = tb.tamanho()
     var acc: inteiro = 0
-    para (var i: inteiro = 0; i < t.tamanho(); i++) {
-        const ch: texto = t[i]
-        se (ch < "0" ou ch > "9") retorna -1
-        const litMod: qualquer = importar("../lexer/literais.delegua")
-        acc = acc * 10 + (litMod.codigoChar(ch) - 48)
+    para (var i: inteiro = 0; i < n; i++) {
+        const b: inteiro = tb.obter(i)
+        se (b < 48 ou b > 57) retorna -1
+        acc = acc * 10 + (b - 48)
         se (acc > 1073741824) retorna -1
     }
 
@@ -112,8 +114,10 @@ funcao parseDecimalAr(s: texto): inteiro {
 }
 
 // Extrai membros ELF64 (.o) de uma biblioteca estatica GNU ar (.a) com checagem estrita de limites.
-funcao extrairObjetosDeAr(dados: inteiro[], nomeArq: texto, diag: qualquer): ObjetoElfLido[] {
-    const bytesMod: qualquer = importar("cgd:bytes")
+// Retorna pares (bytesMembro, nomeFormatado) sem ainda decodificar cada .o, permitindo
+// validacao/parsing paralelo dos membros quando ha muitos objetos em um archive.
+funcao fatiarMembrosDeAr(dadosIn: qualquer, nomeArq: texto, diag: qualquer): qualquer[] {
+    const dados: qualquer = assegurarBytesElf(dadosIn)
     const ec: qualquer = importar("../object/elf/elf_comum.delegua")
     const n: inteiro = dados.tamanho()
     se (!ehArquivoAr(dados)) {
@@ -121,7 +125,7 @@ funcao extrairObjetosDeAr(dados: inteiro[], nomeArq: texto, diag: qualquer): Obj
             "", "", "E5001")
     }
 
-    var membros: ObjetoElfLido[] = []
+    var fatias: qualquer[] = []
     var pos: inteiro = 8
     var tabelaNomesLongos: texto = ""
     var contMembros: inteiro = 0
@@ -131,12 +135,12 @@ funcao extrairObjetosDeAr(dados: inteiro[], nomeArq: texto, diag: qualquer): Obj
             diag.erroDireto(nomeArq, 0, 0, "cabecalho de membro truncado em arquivo '.a'",
                 "", "", "E5002")
         }
-        se (dados[pos + 58] != 96 ou dados[pos + 59] != 10) {
+        se (dados.obter(pos + 58) != 96 ou dados.obter(pos + 59) != 10) {
             diag.erroDireto(nomeArq, 0, 0, "assinatura de cabecalho de membro invalida em '.a'",
                 "", "", "E5002")
         }
-        const nomeCampo: texto = lerTextoAsciiFaixa(dados, pos, 16, bytesMod).aparar()
-        const tamCampo: texto = lerTextoAsciiFaixa(dados, pos + 48, 10, bytesMod)
+        const nomeCampo: texto = dados.fatiarTexto(pos, pos + 16).aparar()
+        const tamCampo: texto = dados.fatiarTexto(pos + 48, pos + 58)
         const tamMembro: inteiro = parseDecimalAr(tamCampo)
         se (tamMembro < 0 ou tamMembro > n - (pos + 60)) {
             diag.erroDireto(nomeArq, 0, 0, "tamanho de membro fora dos limites em arquivo '.a' (${tamMembro})",
@@ -151,10 +155,10 @@ funcao extrairObjetosDeAr(dados: inteiro[], nomeArq: texto, diag: qualquer): Obj
         }
 
         se (nomeCampo == "//") {
-            tabelaNomesLongos = lerTextoAsciiFaixa(dados, iniDados, tamMembro, bytesMod)
+            tabelaNomesLongos = dados.fatiarTexto(iniDados, iniDados + tamMembro)
         } senao se (nomeCampo == "/" ou nomeCampo == "/SYM64/") {
             var skipSymIdx: inteiro = 0
-        } senao se (tamMembro >= 64 e dados[iniDados] == ec.ELF_MAGIC_0 e dados[iniDados + 1] == ec.ELF_MAGIC_1 e dados[iniDados + 2] == ec.ELF_MAGIC_2 e dados[iniDados + 3] == ec.ELF_MAGIC_3) {
+        } senao se (tamMembro >= 64 e dados.obter(iniDados) == ec.ELF_MAGIC_0 e dados.obter(iniDados + 1) == ec.ELF_MAGIC_1 e dados.obter(iniDados + 2) == ec.ELF_MAGIC_2 e dados.obter(iniDados + 3) == ec.ELF_MAGIC_3) {
             var nomeMembro: texto = nomeCampo
             se (nomeCampo.tamanho() > 1 e nomeCampo[0] == "/" e tabelaNomesLongos.tamanho() > 0) {
                 const offLong: inteiro = parseDecimalAr(nomeCampo.fatiar(1, nomeCampo.tamanho()))
@@ -168,20 +172,29 @@ funcao extrairObjetosDeAr(dados: inteiro[], nomeArq: texto, diag: qualquer): Obj
             } senao se (nomeMembro.tamanho() > 0 e nomeMembro[nomeMembro.tamanho() - 1] == "/") {
                 nomeMembro = nomeMembro.fatiar(0, nomeMembro.tamanho() - 1)
             }
-            var fatia: inteiro[] = []
-            para (var k: inteiro = 0; k < tamMembro; k++) fatia.empilhar(dados[iniDados + k] & 255)
-            membros.empilhar(lerObjetoELF64(fatia, "${nomeArq}(${nomeMembro})", diag))
+            const fatia: qualquer = dados.fatiar(iniDados, iniDados + tamMembro)
+            fatias.empilhar(tupla([fatia, "${nomeArq}(${nomeMembro})"]))
         }
 
         pos = iniDados + tamMembro
         se (pos % 2 == 1) pos++
     }
 
+    retorna fatias
+}
+
+funcao extrairObjetosDeAr(dadosIn: qualquer, nomeArq: texto, diag: qualquer): ObjetoElfLido[] {
+    const fatias: qualquer[] = fatiarMembrosDeAr(dadosIn, nomeArq, diag)
+    var membros: ObjetoElfLido[] = []
+    para (var i: inteiro = 0; i < fatias.tamanho(); i++) {
+        membros.empilhar(lerObjetoELF64(fatias[i][0], texto(fatias[i][1]), diag))
+    }
+
     retorna membros
 }
 
-funcao lerObjetoELF64(dados: inteiro[], nomeArq: texto, diag: qualquer): ObjetoElfLido {
-    const bytesMod: qualquer = importar("cgd:bytes")
+funcao lerObjetoELF64(dadosIn: qualquer, nomeArq: texto, diag: qualquer): ObjetoElfLido {
+    const dados: qualquer = assegurarBytesElf(dadosIn)
     const ec: qualquer = importar("../object/elf/elf_comum.delegua")
     const nBytes: inteiro = dados.tamanho()
 
@@ -190,38 +203,38 @@ funcao lerObjetoELF64(dados: inteiro[], nomeArq: texto, diag: qualquer): ObjetoE
             "", "", "E5001")
     }
 
-    se (dados[0] != ec.ELF_MAGIC_0 ou dados[1] != ec.ELF_MAGIC_1 ou dados[2] != ec.ELF_MAGIC_2 ou dados[3] != ec.ELF_MAGIC_3) {
+    se (dados.obter(0) != ec.ELF_MAGIC_0 ou dados.obter(1) != ec.ELF_MAGIC_1 ou dados.obter(2) != ec.ELF_MAGIC_2 ou dados.obter(3) != ec.ELF_MAGIC_3) {
         diag.erroDireto(nomeArq, 0, 0, "arquivo objeto ELF64 invalido (magic incorreto)",
             "", "", "E5001")
     }
 
-    se (dados[4] != ec.ELFCLASS64) {
-        diag.erroDireto(nomeArq, 0, 0, "objeto ELF invalido: classe ELF64 (2) esperada, obtido ${dados[4]}",
+    se (dados.obter(4) != ec.ELFCLASS64) {
+        diag.erroDireto(nomeArq, 0, 0, "objeto ELF invalido: classe ELF64 (2) esperada, obtido ${dados.obter(4)}",
             "", "", "E5001")
     }
 
-    se (dados[5] != ec.ELFDATA2LSB) {
-        diag.erroDireto(nomeArq, 0, 0, "objeto ELF invalido: codificacao little-endian (1) esperada, obtido ${dados[5]}",
+    se (dados.obter(5) != ec.ELFDATA2LSB) {
+        diag.erroDireto(nomeArq, 0, 0, "objeto ELF invalido: codificacao little-endian (1) esperada, obtido ${dados.obter(5)}",
             "", "", "E5001")
     }
 
-    se (dados[6] != ec.EV_CURRENT) {
-        diag.erroDireto(nomeArq, 0, 0, "versao de identificacao ELF invalida: ${dados[6]}",
+    se (dados.obter(6) != ec.EV_CURRENT) {
+        diag.erroDireto(nomeArq, 0, 0, "versao de identificacao ELF invalida: ${dados.obter(6)}",
             "", "", "E5001")
     }
 
-    const eType: inteiro = ec.lerU16LE(dados, 16)
-    const eMachine: inteiro = ec.lerU16LE(dados, 18)
-    const eVersion: inteiro = ec.lerU32LE(dados, 20)
+    const eType: inteiro = dados.lerU16LE(16)
+    const eMachine: inteiro = dados.lerU16LE(18)
+    const eVersion: inteiro = dados.lerU32LE(20)
     se (eType != ec.ET_REL ou eMachine != ec.EM_X86_64 ou eVersion != ec.EV_CURRENT) {
         diag.erroDireto(nomeArq, 0, 0, "objeto ELF64 esperado (ET_REL x86-64), obtido type=${eType} machine=${eMachine}",
             "", "", "E5001")
     }
 
-    const eShoff: inteiro = ec.lerU64LE(dados, 40)
-    const eShentsize: inteiro = ec.lerU16LE(dados, 58)
-    const eShnum: inteiro = ec.lerU16LE(dados, 60)
-    const eShstrndx: inteiro = ec.lerU16LE(dados, 62)
+    const eShoff: inteiro = dados.lerU64LE(40)
+    const eShentsize: inteiro = dados.lerU16LE(58)
+    const eShnum: inteiro = dados.lerU16LE(60)
+    const eShstrndx: inteiro = dados.lerU16LE(62)
 
     se (eShentsize < 64 ou eShentsize > 4096) {
         diag.erroDireto(nomeArq, 0, 0, "e_shentsize invalido (${eShentsize}) em objeto ELF64",
@@ -244,8 +257,8 @@ funcao lerObjetoELF64(dados: inteiro[], nomeArq: texto, diag: qualquer): ObjetoE
     }
 
     const shstrHdrBase: inteiro = eShoff + eShstrndx * eShentsize
-    const shstrOff: inteiro = ec.lerU64LE(dados, shstrHdrBase + 24)
-    const shstrSz: inteiro = ec.lerU64LE(dados, shstrHdrBase + 32)
+    const shstrOff: inteiro = dados.lerU64LE(shstrHdrBase + 24)
+    const shstrSz: inteiro = dados.lerU64LE(shstrHdrBase + 32)
     se (shstrOff < 0 ou shstrSz < 0 ou shstrOff > nBytes ou shstrSz > nBytes - shstrOff) {
         diag.erroDireto(nomeArq, 0, 0, "secao .shstrtab fora dos limites do arquivo", "",
             "", "E5003")
@@ -258,15 +271,15 @@ funcao lerObjetoELF64(dados: inteiro[], nomeArq: texto, diag: qualquer): ObjetoE
 
     para (var i: inteiro = 0; i < eShnum; i++) {
         const base: inteiro = eShoff + i * eShentsize
-        const shNameOff: inteiro = ec.lerU32LE(dados, base)
-        const shType: inteiro = ec.lerU32LE(dados, base + 4)
-        const shFlags: inteiro = ec.lerU64LE(dados, base + 8)
-        const shOffset: inteiro = ec.lerU64LE(dados, base + 24)
-        const shSize: inteiro = ec.lerU64LE(dados, base + 32)
-        const shLink: inteiro = ec.lerU32LE(dados, base + 40)
-        const shInfo: inteiro = ec.lerU32LE(dados, base + 44)
-        const shAlign: inteiro = ec.lerU64LE(dados, base + 48)
-        const shEntSize: inteiro = ec.lerU64LE(dados, base + 56)
+        const shNameOff: inteiro = dados.lerU32LE(base)
+        const shType: inteiro = dados.lerU32LE(base + 4)
+        const shFlags: inteiro = dados.lerU64LE(base + 8)
+        const shOffset: inteiro = dados.lerU64LE(base + 24)
+        const shSize: inteiro = dados.lerU64LE(base + 32)
+        const shLink: inteiro = dados.lerU32LE(base + 40)
+        const shInfo: inteiro = dados.lerU32LE(base + 44)
+        const shAlign: inteiro = dados.lerU64LE(base + 48)
+        const shEntSize: inteiro = dados.lerU64LE(base + 56)
 
         se (shAlign < 0 ou shAlign > 65536 ou (shAlign > 1 e !ec.ehPotenciaDeDois(shAlign))) {
             diag.erroDireto(nomeArq, 0, 0, "alinhamento de secao invalido ou excessivo (sh_addralign=${shAlign}) na secao #${i}",
@@ -286,7 +299,7 @@ funcao lerObjetoELF64(dados: inteiro[], nomeArq: texto, diag: qualquer): ObjetoE
             diag.erroDireto(nomeArq, 0, 0, "offset de nome sh_name (${shNameOff}) fora de .shstrtab na secao #${i}",
                 "", "", "E5004")
         }
-        const nomeSec: texto = ec.lerCStringLim(dados, shstrOff + shNameOff, shstrFim, bytesMod)
+        const nomeSec: texto = dados.lerCString(shstrOff + shNameOff, shstrFim)
         obj.secoes.empilhar(SecaoElfLida(i, nomeSec, shType, shFlags, shOffset, shSize, shLink,
             shInfo, shAlign, shEntSize))
         se (shType == ec.SHT_SYMTAB) symtabSecIdx = i
@@ -313,17 +326,16 @@ funcao lerObjetoELF64(dados: inteiro[], nomeArq: texto, diag: qualquer): ObjetoE
                 diag.erroDireto(nomeArq, 0, 0, "entrada .symtab #${s} fora dos limites",
                     "", "", "E5005")
             }
-            const stName: inteiro = ec.lerU32LE(dados, p)
-            const stInfo: inteiro = dados[p + 4] & 255
-            const stShndx: inteiro = ec.lerU16LE(dados, p + 6)
-            const stValue: inteiro = ec.lerU64LE(dados, p + 8)
-            const stSize: inteiro = ec.lerU64LE(dados, p + 16)
+            const stName: inteiro = dados.lerU32LE(p)
+            const stInfo: inteiro = dados.obter(p + 4)
+            const stShndx: inteiro = dados.lerU16LE(p + 6)
+            const stValue: inteiro = dados.lerU64LE(p + 8)
+            const stSize: inteiro = dados.lerU64LE(p + 16)
             se (stName < 0 ou (stName > 0 e stName >= strSec.shSize)) {
                 diag.erroDireto(nomeArq, 0, 0, "offset st_name (${stName}) fora de .strtab no simbolo #${s}",
                     "", "", "E5005")
             }
-            const nomeSym: texto = ec.lerCStringLim(dados, strSec.shOffset + stName, strFim,
-                bytesMod)
+            const nomeSym: texto = dados.lerCString(strSec.shOffset + stName, strFim)
             obj.simbolos.empilhar(SimboloElfLido(nomeSym, stInfo >> 4, stInfo & 15, stShndx,
                 stValue, stSize))
         }
@@ -349,9 +361,9 @@ funcao lerObjetoELF64(dados: inteiro[], nomeArq: texto, diag: qualquer): ObjetoE
                 diag.erroDireto(nomeArq, 0, 0, "entrada RELA #${r} fora dos limites", "",
                     "", "E5006")
             }
-            const rOff: inteiro = ec.lerU64LE(dados, p)
-            const rInfo: inteiro = ec.lerU64LE(dados, p + 8)
-            const rAdd: inteiro = ec.lerU64LE(dados, p + 16)
+            const rOff: inteiro = dados.lerU64LE(p)
+            const rInfo: inteiro = dados.lerU64LE(p + 8)
+            const rAdd: inteiro = dados.lerU64LE(p + 16)
             const symIdx: inteiro = (rInfo >> 32) & 4294967295
             const rType: inteiro = rInfo & 4294967295
             se (symIdx < 0 ou symIdx >= obj.simbolos.tamanho()) {
@@ -364,6 +376,373 @@ funcao lerObjetoELF64(dados: inteiro[], nomeArq: texto, diag: qualquer): ObjetoE
             }
             obj.relocs.empilhar(RelocElfLida(sec.shInfo, rOff, symIdx, rType, rAdd))
         }
+    }
+
+    retorna obj
+}
+
+// Worker isolado (100% seguro para execucao paralela via `rotina` sobre Bytes congelado zero-copy).
+// Valida integralmente um objeto ET_REL ELF64 e serializa secoes/simbolos/relocacoes em Bytes compacto.
+// Formato de saida:
+//   u8 status (1=OK, 0=ERRO)
+//   Se ERRO: u32 lenCod, bytes cod, u32 lenMsg, bytes msg
+//   Se OK:   u32 nSecoes, [Secao...], u32 nSyms, [Sym...], u32 nRelocs, [Reloc...]
+funcao validarESerializarElfWorker(dadosRaw: qualquer): qualquer {
+    const BytesMod = importar("cgd:bytes")
+    const dados = BytesMod.Bytes.deRecurso(dadosRaw)
+    const out = BytesMod.Bytes.criarReservado(4096)
+    const nBytes: inteiro = dados.tamanho()
+
+    se (nBytes < 64) {
+        out.anexarByte(0)
+        const msg: texto = "arquivo objeto ELF64 truncado (${nBytes} bytes; minimo 64)"
+        out.anexarU32LE(5)
+        out.anexarTexto("E5001")
+        out.anexarU32LE(msg.tamanho())
+        out.anexarTexto(msg)
+        retorna out.congelar().recursoInterno()
+    }
+
+    se (dados.obter(0) != 127 ou dados.obter(1) != 69 ou dados.obter(2) != 76 ou dados.obter(3) != 70) {
+        out.anexarByte(0)
+        const msg: texto = "arquivo objeto ELF64 invalido (magic incorreto)"
+        out.anexarU32LE(5)
+        out.anexarTexto("E5001")
+        out.anexarU32LE(msg.tamanho())
+        out.anexarTexto(msg)
+        retorna out.congelar().recursoInterno()
+    }
+
+    se (dados.obter(4) != 2 ou dados.obter(5) != 1 ou dados.obter(6) != 1) {
+        out.anexarByte(0)
+        const msg: texto = "objeto ELF64 invalido (classe/endianness/versao)"
+        out.anexarU32LE(5)
+        out.anexarTexto("E5001")
+        out.anexarU32LE(msg.tamanho())
+        out.anexarTexto(msg)
+        retorna out.congelar().recursoInterno()
+    }
+
+    const eType: inteiro = dados.lerU16LE(16)
+    const eMachine: inteiro = dados.lerU16LE(18)
+    const eVersion: inteiro = dados.lerU32LE(20)
+    se (eType != 1 ou eMachine != 62 ou eVersion != 1) {
+        out.anexarByte(0)
+        const msg: texto = "objeto ELF64 esperado (ET_REL x86-64), obtido type=${eType} machine=${eMachine}"
+        out.anexarU32LE(5)
+        out.anexarTexto("E5001")
+        out.anexarU32LE(msg.tamanho())
+        out.anexarTexto(msg)
+        retorna out.congelar().recursoInterno()
+    }
+
+    const eShoff: inteiro = dados.lerU64LE(40)
+    const eShentsize: inteiro = dados.lerU16LE(58)
+    const eShnum: inteiro = dados.lerU16LE(60)
+    const eShstrndx: inteiro = dados.lerU16LE(62)
+    se (eShentsize < 64 ou eShentsize > 4096 ou eShnum <= 0 ou eShnum > 65535 ou eShoff < 64 ou eShoff > nBytes ou eShnum > (nBytes - eShoff) \ eShentsize ou eShstrndx >= eShnum) {
+        out.anexarByte(0)
+        const msg: texto = "tabela de Section Headers invalida em objeto ELF64"
+        out.anexarU32LE(5)
+        out.anexarTexto("E5003")
+        out.anexarU32LE(msg.tamanho())
+        out.anexarTexto(msg)
+        retorna out.congelar().recursoInterno()
+    }
+
+    const shstrHdrBase: inteiro = eShoff + eShstrndx * eShentsize
+    const shstrOff: inteiro = dados.lerU64LE(shstrHdrBase + 24)
+    const shstrSz: inteiro = dados.lerU64LE(shstrHdrBase + 32)
+    se (shstrOff < 0 ou shstrSz < 0 ou shstrOff > nBytes ou shstrSz > nBytes - shstrOff) {
+        out.anexarByte(0)
+        const msg: texto = "secao .shstrtab fora dos limites do arquivo"
+        out.anexarU32LE(5)
+        out.anexarTexto("E5003")
+        out.anexarU32LE(msg.tamanho())
+        out.anexarTexto(msg)
+        retorna out.congelar().recursoInterno()
+    }
+
+    const shstrFim: inteiro = shstrOff + shstrSz
+
+    out.anexarByte(1)
+    out.anexarU32LE(eShnum)
+    var symtabSecIdx: inteiro = -1
+    var secTypes: inteiro[] = []
+    var secOffsets: inteiro[] = []
+    var secSizes: inteiro[] = []
+    var secLinks: inteiro[] = []
+    var secInfos: inteiro[] = []
+    var secEntSizes: inteiro[] = []
+
+    para (var i: inteiro = 0; i < eShnum; i++) {
+        const base: inteiro = eShoff + i * eShentsize
+        const shNameOff: inteiro = dados.lerU32LE(base)
+        const shType: inteiro = dados.lerU32LE(base + 4)
+        const shFlags: inteiro = dados.lerU64LE(base + 8)
+        const shOffset: inteiro = dados.lerU64LE(base + 24)
+        const shSize: inteiro = dados.lerU64LE(base + 32)
+        const shLink: inteiro = dados.lerU32LE(base + 40)
+        const shInfo: inteiro = dados.lerU32LE(base + 44)
+        const shAlign: inteiro = dados.lerU64LE(base + 48)
+        const shEntSize: inteiro = dados.lerU64LE(base + 56)
+
+        se (shAlign < 0 ou shAlign > 65536 ou (shAlign > 1 e (shAlign & (shAlign - 1)) != 0) ou shSize < 0 ou shSize > 1073741824) {
+            const errOut = BytesMod.Bytes.criarReservado(128)
+            errOut.anexarByte(0)
+            const msg: texto = "alinhamento ou tamanho de secao invalido na secao #${i}"
+            errOut.anexarU32LE(5)
+            errOut.anexarTexto("E5004")
+            errOut.anexarU32LE(msg.tamanho())
+            errOut.anexarTexto(msg)
+            retorna errOut.congelar().recursoInterno()
+        }
+        se (shType != 0 e shType != 8) {
+            se (shOffset < 0 ou shOffset > nBytes ou shSize > nBytes - shOffset) {
+                const errOut = BytesMod.Bytes.criarReservado(128)
+                errOut.anexarByte(0)
+                const msg: texto = "secao #${i} fora dos limites do arquivo"
+                errOut.anexarU32LE(5)
+                errOut.anexarTexto("E5004")
+                errOut.anexarU32LE(msg.tamanho())
+                errOut.anexarTexto(msg)
+                retorna errOut.congelar().recursoInterno()
+            }
+        }
+        se (shNameOff < 0 ou shNameOff >= shstrSz) {
+            const errOut = BytesMod.Bytes.criarReservado(128)
+            errOut.anexarByte(0)
+            const msg: texto = "offset sh_name fora de .shstrtab na secao #${i}"
+            errOut.anexarU32LE(5)
+            errOut.anexarTexto("E5004")
+            errOut.anexarU32LE(msg.tamanho())
+            errOut.anexarTexto(msg)
+            retorna errOut.congelar().recursoInterno()
+        }
+        const nomeSec: texto = dados.lerCString(shstrOff + shNameOff, shstrFim)
+        const nomeSecB = BytesMod.Bytes.deTexto(nomeSec)
+        out.anexarU32LE(nomeSecB.tamanho())
+        se (nomeSecB.tamanho() > 0) out.anexarBytes(nomeSecB)
+        out.anexarU32LE(shType)
+        out.anexarU64LE(shFlags)
+        out.anexarU64LE(shOffset)
+        out.anexarU64LE(shSize)
+        out.anexarU32LE(shLink)
+        out.anexarU32LE(shInfo)
+        out.anexarU64LE(shAlign)
+        out.anexarU64LE(shEntSize)
+        secTypes.empilhar(shType)
+        secOffsets.empilhar(shOffset)
+        secSizes.empilhar(shSize)
+        secLinks.empilhar(shLink)
+        secInfos.empilhar(shInfo)
+        secEntSizes.empilhar(shEntSize)
+        se (shType == 2) symtabSecIdx = i
+    }
+
+    var nSymsTotal: inteiro = 0
+    se (symtabSecIdx >= 0) {
+        const sLink: inteiro = secLinks[symtabSecIdx]
+        se (sLink <= 0 ou sLink >= eShnum) {
+            const errOut = BytesMod.Bytes.criarReservado(128)
+            errOut.anexarByte(0)
+            const msg: texto = "sh_link invalido em .symtab"
+            errOut.anexarU32LE(5)
+            errOut.anexarTexto("E5005")
+            errOut.anexarU32LE(msg.tamanho())
+            errOut.anexarTexto(msg)
+            retorna errOut.congelar().recursoInterno()
+        }
+        const strOff: inteiro = secOffsets[sLink]
+        const strSz: inteiro = secSizes[sLink]
+        const strFim: inteiro = strOff + strSz
+        const entSz: inteiro = secEntSizes[symtabSecIdx] > 0 ? secEntSizes[symtabSecIdx] : 24
+        se (entSz < 24 ou entSz > 1024) {
+            const errOut = BytesMod.Bytes.criarReservado(128)
+            errOut.anexarByte(0)
+            const msg: texto = "sh_entsize invalido em .symtab"
+            errOut.anexarU32LE(5)
+            errOut.anexarTexto("E5005")
+            errOut.anexarU32LE(msg.tamanho())
+            errOut.anexarTexto(msg)
+            retorna errOut.congelar().recursoInterno()
+        }
+        nSymsTotal = secSizes[symtabSecIdx] \ entSz
+        out.anexarU32LE(nSymsTotal)
+        const sBase: inteiro = secOffsets[symtabSecIdx]
+        para (var s: inteiro = 0; s < nSymsTotal; s++) {
+            const p: inteiro = sBase + s * entSz
+            se (p + 24 > nBytes) {
+                const errOut = BytesMod.Bytes.criarReservado(128)
+                errOut.anexarByte(0)
+                const msg: texto = "entrada .symtab fora dos limites"
+                errOut.anexarU32LE(5)
+                errOut.anexarTexto("E5005")
+                errOut.anexarU32LE(msg.tamanho())
+                errOut.anexarTexto(msg)
+                retorna errOut.congelar().recursoInterno()
+            }
+            const stName: inteiro = dados.lerU32LE(p)
+            const stInfo: inteiro = dados.obter(p + 4)
+            const stShndx: inteiro = dados.lerU16LE(p + 6)
+            const stValue: inteiro = dados.lerU64LE(p + 8)
+            const stSize: inteiro = dados.lerU64LE(p + 16)
+            se (stName < 0 ou (stName > 0 e stName >= strSz)) {
+                const errOut = BytesMod.Bytes.criarReservado(128)
+                errOut.anexarByte(0)
+                const msg: texto = "offset st_name fora de .strtab"
+                errOut.anexarU32LE(5)
+                errOut.anexarTexto("E5005")
+                errOut.anexarU32LE(msg.tamanho())
+                errOut.anexarTexto(msg)
+                retorna errOut.congelar().recursoInterno()
+            }
+            const nomeSym: texto = dados.lerCString(strOff + stName, strFim)
+            const nomeSymB = BytesMod.Bytes.deTexto(nomeSym)
+            out.anexarU32LE(nomeSymB.tamanho())
+            se (nomeSymB.tamanho() > 0) out.anexarBytes(nomeSymB)
+            out.anexarByte(stInfo >> 4)
+            out.anexarByte(stInfo & 15)
+            out.anexarU16LE(stShndx)
+            out.anexarU64LE(stValue)
+            out.anexarU64LE(stSize)
+        }
+    } senao {
+        out.anexarU32LE(0)
+    }
+
+    // Relocacoes SHT_RELA (type == 4)
+    const posNRel: inteiro = out.tamanho()
+    out.anexarU32LE(0)
+    var totalRel: inteiro = 0
+    para (var i: inteiro = 0; i < eShnum; i++) {
+        se (secTypes[i] != 4) continua
+        const alvoSec: inteiro = secInfos[i]
+        se (alvoSec < 0 ou alvoSec >= eShnum) {
+            const errOut = BytesMod.Bytes.criarReservado(128)
+            errOut.anexarByte(0)
+            const msg: texto = "sh_info invalido em secao RELA"
+            errOut.anexarU32LE(5)
+            errOut.anexarTexto("E5006")
+            errOut.anexarU32LE(msg.tamanho())
+            errOut.anexarTexto(msg)
+            retorna errOut.congelar().recursoInterno()
+        }
+        const entSz: inteiro = secEntSizes[i] > 0 ? secEntSizes[i] : 24
+        se (entSz < 24 ou entSz > 1024) {
+            const errOut = BytesMod.Bytes.criarReservado(128)
+            errOut.anexarByte(0)
+            const msg: texto = "sh_entsize invalido em secao RELA"
+            errOut.anexarU32LE(5)
+            errOut.anexarTexto("E5006")
+            errOut.anexarU32LE(msg.tamanho())
+            errOut.anexarTexto(msg)
+            retorna errOut.congelar().recursoInterno()
+        }
+        const nRel: inteiro = secSizes[i] \ entSz
+        const rBase: inteiro = secOffsets[i]
+        para (var r: inteiro = 0; r < nRel; r++) {
+            const p: inteiro = rBase + r * entSz
+            se (p + 24 > nBytes) {
+                const errOut = BytesMod.Bytes.criarReservado(128)
+                errOut.anexarByte(0)
+                const msg: texto = "entrada RELA fora dos limites"
+                errOut.anexarU32LE(5)
+                errOut.anexarTexto("E5006")
+                errOut.anexarU32LE(msg.tamanho())
+                errOut.anexarTexto(msg)
+                retorna errOut.congelar().recursoInterno()
+            }
+            const rOff: inteiro = dados.lerU64LE(p)
+            const rInfo: inteiro = dados.lerU64LE(p + 8)
+            const rAdd: inteiro = dados.lerU64LE(p + 16)
+            const symIdx: inteiro = (rInfo >> 32) & 4294967295
+            const rType: inteiro = rInfo & 4294967295
+            se (symIdx < 0 ou symIdx >= nSymsTotal ou rOff < 0) {
+                const errOut = BytesMod.Bytes.criarReservado(128)
+                errOut.anexarByte(0)
+                const msg: texto = "simbolo ou offset invalido em relocacao"
+                errOut.anexarU32LE(5)
+                errOut.anexarTexto("E5006")
+                errOut.anexarU32LE(msg.tamanho())
+                errOut.anexarTexto(msg)
+                retorna errOut.congelar().recursoInterno()
+            }
+            out.anexarU32LE(alvoSec)
+            out.anexarU64LE(rOff)
+            out.anexarU32LE(symIdx)
+            out.anexarU32LE(rType)
+            out.anexarU64LE(rAdd)
+            totalRel++
+        }
+    }
+
+    out.definirU32LE(posNRel, totalRel)
+    retorna out.congelar().recursoInterno()
+}
+
+funcao materializarObjetoDeWorker(dadosOrig: qualquer, nomeArq: texto, pacoteRaw: qualquer,
+    diag: qualquer): ObjetoElfLido {
+    const BytesMod = importar("cgd:bytes")
+    const p = BytesMod.Bytes.deRecurso(pacoteRaw)
+    const status: inteiro = p.obter(0)
+    se (status == 0) {
+        const lenCod: inteiro = p.lerU32LE(1)
+        const cod: texto = p.fatiarTexto(5, 5 + lenCod)
+        const posMsg: inteiro = 5 + lenCod
+        const lenMsg: inteiro = p.lerU32LE(posMsg)
+        const msg: texto = p.fatiarTexto(posMsg + 4, posMsg + 4 + lenMsg)
+        diag.erroDireto(nomeArq, 0, 0, msg, "", "", cod)
+    }
+
+    const obj: ObjetoElfLido = ObjetoElfLido(nomeArq, dadosOrig)
+    var cur: inteiro = 1
+    const nSec: inteiro = p.lerU32LE(cur)
+    cur = cur + 4
+    para (var i: inteiro = 0; i < nSec; i++) {
+        const lNom: inteiro = p.lerU32LE(cur)
+        cur = cur + 4
+        const nom: texto = lNom > 0 ? p.fatiarTexto(cur, cur + lNom) : ""
+        cur = cur + lNom
+        const shType: inteiro = p.lerU32LE(cur)
+        const shFlags: inteiro = p.lerU64LE(cur + 4)
+        const shOffset: inteiro = p.lerU64LE(cur + 12)
+        const shSize: inteiro = p.lerU64LE(cur + 20)
+        const shLink: inteiro = p.lerU32LE(cur + 28)
+        const shInfo: inteiro = p.lerU32LE(cur + 32)
+        const shAlign: inteiro = p.lerU64LE(cur + 36)
+        const shEntSize: inteiro = p.lerU64LE(cur + 44)
+        cur = cur + 52
+        obj.secoes.empilhar(SecaoElfLida(i, nom, shType, shFlags, shOffset, shSize, shLink,
+            shInfo, shAlign, shEntSize))
+    }
+
+    const nSyms: inteiro = p.lerU32LE(cur)
+    cur = cur + 4
+    para (var s: inteiro = 0; s < nSyms; s++) {
+        const lNom: inteiro = p.lerU32LE(cur)
+        cur = cur + 4
+        const nom: texto = lNom > 0 ? p.fatiarTexto(cur, cur + lNom) : ""
+        cur = cur + lNom
+        const bind: inteiro = p.obter(cur)
+        const tipoS: inteiro = p.obter(cur + 1)
+        const shndx: inteiro = p.lerU16LE(cur + 2)
+        const valor: inteiro = p.lerU64LE(cur + 4)
+        const tam: inteiro = p.lerU64LE(cur + 12)
+        cur = cur + 20
+        obj.simbolos.empilhar(SimboloElfLido(nom, bind, tipoS, shndx, valor, tam))
+    }
+
+    const nRel: inteiro = p.lerU32LE(cur)
+    cur = cur + 4
+    para (var r: inteiro = 0; r < nRel; r++) {
+        const alvo: inteiro = p.lerU32LE(cur)
+        const rOff: inteiro = p.lerU64LE(cur + 4)
+        const symIdx: inteiro = p.lerU32LE(cur + 12)
+        const rType: inteiro = p.lerU32LE(cur + 16)
+        const rAdd: inteiro = p.lerU64LE(cur + 20)
+        cur = cur + 28
+        obj.relocs.empilhar(RelocElfLida(alvo, rOff, symIdx, rType, rAdd))
     }
 
     retorna obj

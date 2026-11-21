@@ -63,29 +63,25 @@ funcao emitirObjetoELF64Bytes(obj: qualquer): qualquer {
         symCount++
     }
 
-    // 2. Constroi .rela.text e .rela.data (escrita direta O(1) sem passar inteiro[] por parametro tipado)
-    var relaText: inteiro[] = []
+    // 2. Constroi .rela.text e .rela.data diretamente em cgd:bytes (1 byte/byte)
+    const relaText: qualquer = bytesMod.Bytes.criarReservado(obj.relocsText.tamanho() * 24)
     para (var i: inteiro = 0; i < obj.relocsText.tamanho(); i++) {
         const r: qualquer = obj.relocsText[i]
         const sIdx: inteiro = inteiro(symIdxMap[r.simbolo])
-        const offR: inteiro = r.offset
         const infoR: inteiro = (sIdx << 32) | (r.tipoReloc & 4294967295)
-        const addR: inteiro = r.addend
-        para (var k: inteiro = 0; k < 8; k++) relaText.empilhar((offR >> (k * 8)) & 255)
-        para (var k: inteiro = 0; k < 8; k++) relaText.empilhar((infoR >> (k * 8)) & 255)
-        para (var k: inteiro = 0; k < 8; k++) relaText.empilhar((addR >> (k * 8)) & 255)
+        relaText.anexarU64LE(r.offset)
+        relaText.anexarU64LE(infoR)
+        relaText.anexarU64LE(r.addend)
     }
 
-    var relaData: inteiro[] = []
+    const relaData: qualquer = bytesMod.Bytes.criarReservado(obj.relocsData.tamanho() * 24)
     para (var i: inteiro = 0; i < obj.relocsData.tamanho(); i++) {
         const r: qualquer = obj.relocsData[i]
         const sIdx: inteiro = inteiro(symIdxMap[r.simbolo])
-        const offR: inteiro = r.offset
         const infoR: inteiro = (sIdx << 32) | (r.tipoReloc & 4294967295)
-        const addR: inteiro = r.addend
-        para (var k: inteiro = 0; k < 8; k++) relaData.empilhar((offR >> (k * 8)) & 255)
-        para (var k: inteiro = 0; k < 8; k++) relaData.empilhar((infoR >> (k * 8)) & 255)
-        para (var k: inteiro = 0; k < 8; k++) relaData.empilhar((addR >> (k * 8)) & 255)
+        relaData.anexarU64LE(r.offset)
+        relaData.anexarU64LE(infoR)
+        relaData.anexarU64LE(r.addend)
     }
 
     // 3. Constroi .shstrtab
@@ -177,23 +173,25 @@ funcao emitirObjetoELF64Bytes(obj: qualquer): qualquer {
         1, 0)
     ec.anexarShdr(shdrs, nGnuStack, ec.SHT_PROGBITS, 0, 0, offShdrs, 0, 0, 0, 1, 0)
 
-    // 7. Monta buffer nativo cgd:bytes (1 byte por byte, evitando alocacoes de centenas de MiB)
-    var out: qualquer = bytesMod.Bytes.deVetor(hdr)
-    se (lenText > 0) out = out.concatenar(bytesMod.Bytes.deVetor(obj.textBytes))
-    se (padRodata > 0) out = out.concatenar(bytesMod.Bytes.criar(padRodata))
-    se (lenRodata > 0) out = out.concatenar(bytesMod.Bytes.deVetor(obj.rodataBytes))
-    se (padData > 0) out = out.concatenar(bytesMod.Bytes.criar(padData))
-    se (lenData > 0) out = out.concatenar(bytesMod.Bytes.deVetor(obj.dataBytes))
-    se (padRelaText > 0) out = out.concatenar(bytesMod.Bytes.criar(padRelaText))
-    se (lenRelaText > 0) out = out.concatenar(bytesMod.Bytes.deVetor(relaText))
-    se (padRelaData > 0) out = out.concatenar(bytesMod.Bytes.criar(padRelaData))
-    se (lenRelaData > 0) out = out.concatenar(bytesMod.Bytes.deVetor(relaData))
-    se (padSymtab > 0) out = out.concatenar(bytesMod.Bytes.criar(padSymtab))
-    se (lenSymtab > 0) out = out.concatenar(bytesMod.Bytes.deVetor(symtab))
-    se (lenStrtab > 0) out = out.concatenar(bytesMod.Bytes.deVetor(strtab))
-    se (lenShstrtab > 0) out = out.concatenar(bytesMod.Bytes.deVetor(shstrtab))
-    se (padShdrs > 0) out = out.concatenar(bytesMod.Bytes.criar(padShdrs))
-    out = out.concatenar(bytesMod.Bytes.deVetor(shdrs))
+    // 7. Monta buffer nativo cgd:bytes com reserva exata em uma unica alocacao (sem copias repetidas)
+    const tamTotal: inteiro = offShdrs + shdrs.tamanho()
+    const out: qualquer = bytesMod.Bytes.criarReservado(tamTotal)
+    out.anexarVetor(hdr)
+    se (lenText > 0) out.anexarBytes(obj.textBytes)
+    se (padRodata > 0) out.anexarZeros(padRodata)
+    se (lenRodata > 0) out.anexarBytes(obj.rodataBytes)
+    se (padData > 0) out.anexarZeros(padData)
+    se (lenData > 0) out.anexarBytes(obj.dataBytes)
+    se (padRelaText > 0) out.anexarZeros(padRelaText)
+    se (lenRelaText > 0) out.anexarBytes(relaText)
+    se (padRelaData > 0) out.anexarZeros(padRelaData)
+    se (lenRelaData > 0) out.anexarBytes(relaData)
+    se (padSymtab > 0) out.anexarZeros(padSymtab)
+    se (lenSymtab > 0) out.anexarVetor(symtab)
+    se (lenStrtab > 0) out.anexarVetor(strtab)
+    se (lenShstrtab > 0) out.anexarVetor(shstrtab)
+    se (padShdrs > 0) out.anexarZeros(padShdrs)
+    out.anexarVetor(shdrs)
     retorna out
 }
 

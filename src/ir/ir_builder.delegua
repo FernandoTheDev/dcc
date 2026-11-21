@@ -1562,13 +1562,8 @@ classe ConstrutorSSA {
 
         const instCall: qualquer = isto.irTipos.InstSSA(opCall, dstC, ehIndireto ? ptrFnReg : 0,
             0, alvoSimbolo)
-        instCall.callArgs = regsArgs
-        instCall.callArgFloats = floatsArgs
-        instCall.callArgLarguras = largsArgs
-        instCall.callArgEhStruct = structsArgs
-        instCall.callEhVariadica = ehVariadicaCall
-        instCall.callRetStructModo = retModo
-        instCall.callSretReg = sretReg
+        instCall.callInfo = isto.irTipos.CallInfoSSA(regsArgs, floatsArgs, largsArgs, structsArgs,
+            ehVariadicaCall, retModo, sretReg)
         instCall.ehFloatDst = expr.tipoC.ehFlutuante()
         se (expr.tipoC.ehFlutuante()) {
             instCall.largura = isto.tabela.tamanhoDe(expr.tipoC)
@@ -1833,13 +1828,12 @@ funcao preencherBytesGlobal(g: qualquer, baseOff: inteiro, inic: qualquer, tipoA
     }
 }
 
-funcao construirModuloSSA(prog: qualquer, tabela: qualquer): qualquer {
+funcao criarModuloComGlobaisSSA(prog: qualquer, tabela: qualquer): qualquer {
     const tMod: qualquer = importar("../types/tipos.delegua")
     const irTipos: qualquer = importar("ir_tipos.delegua")
     const Kind: qualquer = tMod.NoKind
     const OpB: qualquer = tMod.OpBin
     const OpU: qualquer = tMod.OpUn
-    const OpI: qualquer = tMod.OpIR
     const TB: qualquer = tMod.TipoBase
     const modulo: qualquer = irTipos.ModuloSSA()
 
@@ -1861,66 +1855,86 @@ funcao construirModuloSSA(prog: qualquer, tabela: qualquer): qualquer {
         modulo.registrarGlobal(g)
     }
 
+    retorna modulo
+}
+
+funcao construirFuncaoSSA(no: qualquer, tabela: qualquer, modulo: qualquer): qualquer {
+    const tMod: qualquer = importar("../types/tipos.delegua")
+    const irTipos: qualquer = importar("ir_tipos.delegua")
+    const OpI: qualquer = tMod.OpIR
+
+    const params: qualquer = no.filhos[0]
+    const retModoFn: inteiro = classificarStructModo(no.tipoC, tabela)
+    const largRetF: inteiro = no.tipoC.ehFlutuante() ? tabela.tamanhoDe(no.tipoC) : 8
+    const fnSSA: qualquer = irTipos.FuncaoSSA(no.nome, params.filhos.tamanho(), no.tipoC.ehFlutuante(),
+        no.ehVariadica, no.ehStatic, no.tipoC, largRetF, retModoFn, no.ehWeak)
+    const builder: ConstrutorSSA = ConstrutorSSA(modulo, fnSSA, tabela)
+    se (no.ehVariadica) {
+        fnSSA.regSaveOffset = builder.alocarBytes(176)
+    }
+
+    se (retModoFn == 3) {
+        fnSSA.sretPtrOffset = builder.alocarBytes(8)
+        fnSSA.numFixedIntParams = 1 // rdi ocupado pelo ponteiro sret oculto
+    }
+
+    para (var p: inteiro = 0; p < params.filhos.tamanho(); p++) {
+        const pNo: qualquer = params.filhos[p]
+        const off: inteiro = builder.alocarVar(pNo.nome, pNo.tipoC)
+        const tamP: inteiro = tabela.tamanhoDe(pNo.tipoC)
+        const ehFltP: logico = pNo.tipoC.ehFlutuante()
+        const ehStructP: logico = pNo.tipoC.ehAgregado()
+        fnSSA.paramOffsets.empilhar(off)
+        fnSSA.paramLarguras.empilhar(tamP)
+        fnSSA.paramEhFloat.empilhar(ehFltP)
+        fnSSA.paramEhStruct.empilhar(ehStructP)
+        se (ehStructP) {
+            const qwordsP: inteiro = (tamP + 7) \ 8
+            se (tamP <= 8) {
+                se (fnSSA.numFixedIntParams < 6) fnSSA.numFixedIntParams++
+                senao fnSSA.numFixedStkParams++
+            } senao se (tamP <= 16) {
+                se (fnSSA.numFixedIntParams + 2 <= 6) fnSSA.numFixedIntParams = fnSSA.numFixedIntParams + 2
+                senao fnSSA.numFixedStkParams = fnSSA.numFixedStkParams + 2
+            } senao {
+                fnSSA.numFixedStkParams = fnSSA.numFixedStkParams + qwordsP
+            }
+        } senao se (ehFltP) {
+            se (fnSSA.numFixedFltParams < 8) fnSSA.numFixedFltParams++
+            senao fnSSA.numFixedStkParams++
+        } senao {
+            se (fnSSA.numFixedIntParams < 6) fnSSA.numFixedIntParams++
+            senao fnSSA.numFixedStkParams++
+        }
+    }
+
+    builder.baixarStmt(no.filhos[1])
+    no.filhos = []
+    se (!builder.blocoAtual.terminado) {
+        se (fnSSA.retornaFloat) {
+            const zf: inteiro = builder.emitirFConst(0.0)
+            const instFR0: qualquer = irTipos.InstSSA(OpI.FRet, -1, zf, 0)
+            instFR0.largura = fnSSA.larguraRetFloat
+            builder.emitir(instFR0)
+        } senao {
+            const z: inteiro = builder.emitirConst(0)
+            builder.emitir(irTipos.InstSSA(OpI.Ret, -1, z, 0))
+        }
+    }
+
+    retorna fnSSA
+}
+
+funcao construirModuloSSA(prog: qualquer, tabela: qualquer): qualquer {
+    const tMod: qualquer = importar("../types/tipos.delegua")
+    const Kind: qualquer = tMod.NoKind
+    const modulo: qualquer = criarModuloComGlobaisSSA(prog, tabela)
+
     // 2. Funcoes
     para (var i: inteiro = 0; i < prog.filhos.tamanho(); i++) {
         const no: qualquer = prog.filhos[i]
         se (no.kind != Kind.Funcao) continua
-        const params: qualquer = no.filhos[0]
-        const retModoFn: inteiro = classificarStructModo(no.tipoC, tabela)
-        const largRetF: inteiro = no.tipoC.ehFlutuante() ? tabela.tamanhoDe(no.tipoC) : 8
-        const fnSSA: qualquer = irTipos.FuncaoSSA(no.nome, params.filhos.tamanho(), no.tipoC.ehFlutuante(),
-            no.ehVariadica, no.ehStatic, no.tipoC, largRetF, retModoFn, no.ehWeak)
-        const builder: ConstrutorSSA = ConstrutorSSA(modulo, fnSSA, tabela)
-        se (no.ehVariadica) {
-            fnSSA.regSaveOffset = builder.alocarBytes(176)
-        }
-        se (retModoFn == 3) {
-            fnSSA.sretPtrOffset = builder.alocarBytes(8)
-            fnSSA.numFixedIntParams = 1 // rdi ocupado pelo ponteiro sret oculto
-        }
-        para (var p: inteiro = 0; p < params.filhos.tamanho(); p++) {
-            const pNo: qualquer = params.filhos[p]
-            const off: inteiro = builder.alocarVar(pNo.nome, pNo.tipoC)
-            const tamP: inteiro = tabela.tamanhoDe(pNo.tipoC)
-            const ehFltP: logico = pNo.tipoC.ehFlutuante()
-            const ehStructP: logico = pNo.tipoC.ehAgregado()
-            fnSSA.paramOffsets.empilhar(off)
-            fnSSA.paramLarguras.empilhar(tamP)
-            fnSSA.paramEhFloat.empilhar(ehFltP)
-            fnSSA.paramEhStruct.empilhar(ehStructP)
-            se (ehStructP) {
-                const qwordsP: inteiro = (tamP + 7) \ 8
-                se (tamP <= 8) {
-                    se (fnSSA.numFixedIntParams < 6) fnSSA.numFixedIntParams++
-                    senao fnSSA.numFixedStkParams++
-                } senao se (tamP <= 16) {
-                    se (fnSSA.numFixedIntParams + 2 <= 6) fnSSA.numFixedIntParams = fnSSA.numFixedIntParams + 2
-                    senao fnSSA.numFixedStkParams = fnSSA.numFixedStkParams + 2
-                } senao {
-                    fnSSA.numFixedStkParams = fnSSA.numFixedStkParams + qwordsP
-                }
-            } senao se (ehFltP) {
-                se (fnSSA.numFixedFltParams < 8) fnSSA.numFixedFltParams++
-                senao fnSSA.numFixedStkParams++
-            } senao {
-                se (fnSSA.numFixedIntParams < 6) fnSSA.numFixedIntParams++
-                senao fnSSA.numFixedStkParams++
-            }
-        }
-        builder.baixarStmt(no.filhos[1])
-        no.filhos = []
-        se (!builder.blocoAtual.terminado) {
-            se (fnSSA.retornaFloat) {
-                const zf: inteiro = builder.emitirFConst(0.0)
-                const instFR0: qualquer = irTipos.InstSSA(OpI.FRet, -1, zf, 0)
-                instFR0.largura = fnSSA.larguraRetFloat
-                builder.emitir(instFR0)
-            } senao {
-                const z: inteiro = builder.emitirConst(0)
-                builder.emitir(irTipos.InstSSA(OpI.Ret, -1, z, 0))
-            }
-        }
-        modulo.funcoes.empilhar(fnSSA)
+        modulo.funcoes.empilhar(construirFuncaoSSA(no, tabela, modulo))
     }
 
     retorna modulo

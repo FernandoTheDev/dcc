@@ -68,6 +68,7 @@ classe LexerDCC {
     opsSimples: dicionario
     opsSimplesTag: qualquer[]
     opsSimplesLex: texto[]
+    internIds: dicionario
 
     construtor(diag: qualquer, modoGnu: logico = falso) {
         isto.tMod = importar("../types/tipos.delegua")
@@ -205,6 +206,7 @@ classe LexerDCC {
 
         isto.opsSimplesTag = []
         isto.opsSimplesLex = []
+        isto.internIds = {}
         para (var bi: inteiro = 0; bi < 128; bi++) {
             isto.opsSimplesTag.empilhar(nulo)
             isto.opsSimplesLex.empilhar("")
@@ -237,7 +239,7 @@ classe LexerDCC {
     }
 
     tokenizarLinha(fonte: texto, linha: inteiro, out: qualquer, emBlocoIni: logico): logico {
-        const raw: inteiro[] = isto.bytesMod.Bytes.deTexto(fonte).paraVetor()
+        const raw: qualquer = isto.bytesMod.Bytes.deTexto(fonte)
         var pos: inteiro = 0
         var col: inteiro = 1
         var emBloco: logico = emBlocoIni
@@ -245,7 +247,7 @@ classe LexerDCC {
 
         enquanto (pos < n) {
             se (emBloco) {
-                se (pos + 1 < n e raw[pos] == 42 e raw[pos + 1] == 47) {
+                se (pos + 1 < n e raw.obter(pos) == 42 e raw.obter(pos + 1) == 47) {
                     emBloco = falso
                     pos = pos + 2
                     col = col + 2
@@ -255,16 +257,16 @@ classe LexerDCC {
                 }
                 continua
             }
-            const b: inteiro = raw[pos]
+            const b: inteiro = raw.obter(pos)
             se (b == 32 ou b == 9 ou b == 13) {
                 pos++
                 col++
                 continua
             }
-            se (b == 47 e pos + 1 < n e raw[pos + 1] == 47) {
+            se (b == 47 e pos + 1 < n e raw.obter(pos + 1) == 47) {
                 retorna falso
             }
-            se (b == 47 e pos + 1 < n e raw[pos + 1] == 42) {
+            se (b == 47 e pos + 1 < n e raw.obter(pos + 1) == 42) {
                 emBloco = verdadeiro
                 pos = pos + 2
                 col = col + 2
@@ -272,7 +274,7 @@ classe LexerDCC {
             }
 
             // Prefixo L'...' para caractere largo (tratado como constante inteira wchar_t)
-            se (b == 76 e pos + 1 < n e raw[pos + 1] == 39) {
+            se (b == 76 e pos + 1 < n e raw.obter(pos + 1) == 39) {
                 pos++
                 col++
                 continua
@@ -288,7 +290,7 @@ classe LexerDCC {
                 var bytesOut: inteiro[] = []
                 var fechouStr: logico = falso
                 enquanto (pos < n) {
-                    const ch: inteiro = raw[pos]
+                    const ch: inteiro = raw.obter(pos)
                     se (ch == 34) {
                         pos++
                         col++
@@ -337,23 +339,23 @@ classe LexerDCC {
                 const colIni: inteiro = col
                 pos++
                 col++
-                se (pos < n e raw[pos] == 39) {
+                se (pos < n e raw.obter(pos) == 39) {
                     isto.diag.erroEm(linha, colIni, "caractere literal vazio ''", "", "E2004",
                         2)
                 }
                 var codigo: inteiro = 0
-                se (pos < n e raw[pos] == 92) {
+                se (pos < n e raw.obter(pos) == 92) {
                     const decC: (inteiro, inteiro) = isto.litMod.decodificarEscapeBytesC99(raw,
                         pos + 1, n)
                     codigo = decC[0]
                     pos = pos + 1 + decC[1]
                     col = col + 1 + decC[1]
                 } senao se (pos < n) {
-                    codigo = raw[pos] & 255
+                    codigo = raw.obter(pos) & 255
                     pos++
                     col++
                 }
-                se (pos >= n ou raw[pos] != 39) {
+                se (pos >= n ou raw.obter(pos) != 39) {
                     isto.diag.erroEm(linha, colIni, "caractere literal nao terminado", "",
                         "E2004", 1)
                 }
@@ -366,127 +368,141 @@ classe LexerDCC {
             }
 
             // Numeros inteiros e ponto flutuante (decimal, octal, binario, hex, hex-float C99)
-            se ((b >= 48 e b <= 57) ou (b == 46 e pos + 1 < n e raw[pos + 1] >= 48 e raw[pos + 1] <= 57)) {
+            se ((b >= 48 e b <= 57) ou (b == 46 e pos + 1 < n e raw.obter(pos + 1) >= 48 e raw.obter(pos + 1) <= 57)) {
                 const colIni: inteiro = col
+                const posIni: inteiro = pos
                 var ehFloat: logico = falso
                 var ehHex: logico = falso
-                var numB: inteiro[] = []
-                se (b == 48 e pos + 1 < n e (raw[pos + 1] == 120 ou raw[pos + 1] == 88)) {
+                se (b == 48 e pos + 1 < n e (raw.obter(pos + 1) == 120 ou raw.obter(pos + 1) == 88)) {
                     ehHex = verdadeiro
-                    numB.empilhar(raw[pos])
-                    numB.empilhar(raw[pos + 1])
                     pos = pos + 2
                     col = col + 2
-                    enquanto (pos < n e ((raw[pos] >= 48 e raw[pos] <= 57) ou (raw[pos] >= 65 e raw[pos] <= 70) ou (raw[pos] >= 97 e raw[pos] <= 102))) {
-                        numB.empilhar(raw[pos])
-                        pos++
-                        col++
+                    enquanto (pos < n) {
+                        const chH: inteiro = raw.obter(pos)
+                        se ((chH >= 48 e chH <= 57) ou (chH >= 65 e chH <= 70) ou (chH >= 97 e chH <= 102)) {
+                            pos++
+                            col++
+                        } senao {
+                            sustar
+                        }
                     }
-                    se (pos < n e raw[pos] == 46) {
+                    se (pos < n e raw.obter(pos) == 46) {
                         ehFloat = verdadeiro
-                        numB.empilhar(46)
                         pos++
                         col++
-                        enquanto (pos < n e ((raw[pos] >= 48 e raw[pos] <= 57) ou (raw[pos] >= 65 e raw[pos] <= 70) ou (raw[pos] >= 97 e raw[pos] <= 102))) {
-                            numB.empilhar(raw[pos])
+                        enquanto (pos < n) {
+                            const chH2: inteiro = raw.obter(pos)
+                            se ((chH2 >= 48 e chH2 <= 57) ou (chH2 >= 65 e chH2 <= 70) ou (chH2 >= 97 e chH2 <= 102)) {
+                                pos++
+                                col++
+                            } senao {
+                                sustar
+                            }
+                        }
+                    }
+                    se (pos < n e (raw.obter(pos) == 112 ou raw.obter(pos) == 80)) {
+                        ehFloat = verdadeiro
+                        pos++
+                        col++
+                        se (pos < n e (raw.obter(pos) == 43 ou raw.obter(pos) == 45)) {
                             pos++
                             col++
                         }
-                    }
-                    se (pos < n e (raw[pos] == 112 ou raw[pos] == 80)) {
-                        ehFloat = verdadeiro
-                        numB.empilhar(raw[pos])
-                        pos++
-                        col++
-                        se (pos < n e (raw[pos] == 43 ou raw[pos] == 45)) {
-                            numB.empilhar(raw[pos])
-                            pos++
-                            col++
-                        }
-                        enquanto (pos < n e raw[pos] >= 48 e raw[pos] <= 57) {
-                            numB.empilhar(raw[pos])
+                        enquanto (pos < n e raw.obter(pos) >= 48 e raw.obter(pos) <= 57) {
                             pos++
                             col++
                         }
                     }
                     se (ehFloat) {
-                        enquanto (pos < n e (raw[pos] == 102 ou raw[pos] == 70 ou raw[pos] == 108 ou raw[pos] == 76)) {
-                            numB.empilhar(raw[pos])
-                            pos++
-                            col++
+                        enquanto (pos < n) {
+                            const sfH: inteiro = raw.obter(pos)
+                            se (sfH == 102 ou sfH == 70 ou sfH == 108 ou sfH == 76) {
+                                pos++
+                                col++
+                            } senao {
+                                sustar
+                            }
                         }
                     } senao {
-                        enquanto (pos < n e (raw[pos] == 117 ou raw[pos] == 85 ou raw[pos] == 108 ou raw[pos] == 76)) {
-                            numB.empilhar(raw[pos])
-                            pos++
-                            col++
+                        enquanto (pos < n) {
+                            const siH: inteiro = raw.obter(pos)
+                            se (siH == 117 ou siH == 85 ou siH == 108 ou siH == 76) {
+                                pos++
+                                col++
+                            } senao {
+                                sustar
+                            }
                         }
                     }
-                } senao se (b == 48 e pos + 1 < n e (raw[pos + 1] == 98 ou raw[pos + 1] == 66)) {
-                    numB.empilhar(raw[pos])
-                    numB.empilhar(raw[pos + 1])
+                } senao se (b == 48 e pos + 1 < n e (raw.obter(pos + 1) == 98 ou raw.obter(pos + 1) == 66)) {
                     pos = pos + 2
                     col = col + 2
-                    enquanto (pos < n e (raw[pos] == 48 ou raw[pos] == 49 ou raw[pos] == 117 ou raw[pos] == 85 ou raw[pos] == 108 ou raw[pos] == 76)) {
-                        numB.empilhar(raw[pos])
-                        pos++
-                        col++
+                    enquanto (pos < n) {
+                        const chB: inteiro = raw.obter(pos)
+                        se (chB == 48 ou chB == 49 ou chB == 117 ou chB == 85 ou chB == 108 ou chB == 76) {
+                            pos++
+                            col++
+                        } senao {
+                            sustar
+                        }
                     }
                 } senao {
-                    enquanto (pos < n e raw[pos] >= 48 e raw[pos] <= 57) {
-                        numB.empilhar(raw[pos])
+                    enquanto (pos < n e raw.obter(pos) >= 48 e raw.obter(pos) <= 57) {
                         pos++
                         col++
                     }
-                    se (pos < n e raw[pos] == 46) {
+                    se (pos < n e raw.obter(pos) == 46) {
                         ehFloat = verdadeiro
-                        numB.empilhar(46)
                         pos++
                         col++
-                        enquanto (pos < n e raw[pos] >= 48 e raw[pos] <= 57) {
-                            numB.empilhar(raw[pos])
+                        enquanto (pos < n e raw.obter(pos) >= 48 e raw.obter(pos) <= 57) {
                             pos++
                             col++
                         }
                     }
-                    se (pos < n e (raw[pos] == 101 ou raw[pos] == 69)) {
+                    se (pos < n e (raw.obter(pos) == 101 ou raw.obter(pos) == 69)) {
                         ehFloat = verdadeiro
-                        numB.empilhar(raw[pos])
                         pos++
                         col++
-                        se (pos < n e (raw[pos] == 43 ou raw[pos] == 45)) {
-                            numB.empilhar(raw[pos])
+                        se (pos < n e (raw.obter(pos) == 43 ou raw.obter(pos) == 45)) {
                             pos++
                             col++
                         }
                         var digExp: inteiro = 0
-                        enquanto (pos < n e raw[pos] >= 48 e raw[pos] <= 57) {
-                            numB.empilhar(raw[pos])
+                        enquanto (pos < n e raw.obter(pos) >= 48 e raw.obter(pos) <= 57) {
                             pos++
                             col++
                             digExp++
                         }
                         se (digExp == 0) {
-                            const lexBad: texto = isto.bytesMod.Bytes.deVetor(numB).paraTexto()
+                            const lexBad: texto = raw.fatiarTexto(posIni, pos)
                             isto.diag.erroEm(linha, colIni, "expoente sem digitos em literal de ponto flutuante '${lexBad}'",
                                 "", "E2003", lexBad.tamanho())
                         }
                     }
                     se (ehFloat) {
-                        enquanto (pos < n e (raw[pos] == 102 ou raw[pos] == 70 ou raw[pos] == 108 ou raw[pos] == 76)) {
-                            numB.empilhar(raw[pos])
-                            pos++
-                            col++
+                        enquanto (pos < n) {
+                            const sfD: inteiro = raw.obter(pos)
+                            se (sfD == 102 ou sfD == 70 ou sfD == 108 ou sfD == 76) {
+                                pos++
+                                col++
+                            } senao {
+                                sustar
+                            }
                         }
                     } senao {
-                        enquanto (pos < n e (raw[pos] == 117 ou raw[pos] == 85 ou raw[pos] == 108 ou raw[pos] == 76)) {
-                            numB.empilhar(raw[pos])
-                            pos++
-                            col++
+                        enquanto (pos < n) {
+                            const siD: inteiro = raw.obter(pos)
+                            se (siD == 117 ou siD == 85 ou siD == 108 ou siD == 76) {
+                                pos++
+                                col++
+                            } senao {
+                                sustar
+                            }
                         }
                     }
                 }
-                const lex: texto = isto.bytesMod.Bytes.deVetor(numB).paraTexto()
+                const lex: texto = raw.fatiarTexto(posIni, pos)
                 se (ehFloat) {
                     const tokF: TokenC99 = TokenC99(isto.Tok.FloatLit, lex, linha, colIni)
                     se (ehHex) {
@@ -496,7 +512,7 @@ classe LexerDCC {
                                 "", "E2003", lex.tamanho())
                         }
                         tokF.valorReal = hf[0]
-                        const ultB: inteiro = numB[numB.tamanho() - 1]
+                        const ultB: inteiro = raw.obter(pos - 1)
                         tokF.ehFloat32 = ultB == 102 ou ultB == 70
                     } senao {
                         const df: (real, logico) = parseFloatDecimal(lex, isto.diag, linha,
@@ -516,23 +532,27 @@ classe LexerDCC {
                 continua
             }
 
-            // Identificadores e keywords
+            // Identificadores e keywords (com internamento de identificadores)
             se ((b >= 65 e b <= 90) ou (b >= 97 e b <= 122) ou b == 95 ou b == 36) {
                 const colIni: inteiro = col
-                var idB: inteiro[] = [b]
+                const posIni: inteiro = pos
                 pos++
                 col++
                 enquanto (pos < n) {
-                    const cId: inteiro = raw[pos]
+                    const cId: inteiro = raw.obter(pos)
                     se ((cId >= 65 e cId <= 90) ou (cId >= 97 e cId <= 122) ou (cId >= 48 e cId <= 57) ou cId == 95 ou cId == 36) {
-                        idB.empilhar(cId)
                         pos++
                         col++
                     } senao {
                         sustar
                     }
                 }
-                const lexId: texto = isto.bytesMod.Bytes.deVetor(idB).paraTexto()
+                var lexId: texto = raw.fatiarTexto(posIni, pos)
+                se (isto.internIds.contem(lexId)) {
+                    lexId = texto(isto.internIds[lexId])
+                } senao {
+                    isto.internIds[lexId] = lexId
+                }
                 const tagKw: qualquer = isto.keywords.contem(lexId) ? isto.keywords[lexId] : isto.Tok.Ident
                 out.empilhar(TokenC99(tagKw, lexId, linha, colIni))
                 continua
@@ -540,7 +560,7 @@ classe LexerDCC {
 
             // Operadores de 3 caracteres
             se (pos + 2 < n e (b == 46 ou b == 60 ou b == 62)) {
-                const tri: texto = isto.bytesMod.Bytes.deVetor([b, raw[pos + 1], raw[pos + 2]]).paraTexto()
+                const tri: texto = raw.fatiarTexto(pos, pos + 3)
                 se (isto.opsTriplos.contem(tri)) {
                     out.empilhar(TokenC99(isto.opsTriplos[tri], tri, linha, col))
                     pos = pos + 3
@@ -551,9 +571,9 @@ classe LexerDCC {
 
             // Operadores de 2 caracteres
             se (pos + 1 < n) {
-                const b2: inteiro = raw[pos + 1]
+                const b2: inteiro = raw.obter(pos + 1)
                 se (b2 == 61 ou b2 == 62 ou b2 == 60 ou b2 == 43 ou b2 == 45 ou b2 == 38 ou b2 == 124) {
-                    const par: texto = isto.bytesMod.Bytes.deVetor([b, b2]).paraTexto()
+                    const par: texto = raw.fatiarTexto(pos, pos + 2)
                     se (isto.opsDuplos.contem(par)) {
                         out.empilhar(TokenC99(isto.opsDuplos[par], par, linha, col))
                         pos = pos + 2
@@ -572,7 +592,7 @@ classe LexerDCC {
                 continua
             }
 
-            const c1: texto = isto.bytesMod.Bytes.deVetor([b]).paraTexto()
+            const c1: texto = raw.fatiarTexto(pos, pos + 1)
             isto.diag.erroEm(linha, col, "caractere invalido '${c1}'", "", "E2005", 1)
         }
 

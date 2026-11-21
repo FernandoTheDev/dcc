@@ -5,14 +5,34 @@
 // - ir_opt.delegua     (otimizador SSA seguro)
 // - ir_verify.delegua  (verificador estrutural rigoroso de invariantes)
 
+funcao criarModuloComGlobaisSSA(prog: qualquer, tabela: qualquer): qualquer {
+    const bMod: qualquer = importar("ir_builder.delegua")
+    retorna bMod.criarModuloComGlobaisSSA(prog, tabela)
+}
+
+funcao construirFuncaoSSA(no: qualquer, tabela: qualquer, modulo: qualquer): qualquer {
+    const bMod: qualquer = importar("ir_builder.delegua")
+    retorna bMod.construirFuncaoSSA(no, tabela, modulo)
+}
+
 funcao construirModuloSSA(prog: qualquer, tabela: qualquer): qualquer {
     const bMod: qualquer = importar("ir_builder.delegua")
     retorna bMod.construirModuloSSA(prog, tabela)
 }
 
+funcao otimizarFuncaoSSA(fn: qualquer, stats: qualquer, arena: qualquer = nulo): vazio {
+    const oMod: qualquer = importar("ir_opt.delegua")
+    oMod.otimizarFuncaoSSA(fn, stats, arena)
+}
+
 funcao otimizarModuloSSA(modulo: qualquer): qualquer {
     const oMod: qualquer = importar("ir_opt.delegua")
     retorna oMod.otimizarModuloSSA(modulo)
+}
+
+funcao verificarFuncaoSSA(fn: qualquer, nStrings: inteiro, nGlobais: inteiro, arena: qualquer = nulo): logico {
+    const vMod: qualquer = importar("ir_verify.delegua")
+    retorna vMod.verificarFuncaoSSA(fn, nStrings, nGlobais, arena)
 }
 
 funcao verificarModuloSSA(modulo: qualquer): logico {

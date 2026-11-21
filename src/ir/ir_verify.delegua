@@ -10,131 +10,181 @@ funcao ehTerminadorIR(op: qualquer, OpI: qualquer): logico {
     retorna op == OpI.Br ou op == OpI.BrCond ou op == OpI.Ret ou op == OpI.RetPair ou op == OpI.FRet
 }
 
-funcao checarRegDefinido(reg: inteiro, defs: dicionario, numRegs: inteiro, nomeFn: texto,
-    diagMod: qualquer): vazio {
+funcao checarRegDefinido(reg: inteiro, defs: qualquer, numRegs: inteiro, nomeFn: texto, diagMod: qualquer): vazio {
     se (reg < 0 ou reg >= numRegs) {
         falhar diagMod.ErroDCC("IR invalida (ICE): registrador fora dos limites %${reg} (numRegs=${numRegs}) em '${nomeFn}'",
             "", 0, 0, "E9001", verdadeiro)
     }
 
-    se (!defs.contem(texto(reg))) {
+    se (defs.obter(reg) == 0) {
         falhar diagMod.ErroDCC("IR invalida (ICE): uso de registrador nao definido %${reg} em '${nomeFn}'",
             "", 0, 0, "E9002", verdadeiro)
     }
 }
 
-funcao verificarModuloSSA(modulo: qualquer): logico {
+funcao verificarFuncaoSSA(fn: qualquer, nStrings: inteiro, nGlobais: inteiro, arena: qualquer = nulo): logico {
     const tMod: qualquer = importar("../types/tipos.delegua")
     const diagMod: qualquer = importar("../diagnostics/diag.delegua")
     const optMod: qualquer = importar("ir_opt.delegua")
+    const memMod = importar("cgd:memoria")
     const OpI: qualquer = tMod.OpIR
-    const nStrings: inteiro = modulo.stringsBytes.tamanho() > 0 ? modulo.stringsBytes.tamanho() : modulo.strings.tamanho()
-    const nGlobais: inteiro = modulo.globais.tamanho()
 
-    para (var f: inteiro = 0; f < modulo.funcoes.tamanho(); f++) {
-        const fn: qualquer = modulo.funcoes[f]
-        se (fn.blocos.tamanho() == 0) {
-            falhar diagMod.ErroDCC("IR invalida (ICE): funcao '${fn.nome}' sem blocos basicos",
+    se (fn.blocos.tamanho() == 0) {
+        falhar diagMod.ErroDCC("IR invalida (ICE): funcao '${fn.nome}' sem blocos basicos",
+            "", 0, 0, "E9003", verdadeiro)
+    }
+
+    var mapaBlocos: dicionario = {}
+    para (var b: inteiro = 0; b < fn.blocos.tamanho(); b++) {
+        const nomeB: texto = fn.blocos[b].nome
+        se (mapaBlocos.contem(nomeB)) {
+            falhar diagMod.ErroDCC("IR invalida (ICE): bloco duplicado '${nomeB}' em '${fn.nome}'",
                 "", 0, 0, "E9003", verdadeiro)
         }
-        var mapaBlocos: dicionario = {}
-        para (var b: inteiro = 0; b < fn.blocos.tamanho(); b++) {
-            const nomeB: texto = fn.blocos[b].nome
-            se (mapaBlocos.contem(nomeB)) {
-                falhar diagMod.ErroDCC("IR invalida (ICE): bloco duplicado '${nomeB}' em '${fn.nome}'",
-                    "", 0, 0, "E9003", verdadeiro)
-            }
-            mapaBlocos[nomeB] = verdadeiro
-        }
+        mapaBlocos[nomeB] = verdadeiro
+    }
 
-        // Passe 1: coleta e valida unicidade de definicoes SSA + terminadores + limites de indices
-        var defs: dicionario = {}
-        para (var b: inteiro = 0; b < fn.blocos.tamanho(); b++) {
-            const bb: qualquer = fn.blocos[b]
-            se (bb.insts.tamanho() == 0) {
-                falhar diagMod.ErroDCC("IR invalida (ICE): bloco vazio '${bb.nome}' em '${fn.nome}'",
-                    "", 0, 0, "E9003", verdadeiro)
-            }
-            para (var i: inteiro = 0; i < bb.insts.tamanho(); i++) {
-                const inst: qualquer = bb.insts[i]
-                se (i + 1 < bb.insts.tamanho() e ehTerminadorIR(inst.op, OpI)) {
-                    falhar diagMod.ErroDCC("IR invalida (ICE): instrucao apos terminador no bloco '${bb.nome}' em '${fn.nome}'",
-                        "", 0, 0, "E9004", verdadeiro)
-                }
-                se (inst.dst >= 0) {
-                    se (inst.dst >= fn.numRegs) {
-                        falhar diagMod.ErroDCC("IR invalida (ICE): dst %${inst.dst} >= numRegs (${fn.numRegs}) em '${fn.nome}'",
-                            "", 0, 0, "E9001", verdadeiro)
-                    }
-                    const k: texto = texto(inst.dst)
-                    se (defs.contem(k)) {
-                        falhar diagMod.ErroDCC("IR invalida (ICE): violacao SSA no reg %${k} em '${fn.nome}'",
-                            "", 0, 0, "E9005", verdadeiro)
-                    }
-                    defs[k] = verdadeiro
-                }
-                se (inst.dst2 >= 0) {
-                    se (inst.dst2 >= fn.numRegs) {
-                        falhar diagMod.ErroDCC("IR invalida (ICE): dst2 %${inst.dst2} >= numRegs (${fn.numRegs}) em '${fn.nome}'",
-                            "", 0, 0, "E9001", verdadeiro)
-                    }
-                    const k2: texto = texto(inst.dst2)
-                    se (defs.contem(k2)) {
-                        falhar diagMod.ErroDCC("IR invalida (ICE): violacao SSA no reg %${k2} em '${fn.nome}'",
-                            "", 0, 0, "E9005", verdadeiro)
-                    }
-                    defs[k2] = verdadeiro
-                }
-                se (inst.op == OpI.Br e !mapaBlocos.contem(inst.alvo1)) {
-                    falhar diagMod.ErroDCC("IR invalida (ICE): alvo Br inexistente '${inst.alvo1}' em '${fn.nome}'",
-                        "", 0, 0, "E9006", verdadeiro)
-                }
-                se (inst.op == OpI.BrCond e (!mapaBlocos.contem(inst.alvo1) ou !mapaBlocos.contem(inst.alvo2))) {
-                    falhar diagMod.ErroDCC("IR invalida (ICE): alvo BrCond inexistente em '${fn.nome}'",
-                        "", 0, 0, "E9006", verdadeiro)
-                }
-                se (inst.op == OpI.AddrStr e (inst.a < 0 ou inst.a >= nStrings)) {
-                    falhar diagMod.ErroDCC("IR invalida (ICE): indice de string fora dos limites (${inst.a}/${nStrings}) em '${fn.nome}'",
-                        "", 0, 0, "E9007", verdadeiro)
-                }
-                se (inst.op == OpI.AddrGlobal e (inst.a < 0 ou inst.a >= nGlobais)) {
-                    falhar diagMod.ErroDCC("IR invalida (ICE): indice de global fora dos limites (${inst.a}/${nGlobais}) em '${fn.nome}'",
-                        "", 0, 0, "E9007", verdadeiro)
-                }
-            }
-            const ult: qualquer = bb.insts[bb.insts.tamanho() - 1]
-            se (!ehTerminadorIR(ult.op, OpI)) {
-                falhar diagMod.ErroDCC("IR invalida (ICE): bloco '${bb.nome}' em '${fn.nome}' sem terminador",
+    const ar = memMod.Arena(16384, 33554432)
+    const nRegs: inteiro = fn.numRegs > 0 ? fn.numRegs : 1
+    const defs = ar.criarBytes(nRegs)
+
+    const cCopy: inteiro = inteiro(OpI.Copy)
+    const cAddrGlobal: inteiro = inteiro(OpI.AddrGlobal)
+    const cAddrStr: inteiro = inteiro(OpI.AddrStr)
+    const cAlloca: inteiro = inteiro(OpI.Alloca)
+    const cLoad: inteiro = inteiro(OpI.Load)
+    const cStore: inteiro = inteiro(OpI.Store)
+    const cFLoad: inteiro = inteiro(OpI.FLoad)
+    const cFStore: inteiro = inteiro(OpI.FStore)
+    const cAdd: inteiro = inteiro(OpI.Add)
+    const cUGe: inteiro = inteiro(OpI.UGe)
+    const cNeg: inteiro = inteiro(OpI.Neg)
+    const cBitNot: inteiro = inteiro(OpI.BitNot)
+    const cFAdd: inteiro = inteiro(OpI.FAdd)
+    const cFDiv: inteiro = inteiro(OpI.FDiv)
+    const cFNeg: inteiro = inteiro(OpI.FNeg)
+    const cFEq: inteiro = inteiro(OpI.FEq)
+    const cFGe: inteiro = inteiro(OpI.FGe)
+    const cItoF: inteiro = inteiro(OpI.ItoF)
+    const cToBool: inteiro = inteiro(OpI.ToBool)
+    const cCall: inteiro = inteiro(OpI.Call)
+    const cCallIndirect: inteiro = inteiro(OpI.CallIndirect)
+    const cBr: inteiro = inteiro(OpI.Br)
+    const cBrCond: inteiro = inteiro(OpI.BrCond)
+    const cRet: inteiro = inteiro(OpI.Ret)
+    const cRetPair: inteiro = inteiro(OpI.RetPair)
+    const cFRet: inteiro = inteiro(OpI.FRet)
+
+    // Passe 1: coleta e valida unicidade de definicoes SSA + terminadores + limites de indices
+    para (var b: inteiro = 0; b < fn.blocos.tamanho(); b++) {
+        const bb: qualquer = fn.blocos[b]
+        const nI: inteiro = bb.insts.tamanho()
+        se (nI == 0) {
+            falhar diagMod.ErroDCC("IR invalida (ICE): bloco vazio '${bb.nome}' em '${fn.nome}'",
+                "", 0, 0, "E9003", verdadeiro)
+        }
+        para (var i: inteiro = 0; i < nI; i++) {
+            const inst: qualquer = bb.insts[i]
+            const opI: inteiro = inteiro(inst.op)
+            se (i + 1 < nI e opI >= cBr e opI <= cFRet) {
+                falhar diagMod.ErroDCC("IR invalida (ICE): instrucao apos terminador no bloco '${bb.nome}' em '${fn.nome}'",
                     "", 0, 0, "E9004", verdadeiro)
             }
+            se (inst.dst >= 0) {
+                se (inst.dst >= fn.numRegs) {
+                    falhar diagMod.ErroDCC("IR invalida (ICE): dst %${inst.dst} >= numRegs (${fn.numRegs}) em '${fn.nome}'",
+                        "", 0, 0, "E9001", verdadeiro)
+                }
+                se (defs.obter(inst.dst) != 0) {
+                    falhar diagMod.ErroDCC("IR invalida (ICE): violacao SSA no reg %${inst.dst} em '${fn.nome}'",
+                        "", 0, 0, "E9005", verdadeiro)
+                }
+                defs.definir(inst.dst, 1)
+            }
+            se (inst.dst2 >= 0) {
+                se (inst.dst2 >= fn.numRegs) {
+                    falhar diagMod.ErroDCC("IR invalida (ICE): dst2 %${inst.dst2} >= numRegs (${fn.numRegs}) em '${fn.nome}'",
+                        "", 0, 0, "E9001", verdadeiro)
+                }
+                se (defs.obter(inst.dst2) != 0) {
+                    falhar diagMod.ErroDCC("IR invalida (ICE): violacao SSA no reg %${inst.dst2} em '${fn.nome}'",
+                        "", 0, 0, "E9005", verdadeiro)
+                }
+                defs.definir(inst.dst2, 1)
+            }
+            se (opI == cBr e !mapaBlocos.contem(inst.alvo1)) {
+                falhar diagMod.ErroDCC("IR invalida (ICE): alvo Br inexistente '${inst.alvo1}' em '${fn.nome}'",
+                    "", 0, 0, "E9006", verdadeiro)
+            }
+            se (opI == cBrCond e (!mapaBlocos.contem(inst.alvo1) ou !mapaBlocos.contem(inst.alvo2))) {
+                falhar diagMod.ErroDCC("IR invalida (ICE): alvo BrCond inexistente em '${fn.nome}'",
+                    "", 0, 0, "E9006", verdadeiro)
+            }
+            se (opI == cAddrStr e (inst.a < 0 ou inst.a >= nStrings)) {
+                falhar diagMod.ErroDCC("IR invalida (ICE): indice de string fora dos limites (${inst.a}/${nStrings}) em '${fn.nome}'",
+                    "", 0, 0, "E9007", verdadeiro)
+            }
+            se (opI == cAddrGlobal e (inst.a < 0 ou inst.a >= nGlobais)) {
+                falhar diagMod.ErroDCC("IR invalida (ICE): indice de global fora dos limites (${inst.a}/${nGlobais}) em '${fn.nome}'",
+                    "", 0, 0, "E9007", verdadeiro)
+            }
         }
+        const ultOp: inteiro = inteiro(bb.insts[nI - 1].op)
+        se (ultOp < cBr ou ultOp > cFRet) {
+            falhar diagMod.ErroDCC("IR invalida (ICE): bloco '${bb.nome}' em '${fn.nome}' sem terminador",
+                "", 0, 0, "E9004", verdadeiro)
+        }
+    }
 
-        // Passe 2: verifica se todos os operandos referenciados foram definidos
-        para (var b: inteiro = 0; b < fn.blocos.tamanho(); b++) {
-            const bb: qualquer = fn.blocos[b]
-            para (var i: inteiro = 0; i < bb.insts.tamanho(); i++) {
-                const inst: qualquer = bb.insts[i]
-                se (inst.op == OpI.Store ou inst.op == OpI.FStore ou inst.op == OpI.RetPair) {
+    // Passe 2: verifica se todos os operandos referenciados foram definidos (despacho estatico em FatiaBytes)
+    para (var b: inteiro = 0; b < fn.blocos.tamanho(); b++) {
+        const bb: qualquer = fn.blocos[b]
+        para (var i: inteiro = 0; i < bb.insts.tamanho(); i++) {
+            const inst: qualquer = bb.insts[i]
+            const opI: inteiro = inteiro(inst.op)
+            se (opI == cStore ou opI == cFStore ou opI == cRetPair ou (opI >= cAdd e opI <= cUGe) ou (opI >= cFAdd e opI <= cFDiv) ou (opI >= cFEq e opI <= cFGe)) {
+                se (inst.a < 0 ou inst.a >= fn.numRegs ou defs.obter(inst.a) == 0) {
                     checarRegDefinido(inst.a, defs, fn.numRegs, fn.nome, diagMod)
+                }
+                se (inst.b < 0 ou inst.b >= fn.numRegs ou defs.obter(inst.b) == 0) {
                     checarRegDefinido(inst.b, defs, fn.numRegs, fn.nome, diagMod)
-                } senao se (inst.op == OpI.Load ou inst.op == OpI.FLoad ou inst.op == OpI.Alloca ou inst.op == OpI.Ret ou inst.op == OpI.FRet ou inst.op == OpI.BrCond ou inst.op == OpI.Neg ou inst.op == OpI.FNeg ou inst.op == OpI.LogNot ou inst.op == OpI.BitNot ou inst.op == OpI.ItoF ou inst.op == OpI.UItoF ou inst.op == OpI.FtoI ou inst.op == OpI.FtoUI ou inst.op == OpI.TruncSext ou inst.op == OpI.TruncZext ou inst.op == OpI.ToBool ou inst.op == OpI.Copy) {
+                }
+            } senao se (opI == cLoad ou opI == cFLoad ou opI == cAlloca ou opI == cCopy ou opI == cBrCond ou opI == cRet ou opI == cFRet ou (opI >= cNeg e opI <= cBitNot) ou opI == cFNeg ou (opI >= cItoF e opI <= cToBool)) {
+                se (inst.a < 0 ou inst.a >= fn.numRegs ou defs.obter(inst.a) == 0) {
                     checarRegDefinido(inst.a, defs, fn.numRegs, fn.nome, diagMod)
-                } senao se (optMod.ehOpBinariaIntPura(inst.op, OpI) ou optMod.ehOpBinariaFloat(inst.op,
-                    OpI)) {
+                }
+            } senao se (opI >= cCall e opI <= cCallIndirect) {
+                const ci: qualquer = inst.callInfo
+                se (opI == cCallIndirect e (inst.a < 0 ou inst.a >= fn.numRegs ou defs.obter(inst.a) == 0)) {
                     checarRegDefinido(inst.a, defs, fn.numRegs, fn.nome, diagMod)
-                    checarRegDefinido(inst.b, defs, fn.numRegs, fn.nome, diagMod)
-                } senao se (inst.op == OpI.Call ou inst.op == OpI.CallExtern ou inst.op == OpI.CallIndirect) {
-                    se (inst.op == OpI.CallIndirect) checarRegDefinido(inst.a, defs, fn.numRegs,
-                        fn.nome, diagMod)
-                    se (inst.callSretReg >= 0) checarRegDefinido(inst.callSretReg, defs,
-                        fn.numRegs, fn.nome, diagMod)
-                    para (var k: inteiro = 0; k < inst.callArgs.tamanho(); k++) {
-                        checarRegDefinido(inst.callArgs[k], defs, fn.numRegs, fn.nome, diagMod)
+                }
+                se (ci.sretReg >= 0 e (ci.sretReg >= fn.numRegs ou defs.obter(ci.sretReg) == 0)) {
+                    checarRegDefinido(ci.sretReg, defs, fn.numRegs, fn.nome, diagMod)
+                }
+                para (var k: inteiro = 0; k < ci.args.tamanho(); k++) {
+                    const ra: inteiro = ci.args[k]
+                    se (ra < 0 ou ra >= fn.numRegs ou defs.obter(ra) == 0) {
+                        checarRegDefinido(ra, defs, fn.numRegs, fn.nome, diagMod)
                     }
                 }
             }
         }
     }
 
+    ar.liberar()
+    retorna verdadeiro
+}
+
+funcao verificarModuloSSA(modulo: qualquer): logico {
+    const memMod = importar("cgd:memoria")
+    const nStrings: inteiro = modulo.stringsBytes.tamanho() > 0 ? modulo.stringsBytes.tamanho() : modulo.strings.tamanho()
+    const nGlobais: inteiro = modulo.globais.tamanho()
+    const arena: qualquer = memMod.Arena(32768, 33554432)
+
+    para (var f: inteiro = 0; f < modulo.funcoes.tamanho(); f++) {
+        verificarFuncaoSSA(modulo.funcoes[f], nStrings, nGlobais, arena)
+    }
+
+    arena.liberar()
     retorna verdadeiro
 }

@@ -99,3 +99,75 @@ Após a conclusão da base v0.2.0, o compilador foi submetido ao teste real de *
   - `tests/run_tests.py`: **86/86 verificações aprovadas, 0 falhas** (incluindo inicializadores designados aninhados, `__builtin_expect`, string `"-"`, vírgula agregada, `__thread` TLS e retorno `bool` estreito contra GCC).
   - `tests/test_security_fuzz.py`: **APROVADO** (incluindo 5 novas regressões de escalabilidade: ~480k tokens sem macros, linha de 260 KiB, inicializador de 1.000 structs com `.rela.data`, header com 1.500 macros legítimas e 200 `#include`s repetidos).
   - `tests/test_stress.py`: **APROVADO** — 24 compilações paralelas 4× em **2,61 s** (antes 8,76 s → **3,35× mais rápido**); benchmark `-O2` total **872 ms** (antes 3.005 ms → **3,45× mais rápido**).
+
+---
+
+## 5. Ciclo IV — Engenharia Cruzada CGD × DCC, Otimização Extrema de Memória e Performance (21/11/2026)
+
+Em trabalho unificado com o Ciclo III do CGD (`0.9.0`), o DCC passou por auditoria forense completa de memória e desempenho na auto-compilação real (`build/dcc.c` → `build/dcc-self.o` → `build/dcc-self`).
+
+### Melhorias Implementadas no DCC (12 arquivos em `src/`)
+1. **Telemetria `-fmem-report`** (`src/driver/cli.delegua`): medição fase-a-fase de RSS/HWM/PSS e Boehm GC via `Sistema.memoria()` + contadores estruturais (`tokens`, `astNodes`, `insts`, `calls`, `relaText`, `elfBytes`).
+2. **Emissor x86-64 e ELF64 em `cgd:bytes.Bytes` (`GC_MALLOC_ATOMIC`)** (`emissor.delegua`, `codegen.delegua`, `elf_obj.delegua`, `cli.delegua`): eliminou `EmissorX86_64.code: inteiro[]` (24 B/byte), encadeamento `Bytes.concatenar` e o subprocesso `base64 -d`, substituindo por `Bytes.criarReservado`, `anexarU32LE/U64LE`, `gravarArquivo`/`lerArquivo`.
+3. **IR e Verificador/Otimizador compactos** (`ir_tipos.delegua`, `ir_builder.delegua`, `ir_opt.delegua`, `ir_verify.delegua`, `asm.delegua`): extração dos 7 campos de chamada de `InstSSA` para `CallInfoSSA` preguiçoso (`nulo` em 94,7% das instruções) e substituição de dicionários `texto(reg)` por bitsets `Bytes.criar(fn.numRegs)` (`OPT` alloc `330 → 2 MiB`).
+4. **Pré-processador e Lexer sem `paraVetor()` + interning** (`preproc.delegua`, `lexer.delegua`, `literais.delegua`): correção do fast-path de line-splicing (`terminaCom("\\")` no lugar de `contem("\\")`, antes quebrado por escapes octais do CGD), leitura direta via `Bytes.obter`/`fatiarTexto` e interning de identificadores (`internIds`).
+5. **Isolamento de frames e liberação explícita entre fases** (`cli.delegua`): subfunções `executarPreprocLexParse`/`executarSemaEIR` + `tokens.limpar()`, `ast.filhos.limpar()`, `moduloSSA.funcoes.limpar()` + `Sistema.coletarGC(verdadeiro)` em TUs >20k tokens.
+6. **Backend x86-64: rastreamento intra-bloco de `RAX`** (`src/backend/x86_64/codegen.delegua`): elide loads redundantes `[rbp - off]` quando `RAX` já contém o registrador SSA, encolhendo `.text` em `-760 KB` (-4,3%).
+
+### Resultados Medidos (Script [`scripts/bench_ciclo4.py`](../scripts/bench_ciclo4.py), 3 repetições sequenciais)
+- **Modo A (Entrada congelada `frozen_dcc.c`, `clang -O2`)**:
+  - Tempo total: **29,94 s → 8,56 s** (min `8,54 s` / max `9,05 s` — **3,50× mais rápido**).
+  - Pico RSS: **6.715.172 KB (6,40 GiB) → 955.216 KB (0,91 GiB)** (**7,03× menor, -85,8%**).
+  - Alocação GC total: **12.150 MiB → 3.863 MiB (-68,2%)**; `elf_obj`: **311 ms → 53 ms**.
+  - Determinismo: GCC `-O0` (`12,86 s`, `1,12 GiB`), Clang `-O0` (`13,15 s`, `0,89 GiB`), TinyCC `-O0` (`23,26 s`, `0,91 GiB`) e Clang `-O2` (`8,56 s`, `0,91 GiB`) emitiram exatamente o mesmo `.o` (`20.190.680 B`, `sha256: 6144e0665d578e7da0d78b6db63f236150f777d1941ab5548f5d0a6647e5f9ba`).
+- **Modo B (Pipeline atual `build/dcc.c`, 955.348 tokens, 894 funções, `clang -O2`)**:
+  - Mediana **9,53 s**, pico RSS **1.038.188 KB (0,99 GiB)**, `build/dcc-self.o` = `22.130.832 B` → `build/dcc-self` compilou `examples/hello_libc.c` em **290 ms** imprimindo **`DCC`**.
+- **Suítes completas pós-Ciclo IV**:
+  - `make check-format`: **23/23** aprovados.
+  - `tests/run_tests.py`: **86/86** verificações aprovadas, 0 falhas.
+  - `tests/test_security_fuzz.py`: **APROVADO**.
+  - `tests/test_stress.py`: **APROVADO** — 24 compilações paralelas em **1,35 s**; benchmark `-O2` em **250 ms**.
+  - `./bootstrap/verify.sh`: **APROVADO**.
+- **Relatórios gerados**: [AUDITORIA_CICLO_IV.md](AUDITORIA_CICLO_IV.md), [PERFORMANCE_CICLO_IV.md](PERFORMANCE_CICLO_IV.md), [MEMORIA_BOOTSTRAP.md](MEMORIA_BOOTSTRAP.md), [INTEGRACAO_CGD_DCC.md](INTEGRACAO_CGD_DCC.md) e dados em `build/audit_ciclo4/`.
+
+---
+
+## 6. Ciclo V — Paralelismo Adaptativo, Streaming, `cgd:memoria` e Linker `Bytes`/Paralelo (21/11/2026)
+
+Em engenharia integrada com o Ciclo IV do CGD (`0.9.0`), o DCC incorporou paralelismo adaptativo com respeito rigoroso aos recursos da máquina, migração completa do linker para `cgd:bytes.Bytes`, pipeline streaming por função e uso intensivo de `cgd:memoria`.
+
+### Melhorias Implementadas no DCC
+1. **CLI e Política Adaptativa de Recursos (`src/driver/cli.delegua`, `src/main.delegua`)**:
+   - Flags `-j <N|auto>`, `-j<N>`, `--parallel=off`, `--parallel=auto` e fallback `DCC_JOBS`, com validação estrita de entradas inválidas.
+   - Modo padrão `auto` consultando `Memoria.sistema()` e `Rotinas.workersRecomendados(134217728)` (afinidade `sched_getaffinity`, quotas cgroup v2/v1, RAM disponível e pressão de memória; em `taskset -c 0,1` escolhe `workers=1`).
+2. **Compilação Paralela Multi-TU (`src/driver/cli.delegua`)**:
+   - Para `>= 2` arquivos `.c` com `workers > 1`, dispara compilações isoladas via `Processo.executarLote` (`maxProc <= min(workers, TUs, RAM/256MiB)`), preservando ordem exata de diagnósticos/erros, limpeza garantida de temporários e ordem exata dos `.o` para o linker.
+3. **Pipeline Streaming + `cgd:memoria.Arena` + O(1) SSA (`parser.delegua`, `sema.delegua`, `ir_builder.delegua`, `ir_opt.delegua`, `ir_verify.delegua`, `codegen.delegua`, `emissor.delegua`)**:
+   - `parser.delegua`: liberação progressiva de `TokenC99` consumidos (via `tokSentinela`) + `Memoria.coletarSeAcima(192 MiB)` mid-parse a cada 120k tokens em arquivos `>100k` tokens.
+   - `sema.delegua` / `ir_builder.delegua` / `codegen.delegua`: streaming função-a-função (`verificarCorpoFuncao` → `construirFuncaoSSA` → `otimizarFuncaoSSA` → `verificarFuncaoSSA` → `emitirFuncaoStreaming`), liberando AST e IR imediatamente e preservando ordem exata de `.rodata`/`.data`/`.symtab`.
+   - `emissor.delegua`: resolução imediata de labels/patches intra-função (`labelsLocais` + `resolverPatchesFuncao`).
+   - `ir_opt.delegua` / `ir_verify.delegua`: mapas de constantes/cópias/usos em `cgd:memoria.Arena` (`FatiaBytes`/`FatiaInt64`, zero churn GC), DCE por contagem de usos em varredura reversa e despacho $O(1)$ de `OpIR` por faixa inteira.
+4. **Linker Nativo ELF64 em `Bytes` + Workers Paralelos (`linker.delegua`, `elf_leitor.delegua`, `elf_comum.delegua`)**:
+   - Eliminação completa de `inteiro[]` (24 B/byte) em favor de `Bytes` (1 B/byte em `GC_MALLOC_ATOMIC`) com pré-alocação por prefix-sum e `anexarBytesFatia`.
+   - Leitura/validação paralela de `.o`/`.a` (`validarESerializarElfWorker`) e preparação paralela de patches de relocação (`prepararPatchesRelocWorker`) via `rotina` + `Bytes` congelado *zero-copy*, com checagem de limites/estouro/sobreposição e limiares empíricos calibrados (`>= 16 itens && >= 16 MiB`; `>= 20.000` relocs; exercitável via `DCC_FORCE_PAR_LINKER=1`).
+
+### Resultados Medidos (`scripts/bench_paralelismo.py 3`, `build/audit_ciclo5/bench_paralelismo.json`)
+- **Modo A (`frozen_dcc.c`, `clang -O2`, mesmos headers)**:
+  - Tempo mediano (`-j1`): **`12,11 s → 8,66 s` (`-28,5%`, `1,40×` mais rápido)**; `opt+verify`: **`3.611 ms → 838 ms` (`4,31×`)**; `codegen`: **`1.420 ms → 928 ms` (`1,53×`)**.
+  - Pico RSS mediano: **`995.100 KB (971,8 MiB) → 572.960 KB (559,5 MiB)` (`-42,4%`, `-422 MB`!)**.
+  - Determinismo bit a bit: SHA-256 `9b3c0d377d05a831e309977ef4287f595bad4ee07bf238dc4f345da8d44a1d39` (`18.951.128 B`) idêntico entre Ciclo IV, Ciclo V (`clang -O2`, `gcc -O0`, `clang -O0`, `tcc -O0`) e `-j1/-j2/-j4/-j8/-j auto`.
+- **Modo B (Pipeline atual `dcc_c5_current.c`, `70.988` linhas, `1.320.946` tokens, `1.048` funções)**:
+  - Mediana **`12,83 s`**, pico RSS **`849.800 KB` (`829,9 MiB`)** (`-18,1%` RSS vs Ciclo IV apesar de `+65%` linhas C); bootstrap indireto `build/dcc-self` validado compilando `examples/hello_libc.c` → **`DCC`**.
+- **Multi-TU (17 `.c` → executável ELF64)**:
+  - `-j1`: `1,96 s` → `-j2`: `1,64 s` (`1,20×`) → **`-j4`: `1,06 s` (`1,85×`)** → **`-j8`: `0,83 s` (`2,36×`)** → **`-j auto`: `1,09 s` (`1,80×`)**; SHA-256 bit a bit idêntico em todos os modos.
+- **Linker (300 `.o`)**:
+  - Ciclo IV (`inteiro[]`): `0,20 s` / `154.572 KB` → Ciclo V (`Bytes` `-j1`): **`0,03 s` (`6,7×`) / `22.104 KB` (`-85,7%` RSS)**; SHA-256 idêntico em `-j1/-j2/-j4/-j8/-j auto`.
+
+### Suítes Executadas Pós-Ciclo V
+- `make check-format`: **100% aprovado**.
+- `python3 tests/run_tests.py`: **86/86 aprovados, 0 falhas**.
+- `python3 tests/test_security_fuzz.py`: **APROVADO**.
+- `python3 tests/test_stress.py`: **APROVADO** (24 compilações paralelas em **`1,22 s`**, benchmark `-O2` em **`225 ms`**).
+- `python3 tests/test_paralelismo.py`: **6/6 aprovados** (flags inválidos, `taskset -c 0,1`, determinismo 17 TUs, erros ordenados sem vazamento `/tmp`, linker paralelo 2.600+ relocs + `.a` + `weak` + rejeição de ELF hostil).
+- `./bootstrap/verify.sh`: **APROVADO**.
+- **Relatórios gerados**: [PARALELISMO_CICLO_V.md](PARALELISMO_CICLO_V.md), [PERFORMANCE_CICLO_V.md](PERFORMANCE_CICLO_V.md), [LINKER_PARALELO.md](LINKER_PARALELO.md), [INTEGRACAO_CGD_DCC_CICLO_V.md](INTEGRACAO_CGD_DCC_CICLO_V.md).

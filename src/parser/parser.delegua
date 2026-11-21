@@ -82,6 +82,7 @@ classe ParserDCC {
     modoGnu: logico
     tokens: qualquer[]
     pos: inteiro
+    posLiberado: inteiro
     profundidade: inteiro
     pilhaTypedefs: dicionario[]
     enumConsts: dicionario
@@ -105,6 +106,7 @@ classe ParserDCC {
         isto.modoGnu = modoGnu
         isto.tokens = tokens
         isto.pos = 0
+        isto.posLiberado = 0
         isto.profundidade = 0
         isto.pilhaTypedefs = [{}]
         isto.enumConsts = {}
@@ -901,9 +903,28 @@ classe ParserDCC {
         isto.declsPendentes = []
     }
 
+    liberarTokensConsumidos(): vazio {
+        const ultIdx: inteiro = isto.tokens.tamanho() - 1
+        se (ultIdx <= 0) retorna
+        const tokSentinela: qualquer = isto.tokens[ultIdx]
+        const lim: inteiro = isto.pos < ultIdx ? isto.pos : ultIdx
+        enquanto (isto.posLiberado < lim) {
+            isto.tokens[isto.posLiberado] = tokSentinela
+            isto.posLiberado++
+        }
+    }
+
     parsePrograma(): NoAST {
+        const memMod: qualquer = importar("cgd:memoria")
         const prog: NoAST = NoAST(isto.Kind.Programa, 1, 1)
+        const nToksTotal: inteiro = isto.tokens.tamanho()
+        var ultColetaTok: inteiro = 0
         enquanto (isto.atual().tag != isto.Tok.Fim) {
+            isto.liberarTokensConsumidos()
+            se (nToksTotal > 100000 e (isto.posLiberado - ultColetaTok) >= 120000) {
+                ultColetaTok = isto.posLiberado
+                memMod.Memoria.coletarSeAcima(201326592, verdadeiro)
+            }
             const posIniDecl: inteiro = isto.pos
             se (isto.atual().tag == isto.Tok.Semi) {
                 isto.avancar()

@@ -1,7 +1,7 @@
 PREFIX ?= /usr/local
 DESTDIR ?=
 CGD ?= cgd
-VERSION := 0.2.0
+VERSION := 0.3.0
 DIST_NAME := dcc-$(VERSION)-linux-x86_64
 
 .PHONY: all build test test-security test-stress test-all verify format check-format install uninstall dist clean
