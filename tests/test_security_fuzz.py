@@ -277,6 +277,88 @@ def testar_elf_e_ar_malformados(tmp: Path) -> int:
     return falhas
 
 
+def testar_escalabilidade_preprocessador(tmp: Path) -> int:
+    """Regressao para E1011 e escalabilidade O(N) em arquivos C grandes, linhas extensas,
+    inicializadores grandes, headers com muitas macros legitimas e includes repetidos."""
+    falhas = 0
+
+    # 1. Arquivo C grande sem macros (>450.000 tokens de entrada) nao deve acionar E1011
+    arq_grande = tmp / "scale_sem_macros.c"
+    linhas_g = ["int f_big(void) { int s = 0;\n"]
+    # Cada linha tem ~16 tokens; 30.000 linhas = ~480.000 tokens de entrada (zero macros)
+    linhas_g.extend(["s = s + 1 + 2 + 3 + 4 + 5 + 6;\n"] * 30000)
+    linhas_g.append("return s; }\n")
+    arq_grande.write_text("".join(linhas_g), encoding="utf-8")
+    r_g = rodar_dcc_seguro(["-E", str(arq_grande), "-o", str(tmp / "scale_sem_macros.i")], timeout=15.0)
+    if r_g.returncode != 0 or "E1011" in r_g.stderr or "GC Warning" in r_g.stderr:
+        print(f"[FALHA scale_sem_macros] rc={r_g.returncode} err={r_g.stderr[:300]!r}")
+        falhas += 1
+    else:
+        print("[OK] scale:arquivo_grande_sem_macros (~480k tokens, -E sem E1011/GC warning)")
+
+    # 2. Linha unica com >250.000 caracteres (inicializador estilo cgd_source_sites[])
+    arq_lin = tmp / "scale_linha_250k.c"
+    itens = ",".join(["{f0,1,2}"] * 26000)  # ~260 KB numa unica linha!
+    arq_lin.write_text(
+        f'typedef struct {{ const char *f; int l; int c; }} L;\n'
+        f'static const char f0[] = "x";\n'
+        f'static const L tab[] = {{{itens}}};\n',
+        encoding="utf-8",
+    )
+    r_l = rodar_dcc_seguro(["-E", str(arq_lin), "-o", str(tmp / "scale_linha_250k.i")], timeout=15.0)
+    if r_l.returncode != 0 or "E1011" in r_l.stderr or "GC Warning" in r_l.stderr:
+        print(f"[FALHA scale_linha_250k] rc={r_l.returncode} err={r_l.stderr[:300]!r}")
+        falhas += 1
+    else:
+        print("[OK] scale:linha_250k_chars (-E O(L) sem E1011/GC warning)")
+
+    # 3. Inicializador extenso compilado ate .o com relocacoes .rela.data (escala O(N))
+    arq_init = tmp / "scale_init_obj.c"
+    itens_obj = ",".join([f"{{f0,{i},1}}" for i in range(1000)])
+    arq_init.write_text(
+        f'typedef struct {{ const char *f; int l; int c; }} L;\n'
+        f'static const char f0[] = "ok";\n'
+        f'static const L sites[] = {{{itens_obj}}};\n'
+        f'int main(void) {{ return sites[999].l == 999 ? 0 : 1; }}\n',
+        encoding="utf-8",
+    )
+    r_i = rodar_dcc_seguro(["-c", str(arq_init), "-o", str(tmp / "scale_init_obj.o")], timeout=15.0)
+    if r_i.returncode != 0 or "GC Warning" in r_i.stderr:
+        print(f"[FALHA scale_init_obj] rc={r_i.returncode} err={r_i.stderr[:300]!r}")
+        falhas += 1
+    else:
+        print("[OK] scale:inicializador_extenso_rela_data (1000 structs -> .o)")
+
+    # 4. Header com muitas macros legitimas (1500 definicoes + usos)
+    hdr_m = tmp / "muitas_macros.h"
+    hdr_m.write_text("".join([f"#define M_{k} ({k})\n" for k in range(1500)]), encoding="utf-8")
+    arq_m = tmp / "usa_muitas_macros.c"
+    arq_m.write_text(
+        '#include "muitas_macros.h"\nint main(void) { return M_0 + M_10 + M_999 + M_1499 - 2508; }\n',
+        encoding="utf-8",
+    )
+    r_m = rodar_dcc_seguro(["-I", str(tmp), str(arq_m), "-o", str(tmp / "usa_muitas_macros.out")], timeout=15.0)
+    if r_m.returncode != 0:
+        print(f"[FALHA scale_muitas_macros] rc={r_m.returncode} err={r_m.stderr[:300]!r}")
+        falhas += 1
+    else:
+        print("[OK] scale:header_1500_macros_legitimas")
+
+    # 5. Includes repetidos (200 inclusoes do mesmo header com include-guard -> MI-OPT)
+    hdr_g = tmp / "guard_rep.h"
+    hdr_g.write_text("#ifndef GUARD_REP_H\n#define GUARD_REP_H\nstatic int g_rep_val = 7;\n#endif\n", encoding="utf-8")
+    arq_r = tmp / "rep_inc.c"
+    arq_r.write_text('#include "guard_rep.h"\n' * 200 + "int main(void) { return g_rep_val - 7; }\n", encoding="utf-8")
+    r_r = rodar_dcc_seguro(["-I", str(tmp), str(arq_r), "-o", str(tmp / "rep_inc.out")], timeout=10.0)
+    if r_r.returncode != 0:
+        print(f"[FALHA scale_includes_repetidos] rc={r_r.returncode} err={r_r.stderr[:300]!r}")
+        falhas += 1
+    else:
+        print("[OK] scale:includes_repetidos_200x (MI-OPT)")
+
+    return falhas
+
+
 def main() -> int:
     if not DCC_BIN.exists():
         print(f"Binario nao encontrado: {DCC_BIN}")
@@ -285,6 +367,7 @@ def main() -> int:
     try:
         falhas = 0
         falhas += testar_preproc_adversarial(tmp)
+        falhas += testar_escalabilidade_preprocessador(tmp)
         falhas += testar_lexer_parser_fuzz(tmp)
         falhas += testar_elf_e_ar_malformados(tmp)
         print(f"\nResumo Seguranca/Fuzzing DCC: {'APROVADO' if falhas == 0 else f'{falhas} FALHA(S)'}")

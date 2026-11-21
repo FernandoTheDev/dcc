@@ -218,6 +218,7 @@ funcao gerarCodigoObjetoX86_64(modulo: qualquer): qualquer {
 
     // 2b. Emite relocacoes .rela.data para ponteiros globais inicializados
     var externosExtras: dicionario = {}
+    var externosTls: dicionario = {}
     para (var i: inteiro = 0; i < modulo.globais.tamanho(); i++) {
         const g: qualquer = modulo.globais[i]
         se (!g.temInit ou g.relocs.tamanho() == 0) continua
@@ -388,6 +389,10 @@ funcao gerarCodigoObjetoX86_64(modulo: qualquer): qualquer {
                     emissor.storeRaxRbp(offRegObj(fn.tamanhoLocaisBytes, inst.dst))
                     caso OpI.AddrExternGlobal:
                     emissor.movRaxGotReloc(inst.alvo1)
+                    emissor.storeRaxRbp(offRegObj(fn.tamanhoLocaisBytes, inst.dst))
+                    caso OpI.AddrExternTls:
+                    externosTls[inst.alvo1] = verdadeiro
+                    emissor.movRaxTlsGotReloc(inst.alvo1)
                     emissor.storeRaxRbp(offRegObj(fn.tamanhoLocaisBytes, inst.dst))
                     caso OpI.AddrFunc:
                     se (funcoesWeak.contem(inst.alvo1)) {
@@ -579,6 +584,7 @@ funcao gerarCodigoObjetoX86_64(modulo: qualquer): qualquer {
         const tamFn: inteiro = emissor.code.tamanho() - inicioFn
         obj.simbolos.empilhar(emMod.SimboloObj(fn.nome, "TEXT", inicioFn, tamFn, !fn.ehStatic,
             elfComum.STT_FUNC, fn.ehWeak))
+        fn.blocos = []
     }
 
     emissor.resolverPatchesInternos()
@@ -599,7 +605,8 @@ funcao gerarCodigoObjetoX86_64(modulo: qualquer): qualquer {
         const nm: texto = modulo.externosDados[i]
         se (!extVistos.contem(nm)) {
             extVistos[nm] = verdadeiro
-            obj.simbolos.empilhar(emMod.SimboloObj(nm, "UNDEF", 0, 0, verdadeiro, elfComum.STT_NOTYPE))
+            const tipoSymExt: inteiro = externosTls.contem(nm) ? elfComum.STT_TLS : elfComum.STT_NOTYPE
+            obj.simbolos.empilhar(emMod.SimboloObj(nm, "UNDEF", 0, 0, verdadeiro, tipoSymExt))
         }
     }
 

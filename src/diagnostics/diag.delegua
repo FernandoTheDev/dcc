@@ -50,7 +50,8 @@ classe MapaFonte {
     }
 
     registrar(arquivo: texto, linha: inteiro, textoLinha: texto, pilhaInclusao: texto[] = []): vazio {
-        isto.linhas.empilhar(OrigemLinha(arquivo, linha, textoLinha, pilhaInclusao))
+        const trecho: texto = textoLinha.tamanho() > 512 ? textoLinha.fatiar(0, 512) : textoLinha
+        isto.linhas.empilhar(OrigemLinha(arquivo, linha, trecho, pilhaInclusao))
     }
 
     consultar(linhaExpandida: inteiro): OrigemLinha {

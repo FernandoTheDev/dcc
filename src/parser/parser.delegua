@@ -11,7 +11,7 @@ classe NoAST {
     nome: texto
     nomeSimboloLink: texto
     textoLit: texto
-    bytesLit: inteiro[]
+    bytesLit: qualquer
     valor: inteiro
     valorReal: real
     tipoC: qualquer
@@ -19,6 +19,7 @@ classe NoAST {
     ehExtern: logico
     ehStatic: logico
     ehWeak: logico
+    ehThreadLocal: logico
     ehVariadica: logico
     ehSemSinal: logico
     ehLongo: logico
@@ -38,7 +39,7 @@ classe NoAST {
         isto.nome = ""
         isto.nomeSimboloLink = ""
         isto.textoLit = ""
-        isto.bytesLit = []
+        isto.bytesLit = nulo
         isto.valor = 0
         isto.valorReal = 0.0
         isto.tipoC = nulo
@@ -46,6 +47,7 @@ classe NoAST {
         isto.ehExtern = falso
         isto.ehStatic = falso
         isto.ehWeak = falso
+        isto.ehThreadLocal = falso
         isto.ehVariadica = falso
         isto.ehSemSinal = falso
         isto.ehLongo = falso
@@ -85,6 +87,7 @@ classe ParserDCC {
     enumConsts: dicionario
     declsPendentes: NoAST[]
     contAnon: inteiro
+    ultimoThreadLocal: logico
     mapaAtrib: dicionario
     mapaBinOp: dicionario
     mapaBinPrec: dicionario
@@ -107,6 +110,7 @@ classe ParserDCC {
         isto.enumConsts = {}
         isto.declsPendentes = []
         isto.contAnon = 0
+        isto.ultimoThreadLocal = falso
 
         isto.mapaAtrib = {
             "=": isto.OpB.Assign,
@@ -363,7 +367,7 @@ classe ParserDCC {
         se (tag == isto.Tok.KwExtension ou tag == isto.Tok.KwAttribute ou tag == isto.Tok.KwTypeof) {
             retorna verdadeiro
         }
-        se (tag == isto.Tok.KwConst ou tag == isto.Tok.KwVolatile ou tag == isto.Tok.KwRestrict ou tag == isto.Tok.KwInline ou tag == isto.Tok.KwStatic ou tag == isto.Tok.KwExtern ou tag == isto.Tok.KwAuto ou tag == isto.Tok.KwRegister) {
+        se (tag == isto.Tok.KwConst ou tag == isto.Tok.KwVolatile ou tag == isto.Tok.KwRestrict ou tag == isto.Tok.KwInline ou tag == isto.Tok.KwStatic ou tag == isto.Tok.KwExtern ou tag == isto.Tok.KwThreadLocal ou tag == isto.Tok.KwAuto ou tag == isto.Tok.KwRegister) {
             retorna verdadeiro
         }
         se (tag == isto.Tok.KwVoid ou tag == isto.Tok.KwBool ou tag == isto.Tok.KwChar ou tag == isto.Tok.KwShort ou tag == isto.Tok.KwInt ou tag == isto.Tok.KwLong ou tag == isto.Tok.KwSigned ou tag == isto.Tok.KwUnsigned ou tag == isto.Tok.KwFloat ou tag == isto.Tok.KwDouble ou tag == isto.Tok.KwFloat32 ou tag == isto.Tok.KwFloat64 ou tag == isto.Tok.KwFloat32x ou tag == isto.Tok.KwFloat64x ou tag == isto.Tok.KwBuiltinVaList ou tag == isto.Tok.KwStruct ou tag == isto.Tok.KwUnion ou tag == isto.Tok.KwEnum) {
@@ -386,6 +390,7 @@ classe ParserDCC {
         var ehExtern: logico = falso
         var ehStatic: logico = falso
         var ehWeak: logico = falso
+        isto.ultimoThreadLocal = falso
         var ehConst: logico = falso
         var ehVolatile: logico = falso
         var ehRestrict: logico = falso
@@ -442,6 +447,12 @@ classe ParserDCC {
             se (tag == isto.Tok.KwExtern) {
                 isto.avancar()
                 ehExtern = verdadeiro
+                consumiuAlgo = verdadeiro
+                continua
+            }
+            se (tag == isto.Tok.KwThreadLocal) {
+                isto.avancar()
+                isto.ultimoThreadLocal = verdadeiro
                 consumiuAlgo = verdadeiro
                 continua
             }
@@ -882,7 +893,8 @@ classe ParserDCC {
         retorna decl[0]
     }
 
-    drenarPendentes(destino: NoAST[]): vazio {
+    // Nota CGD: destino usa 'qualquer' (NoAST[]) para evitar validacao O(N) por declaracao.
+    drenarPendentes(destino: qualquer): vazio {
         para (var i: inteiro = 0; i < isto.declsPendentes.tamanho(); i++) {
             destino.empilhar(isto.declsPendentes[i])
         }
@@ -892,6 +904,7 @@ classe ParserDCC {
     parsePrograma(): NoAST {
         const prog: NoAST = NoAST(isto.Kind.Programa, 1, 1)
         enquanto (isto.atual().tag != isto.Tok.Fim) {
+            const posIniDecl: inteiro = isto.pos
             se (isto.atual().tag == isto.Tok.Semi) {
                 isto.avancar()
                 continua
@@ -970,6 +983,7 @@ classe ParserDCC {
         no.ehExtern = ehExtern
         no.ehStatic = ehStatic
         no.ehWeak = ehWeak
+        no.ehThreadLocal = isto.ultimoThreadLocal
         const linkSym: texto = isto.lerAsmSimboloLink()
         se (linkSym.tamanho() > 0) no.nomeSimboloLink = linkSym
         const attrG: (logico, inteiro, logico) = isto.lerAtributosGNU()
@@ -1041,6 +1055,7 @@ classe ParserDCC {
         const no: NoAST = NoAST(ehUnion ? isto.Kind.DeclUnion : isto.Kind.DeclStruct, lin)
         no.nome = nomeA
         enquanto (isto.atual().tag != isto.Tok.RBrace e isto.atual().tag != isto.Tok.Fim) {
+            const posIniStmt: inteiro = isto.pos
             se (isto.atual().tag == isto.Tok.Semi) {
                 isto.avancar()
                 continua
@@ -1177,6 +1192,7 @@ classe ParserDCC {
         isto.entrarEscopoTypedef()
         const bloco: NoAST = NoAST(isto.Kind.Bloco, lin, col)
         enquanto (isto.atual().tag != isto.Tok.RBrace e isto.atual().tag != isto.Tok.Fim) {
+            const posIniStmt: inteiro = isto.pos
             se (isto.atual().tag == isto.Tok.Semi) {
                 isto.avancar()
                 continua
@@ -1191,6 +1207,11 @@ classe ParserDCC {
                 isto.parseDeclVarLocal(bloco.filhos, verdadeiro)
             } senao {
                 bloco.filhos.empilhar(isto.parseStmt())
+            }
+            se (isto.pos == posIniStmt) {
+                const tkTr: qualquer = isto.atual()
+                isto.diag.erroEm(tkTr.linha, tkTr.coluna, "token inesperado '${tkTr.lexema}' sem progresso no parser",
+                    "", "E2011", tkTr.lexema.tamanho())
             }
         }
         isto.consumir(isto.Tok.RBrace, "'}' esperado")
@@ -1207,28 +1228,34 @@ classe ParserDCC {
             isto.avancar()
             const lista: NoAST = NoAST(isto.Kind.ExprInitList, lin, col)
             enquanto (isto.atual().tag != isto.Tok.RBrace e isto.atual().tag != isto.Tok.Fim) {
-                se (isto.atual().tag == isto.Tok.Dot) {
-                    const dLin: inteiro = isto.atual().linha
-                    isto.avancar()
-                    const campoN: texto = isto.consumir(isto.Tok.Ident, "nome de campo esperado em inicializador designado").lexema
+                se (isto.atual().tag == isto.Tok.Dot ou isto.atual().tag == isto.Tok.LBracket) {
+                    var raizDes: qualquer = nulo
+                    var ultDes: qualquer = nulo
+                    enquanto (isto.atual().tag == isto.Tok.Dot ou isto.atual().tag == isto.Tok.LBracket) {
+                        const dLin: inteiro = isto.atual().linha
+                        const dCol: inteiro = isto.atual().coluna
+                        const des: NoAST = NoAST(isto.Kind.ExprInicDesignado, dLin, dCol)
+                        se (isto.atual().tag == isto.Tok.Dot) {
+                            isto.avancar()
+                            des.nome = isto.consumir(isto.Tok.Ident, "nome de campo esperado em inicializador designado").lexema
+                            des.ehSeta = falso
+                        } senao {
+                            isto.avancar()
+                            const idxExpr: NoAST = isto.parseExprAtribOuCond()
+                            des.valor = isto.avaliarConstSimples(idxExpr)
+                            isto.consumir(isto.Tok.RBracket, "']' esperado em inicializador designado")
+                            des.ehSeta = verdadeiro
+                        }
+                        se (raizDes == nulo) {
+                            raizDes = des
+                        } senao {
+                            ultDes.filhos.empilhar(des)
+                        }
+                        ultDes = des
+                    }
                     isto.consumir(isto.Tok.Igual, "'=' esperado em inicializador designado")
-                    const des: NoAST = NoAST(isto.Kind.ExprInicDesignado, dLin)
-                    des.nome = campoN
-                    des.ehSeta = falso
-                    des.filhos.empilhar(isto.parseInicializador())
-                    lista.filhos.empilhar(des)
-                } senao se (isto.atual().tag == isto.Tok.LBracket) {
-                    const dLin: inteiro = isto.atual().linha
-                    isto.avancar()
-                    const idxExpr: NoAST = isto.parseExprAtribOuCond()
-                    const idxVal: inteiro = isto.avaliarConstSimples(idxExpr)
-                    isto.consumir(isto.Tok.RBracket, "']' esperado em inicializador designado")
-                    isto.consumir(isto.Tok.Igual, "'=' esperado em inicializador designado")
-                    const des: NoAST = NoAST(isto.Kind.ExprInicDesignado, dLin)
-                    des.valor = idxVal
-                    des.ehSeta = verdadeiro
-                    des.filhos.empilhar(isto.parseInicializador())
-                    lista.filhos.empilhar(des)
+                    ultDes.filhos.empilhar(isto.parseInicializador())
+                    lista.filhos.empilhar(raizDes)
                 } senao {
                     lista.filhos.empilhar(isto.parseInicializador())
                 }
@@ -1244,7 +1271,8 @@ classe ParserDCC {
         retorna resInic
     }
 
-    parseDeclVarLocal(destino: NoAST[], comPontoVirgula: logico): vazio {
+    // Nota CGD: destino usa 'qualquer' (NoAST[]) para evitar validacao O(N) em blocos extensos.
+    parseDeclVarLocal(destino: qualquer, comPontoVirgula: logico): vazio {
         const lin: inteiro = isto.atual().linha
         const col: inteiro = isto.atual().coluna
         const baseInfo: (qualquer, logico, logico, logico) = isto.lerTipoBase()
@@ -1278,6 +1306,7 @@ classe ParserDCC {
     }
 
     parseStmt(): NoAST {
+        se (isto.atual().tag == isto.Tok.LBrace) retorna isto.parseBloco()
         isto.entrarProfundidade()
         const res: NoAST = isto.parseStmtInterno()
         isto.sairProfundidade()
@@ -1484,8 +1513,9 @@ classe ParserDCC {
 
     parseAtrib(): NoAST {
         const esq: NoAST = isto.parseTernario()
-        const lexAtual: texto = isto.atual().lexema
-        se (isto.mapaAtrib.contem(lexAtual)) {
+        const tAt: qualquer = isto.atual()
+        const lexAtual: texto = tAt.lexema
+        se (tAt.tag != isto.Tok.StrLit e tAt.tag != isto.Tok.CharLit e isto.mapaAtrib.contem(lexAtual)) {
             const tOp: qualquer = isto.avancar()
             const dir: NoAST = isto.parseAtrib()
             const no: NoAST = NoAST(isto.Kind.ExprAtrib, tOp.linha, tOp.coluna)
@@ -1517,8 +1547,9 @@ classe ParserDCC {
     parseBinaria(minPrec: inteiro): NoAST {
         var esq: NoAST = isto.parseCast()
         enquanto (verdadeiro) {
-            const lex: texto = isto.atual().lexema
-            se (!isto.mapaBinPrec.contem(lex)) sustar
+            const tBin: qualquer = isto.atual()
+            const lex: texto = tBin.lexema
+            se (tBin.tag == isto.Tok.StrLit ou tBin.tag == isto.Tok.CharLit ou !isto.mapaBinPrec.contem(lex)) sustar
             const prec: inteiro = inteiro(isto.mapaBinPrec[lex])
             se (prec < minPrec) sustar
             const t: qualquer = isto.avancar()
@@ -1598,7 +1629,7 @@ classe ParserDCC {
             noAl.ehSeta = verdadeiro
             retorna noAl
         }
-        se (isto.mapaUnario.contem(t.lexema)) {
+        se (t.tag != isto.Tok.StrLit e t.tag != isto.Tok.CharLit e isto.mapaUnario.contem(t.lexema)) {
             isto.avancar()
             const no: NoAST = NoAST(isto.Kind.ExprUnaria, t.linha, t.coluna)
             no.opUn = isto.mapaUnario[t.lexema]

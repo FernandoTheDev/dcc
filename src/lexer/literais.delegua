@@ -101,6 +101,57 @@ funcao ehContIdent(c: texto): logico {
     retorna (cd >= 65 e cd <= 90) ou (cd >= 97 e cd <= 122) ou (cd >= 48 e cd <= 57) ou cd == 95 ou cd == 36
 }
 
+// Decodifica sequencia de escape C99 diretamente sobre vetor de bytes (O(1) por byte, sem O(L^2) UTF-8).
+// Retorna (valorByte, quantidadeDeBytesConsumidosAposBarra).
+funcao decodificarEscapeBytesC99(raw: inteiro[], posEsc: inteiro, n: inteiro): (inteiro,
+    inteiro) {
+    se (posEsc >= n) retorna tupla([0, 0])
+    const b: inteiro = raw[posEsc]
+    se (b == 110) retorna tupla([10, 1]) // 'n'
+    se (b == 116) retorna tupla([9, 1]) // 't'
+    se (b == 114) retorna tupla([13, 1]) // 'r'
+    se (b == 97) retorna tupla([7, 1]) // 'a'
+    se (b == 98) retorna tupla([8, 1]) // 'b'
+    se (b == 102) retorna tupla([12, 1]) // 'f'
+    se (b == 118) retorna tupla([11, 1]) // 'v'
+    se (b == 92) retorna tupla([92, 1]) // '\'
+    se (b == 39) retorna tupla([39, 1]) // '''
+    se (b == 34) retorna tupla([34, 1]) // '"'
+    se (b == 63) retorna tupla([63, 1]) // '?'
+
+    // Hexadecimal: \xHH...
+    se (b == 120) {
+        var valH: inteiro = 0
+        var p: inteiro = posEsc + 1
+        enquanto (p < n) {
+            const c: inteiro = raw[p]
+            var d: inteiro = -1
+            se (c >= 48 e c <= 57) d = c - 48
+            senao se (c >= 65 e c <= 70) d = c - 55
+            senao se (c >= 97 e c <= 102) d = c - 87
+            se (d < 0) sustar
+            valH = ((valH << 4) | d) & 255
+            p++
+        }
+        retorna tupla([valH, p - posEsc])
+    }
+
+    // Octal: \0 .. \377 (ate 3 digitos octais conforme C99 6.4.4.4)
+    se (b >= 48 e b <= 55) {
+        var valO: inteiro = b - 48
+        var p: inteiro = posEsc + 1
+        var cnt: inteiro = 1
+        enquanto (p < n e cnt < 3 e raw[p] >= 48 e raw[p] <= 55) {
+            valO = (valO << 3) | (raw[p] - 48)
+            p++
+            cnt++
+        }
+        retorna tupla([valO & 255, cnt])
+    }
+
+    retorna tupla([b & 255, 1])
+}
+
 // Decodifica sequencia de escape C99 a partir do caractere logo apos '\'.
 // Retorna (valorByte, quantidadeDeCaracteresConsumidosAposBarra).
 funcao decodificarEscapeC99(fonte: texto, posEsc: inteiro, n: inteiro): (inteiro, inteiro) {

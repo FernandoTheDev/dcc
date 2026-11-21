@@ -48,7 +48,7 @@ Serializado com `cgd:json.Json.formatar` em `stderr`, emitindo um objeto JSON po
 
 | Faixa | Fase | Exemplos |
 | :--- | :--- | :--- |
-| `E1000`–`E1020` | Pré-processador | `E1001` comentário `/*` aberto, `E1002` limite `#include`, `E1003` `#if`/`#endif`, `E1004`–`E1008` expressão `#if`, `E1011` limite de expansão de macro (anti-DoS), `E1014` `##` inválido, `E1016` header ausente, `E1020` `#error` |
+| `E1000`–`E1020` | Pré-processador | `E1001` comentário `/*` aberto, `E1002` limite `#include`, `E1003` `#if`/`#endif`, `E1004`–`E1008` expressão `#if`, `E1010` profundidade de macro, `E1011` limite de expansão de macro (anti-DoS), `E1014` `##` inválido, `E1016` header ausente, `E1018` limite de tokens de entrada por TU (20M), `E1019` limite de tamanho de arquivo (64 MiB), `E1020` `#error` |
 | `W1001` | Pré-processador | `#warning` (categoria `cpp`) |
 | `E2000`–`E2102` | Lexer / Parser | `E2001`–`E2005` erro léxico, `E2010` limite de recursão do parser, `E2100` atributo/inline `asm` GNU Cat C, `E2101` statement expression `({...})` Cat C, `E2102` computed goto `&&label` Cat C |
 | `E3000`–`E3011` | Semântica / Tipos | `E3001` símbolo/struct duplicado, `E3002` campo duplicado, `E3003` bit-field inválido, `E3004` array negativo/overflow, `E3005` struct recursiva/incompleta, `E3006`/`E3007` `case`/`default` duplicado, `E3010` escrita em `const`, `E3011` tipos incompatíveis |

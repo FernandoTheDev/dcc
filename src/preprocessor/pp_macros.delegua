@@ -18,26 +18,35 @@ classe PPToken {
     val: texto
     espaco: logico
     linha: inteiro
-    hideSet: dicionario
+    hideSet: qualquer
 
     construtor(kind: PPTokKind, val: texto, espaco: logico = falso, linha: inteiro = 1) {
         isto.kind = kind
         isto.val = val
         isto.espaco = espaco
         isto.linha = linha
-        isto.hideSet = {}
+        isto.hideSet = nulo
+    }
+
+    temHide(nome: texto): logico {
+        se (isto.hideSet == nulo) retorna falso
+        retorna isto.hideSet.contem(nome)
     }
 
     clonarComHide(extraHide: dicionario): PPToken {
         const novo: PPToken = PPToken(isto.kind, isto.val, isto.espaco, isto.linha)
-        const chaves1: texto[] = isto.hideSet.chaves()
-        para (var i: inteiro = 0; i < chaves1.tamanho(); i++) {
-            novo.hideSet[chaves1[i]] = verdadeiro
+        var hs: dicionario = {}
+        se (isto.hideSet != nulo) {
+            const chaves1: texto[] = isto.hideSet.chaves()
+            para (var i: inteiro = 0; i < chaves1.tamanho(); i++) {
+                hs[chaves1[i]] = verdadeiro
+            }
         }
         const chaves2: texto[] = extraHide.chaves()
         para (var i: inteiro = 0; i < chaves2.tamanho(); i++) {
-            novo.hideSet[chaves2[i]] = verdadeiro
+            hs[chaves2[i]] = verdadeiro
         }
+        novo.hideSet = hs
         retorna novo
     }
 }
@@ -224,7 +233,7 @@ funcao stringificarTokensPP(toks: PPToken[]): texto {
     retorna out.juntar("")
 }
 
-funcao aplicarTokenPastingPP(toks: PPToken[], numLinha: inteiro): PPToken[] {
+funcao aplicarTokenPastingPP(toks: PPToken[], numLinha: inteiro, clsArg: qualquer = nulo): PPToken[] {
     var out: PPToken[] = []
     var i: inteiro = 0
     enquanto (i < toks.tamanho()) {
@@ -233,9 +242,9 @@ funcao aplicarTokenPastingPP(toks: PPToken[], numLinha: inteiro): PPToken[] {
                 const esq: PPToken = out.removerUltimo()
                 const dir: PPToken = toks[i + 1]
                 const combinado: texto = esq.val + dir.val
-                const novos: PPToken[] = tokenizarLinhaPP(combinado, numLinha)
+                const novos: PPToken[] = tokenizarLinhaPP(combinado, numLinha, clsArg)
                 para (var k: inteiro = 0; k < novos.tamanho(); k++) {
-                    const nt: PPToken = novos[k].clonarComHide(esq.hideSet)
+                    const nt: PPToken = esq.hideSet != nulo ? novos[k].clonarComHide(esq.hideSet) : novos[k]
                     se (k == 0) nt.espaco = esq.espaco
                     out.empilhar(nt)
                 }

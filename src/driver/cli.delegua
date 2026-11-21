@@ -21,22 +21,25 @@ funcao trocarExtensaoLocal(caminho: texto, novaExt: texto): texto {
     retorna camMod.Caminhos.semExtensao(baseNome) + novaExt
 }
 
-// Grava buffer binario em disco sem interpolar caminhos em comando shell;
+// Grava buffer binario cgd:bytes em disco sem interpolar caminhos em comando shell;
 // aplica permissao 0755 diretamente via syscall POSIX chmod (FFI).
-funcao gravarBinario(caminhoSaida: texto, vetorBytes: inteiro[], executavel: logico): vazio {
-    const bytesMod: qualquer = importar("cgd:bytes")
+funcao gravarBinarioBytes(caminhoSaida: texto, b: qualquer, executavel: logico): vazio {
     const procMod: qualquer = importar("cgd:processo")
-    const b: qualquer = bytesMod.Bytes.deVetor(vetorBytes)
     const res: qualquer = procMod.Processo.executar("/bin/sh", [
         "-c",
         "exec base64 -d > \"$1\"",
         "_",
         caminhoSaida
-    ], "", {}, 15000, 65536, b.paraBase64())
+    ], "", {}, 60000, 65536, b.paraBase64())
     res.exigirSucesso()
     se (executavel) {
         LibCChmod.chmodArq(caminhoSaida, 493) // 0755
     }
+}
+
+funcao gravarBinario(caminhoSaida: texto, vetorBytes: qualquer, executavel: logico): vazio {
+    const bytesMod: qualquer = importar("cgd:bytes")
+    gravarBinarioBytes(caminhoSaida, bytesMod.Bytes.deVetor(vetorBytes), executavel)
 }
 
 funcao lerBinario(caminho: texto): inteiro[] {
@@ -358,26 +361,34 @@ funcao executarDriverDCC(args: texto[]): inteiro {
             se (verbose) escreverErro("[dcc] pre-processando ${arqPath} (std=${modoGnu ? "gnu99" : "c99"})")
 
             cron.reiniciar()
-            const resPre: (texto, inteiro) = preMod.preprocessarDCC(arquivos.Arquivo(arqPath).ler(),
+            var resPre: qualquer = preMod.preprocessarDCC(arquivos.Arquivo(arqPath).ler(),
                 arqPath, dirsInclude, defsCli, undefsCli, diag, modoGnu)
             tPre = tPre + cron.milisegundos()
-            se (verbose) escreverErro("[dcc] includes resolvidos: ${resPre[1]}")
+            se (verbose) escreverErro("[dcc] preprocess concluido em ${inteiro(tPre)}ms (includes=${resPre[1]})")
 
             cron.reiniciar()
-            const tokens: qualquer[] = lexMod.tokenizarDCC(resPre[0], diag, modoGnu)
+            var tokens: qualquer = lexMod.tokenizarDCC(resPre[0], diag, modoGnu)
+            resPre = nulo
             tLex = tLex + cron.milisegundos()
+            se (verbose) escreverErro("[dcc] lex concluido em ${inteiro(tLex)}ms (tokens=${tokens.tamanho()})")
 
             cron.reiniciar()
-            const ast: qualquer = parMod.analisarSintaxeDCC(tokens, diag, modoGnu)
+            var ast: qualquer = parMod.analisarSintaxeDCC(tokens, diag, modoGnu)
+            tokens = nulo
             tPar = tPar + cron.milisegundos()
+            se (verbose) escreverErro("[dcc] parse concluido em ${inteiro(tPar)}ms (decls=${ast.filhos.tamanho()})")
 
             cron.reiniciar()
-            const resSema: qualquer = semMod.analisarSemanticaDCC(ast, diag, falso)
+            var resSema: qualquer = semMod.analisarSemanticaDCC(ast, diag, falso)
             tSem = tSem + cron.milisegundos()
+            se (verbose) escreverErro("[dcc] sema concluido em ${inteiro(tSem)}ms")
 
             cron.reiniciar()
-            const moduloSSA: qualquer = irMod.construirModuloSSA(ast, resSema.tabela)
+            var moduloSSA: qualquer = irMod.construirModuloSSA(ast, resSema.tabela)
+            ast = nulo
+            resSema = nulo
             tIr = tIr + cron.milisegundos()
+            se (verbose) escreverErro("[dcc] ir concluido em ${inteiro(tIr)}ms (fns=${moduloSSA.funcoes.tamanho()})")
 
             cron.reiniciar()
             se (nivelOpt > 0) {
@@ -387,12 +398,14 @@ funcao executarDriverDCC(args: texto[]): inteiro {
             }
             irMod.verificarModuloSSA(moduloSSA)
             tOpt = tOpt + cron.milisegundos()
+            se (verbose) escreverErro("[dcc] opt+verify concluido em ${inteiro(tOpt)}ms")
 
             emitirAvisosDiag(diag)
 
             se (somenteAsm) {
                 cron.reiniciar()
                 const codigoAsm: texto = asmMod.emitirAssemblyX86_64(moduloSSA)
+                moduloSSA = nulo
                 tCg = tCg + cron.milisegundos()
                 const destAsm: texto = caminhoSaida.tamanho() > 0 ? caminhoSaida : trocarExtensaoLocal(arqPath,
                     ".s")
@@ -402,19 +415,27 @@ funcao executarDriverDCC(args: texto[]): inteiro {
             }
 
             cron.reiniciar()
-            const codObj: qualquer = cgMod.gerarCodigoObjetoX86_64(moduloSSA)
+            var codObj: qualquer = cgMod.gerarCodigoObjetoX86_64(moduloSSA)
+            moduloSSA = nulo
             tCg = tCg + cron.milisegundos()
-
-            cron.reiniciar()
-            const bytesObj: inteiro[] = elfObjMod.emitirObjetoELF64(codObj)
-            tElf = tElf + cron.milisegundos()
+            se (verbose) escreverErro("[dcc] codegen concluido em ${inteiro(tCg)}ms (text=${codObj.textBytes.tamanho()}B)")
 
             se (somenteObjeto) {
+                cron.reiniciar()
+                const bytesObjB: qualquer = elfObjMod.emitirObjetoELF64Bytes(codObj)
+                codObj = nulo
+                tElf = tElf + cron.milisegundos()
+                se (verbose) escreverErro("[dcc] elf_obj concluido em ${inteiro(tElf)}ms (${bytesObjB.tamanho()}B)")
                 const destObj: texto = caminhoSaida.tamanho() > 0 ? caminhoSaida : trocarExtensaoLocal(arqPath,
                     ".o")
-                gravarBinario(destObj, bytesObj, falso)
-                se (verbose) escreverErro("[dcc] objeto ELF64 emitido em ${destObj} (${bytesObj.tamanho()} bytes)")
+                gravarBinarioBytes(destObj, bytesObjB, falso)
+                se (verbose) escreverErro("[dcc] objeto ELF64 emitido em ${destObj} (${bytesObjB.tamanho()} bytes)")
             } senao {
+                cron.reiniciar()
+                const bytesObj: inteiro[] = elfObjMod.emitirObjetoELF64(codObj)
+                codObj = nulo
+                tElf = tElf + cron.milisegundos()
+                se (verbose) escreverErro("[dcc] elf_obj concluido em ${inteiro(tElf)}ms (${bytesObj.tamanho()}B)")
                 objetosLinkar.empilhar(bytesObj)
                 nomesObjetos.empilhar(arqPath)
             }

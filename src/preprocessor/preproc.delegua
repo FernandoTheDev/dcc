@@ -36,137 +36,145 @@ funcao trigraphByte(b: inteiro): inteiro {
     retorna -1
 }
 
-// Fase 1 + Fase 2 + Fase 3 em O(N) sobre vetor de bytes.
-// Pula copias intermediarias quando nao ha CRLF/trigrafos nem line-splicing.
-// Detecta e reporta comentario de bloco /* nao fechado com linha exata.
-funcao fasesIniciaisELimpezaPP(fonte: texto, nomeArquivo: texto, diag: qualquer, pilhaInc: texto[] = [],
-    bytesModArg: qualquer = nulo): texto {
+funcao limparBytesLinhaPP(raw: inteiro[]): inteiro[] {
+    const n: inteiro = raw.tamanho()
+    var t1: inteiro[] = []
+    var i: inteiro = 0
+    enquanto (i < n) {
+        const b: inteiro = raw[i]
+        se (b == 13) {
+            i++
+            continua
+        }
+        se (b == 63 e i + 2 < n e raw[i + 1] == 63) {
+            const rep: inteiro = trigraphByte(raw[i + 2])
+            se (rep >= 0) {
+                t1.empilhar(rep)
+                i = i + 3
+                continua
+            }
+        }
+        t1.empilhar(b)
+        i++
+    }
+
+    retorna t1
+}
+
+// Fases 1, 2 e 3 linha a linha em O(N) real sobre bytes (sem alocar inteiro[] de 48 MiB
+// para o arquivo inteiro e sem indexacao O(N^2) em strings UTF-8 gigantes).
+funcao fasesIniciaisELimpezaLinhasPP(fonte: texto, nomeArquivo: texto, diag: qualquer, pilhaInc: texto[] = [],
+    bytesModArg: qualquer = nulo): texto[] {
     var bytesMod: qualquer = bytesModArg
     se (bytesMod == nulo) bytesMod = importar("cgd:bytes")
-    const raw: inteiro[] = bytesMod.Bytes.deTexto(fonte).paraVetor()
-    const n: inteiro = raw.tamanho()
 
-    // Fase 1: trigraphs + normalizacao CRLF (apenas se necessario)
-    var t1: inteiro[] = raw
-    se (fonte.contem("\r") ou fonte.contem("??")) {
-        t1 = []
-        var i: inteiro = 0
-        enquanto (i < n) {
-            const b: inteiro = raw[i]
-            se (b == 13) {
-                se (i + 1 < n e raw[i + 1] == 10) i++
-                t1.empilhar(10)
-                i++
-                continua
-            }
-            se (b == 63 e i + 2 < n e raw[i + 1] == 63) {
-                const rep: inteiro = trigraphByte(raw[i + 2])
-                se (rep >= 0) {
-                    t1.empilhar(rep)
-                    i = i + 3
-                    continua
-                }
-            }
-            t1.empilhar(b)
-            i++
-        }
-    }
+    const linhasBrutas: texto[] = fonte.dividir("\n")
+    const totalLin: inteiro = linhasBrutas.tamanho()
+    var saida: texto[] = []
+    var emBlocoCom: logico = falso
+    var linIniCom: inteiro = 1
+    var idx: inteiro = 0
 
-    // Fase 2: line splicing ('\' seguido de '\n') (apenas se necessario)
-    var t2: inteiro[] = t1
-    se (fonte.contem("\\\n") ou t1 != raw) {
-        t2 = []
-        var j: inteiro = 0
-        const m: inteiro = t1.tamanho()
-        enquanto (j < m) {
-            se (t1[j] == 92 e j + 1 < m e t1[j + 1] == 10) {
-                j = j + 2
-                continua
-            }
-            t2.empilhar(t1[j])
-            j++
-        }
-    }
+    enquanto (idx < totalLin) {
+        var lin: texto = linhasBrutas[idx]
+        const temEspecial: logico = lin.contem("\r") ou lin.contem("??") ou lin.contem("/*") ou lin.contem("//") ou lin.contem("\\")
 
-    // Fase 3: remove comentarios mantendo quebras de linha e valida fechamento de /* */
-    var out: inteiro[] = []
-    var k: inteiro = 0
-    const p: inteiro = t2.tamanho()
-    var emStr: logico = falso
-    var emChr: logico = falso
-    var linhaAtual: inteiro = 1
-    enquanto (k < p) {
-        const b: inteiro = t2[k]
-        se (b == 10) linhaAtual++
-        se (emStr) {
-            out.empilhar(b)
-            se (b == 92 e k + 1 < p) {
-                k++
-                se (t2[k] == 10) linhaAtual++
-                out.empilhar(t2[k])
-            } senao se (b == 34 ou b == 10) {
-                emStr = falso
-            }
-            k++
+        // Caminho rapido O(1): linha comum fora de comentario de bloco
+        se (!emBlocoCom e !temEspecial) {
+            saida.empilhar(lin)
+            idx++
             continua
         }
-        se (emChr) {
-            out.empilhar(b)
-            se (b == 92 e k + 1 < p) {
-                k++
-                se (t2[k] == 10) linhaAtual++
-                out.empilhar(t2[k])
-            } senao se (b == 39 ou b == 10) {
-                emChr = falso
-            }
-            k++
-            continua
+
+        // Fase 1 + Fase 2 (line splicing) em bytes da linha logica atual
+        var bytesLogica: inteiro[] = limparBytesLinhaPP(bytesMod.Bytes.deTexto(lin).paraVetor())
+        var linhasConsumidas: inteiro = 1
+        enquanto (bytesLogica.tamanho() > 0 e bytesLogica[bytesLogica.tamanho() - 1] == 92 e idx + linhasConsumidas < totalLin) {
+            bytesLogica.removerUltimo()
+            const proxBytes: inteiro[] = limparBytesLinhaPP(bytesMod.Bytes.deTexto(linhasBrutas[idx + linhasConsumidas]).paraVetor())
+            para (var p: inteiro = 0; p < proxBytes.tamanho(); p++) bytesLogica.empilhar(proxBytes[p])
+            linhasConsumidas++
         }
-        se (b == 34) {
-            emStr = verdadeiro
-            out.empilhar(b)
-            k++
-            continua
-        }
-        se (b == 39) {
-            emChr = verdadeiro
-            out.empilhar(b)
-            k++
-            continua
-        }
-        se (b == 47 e k + 1 < p e t2[k + 1] == 47) {
-            out.empilhar(32)
-            enquanto (k < p e t2[k] != 10) k++
-            continua
-        }
-        se (b == 47 e k + 1 < p e t2[k + 1] == 42) {
-            const linIniCom: inteiro = linhaAtual
-            out.empilhar(32)
-            k = k + 2
-            var fechou: logico = falso
-            enquanto (k < p) {
-                se (k + 1 < p e t2[k] == 42 e t2[k + 1] == 47) {
+
+        // Fase 3: remocao de comentarios respeitando strings/chars e estado emBlocoCom
+        var outB: inteiro[] = []
+        var k: inteiro = 0
+        const m: inteiro = bytesLogica.tamanho()
+        var emStr: logico = falso
+        var emChr: logico = falso
+        enquanto (k < m) {
+            se (emBlocoCom) {
+                se (k + 1 < m e bytesLogica[k] == 42 e bytesLogica[k + 1] == 47) {
+                    emBlocoCom = falso
                     k = k + 2
-                    fechou = verdadeiro
-                    sustar
+                } senao {
+                    k++
                 }
-                se (t2[k] == 10) {
-                    linhaAtual++
-                    out.empilhar(10)
+                continua
+            }
+            const b: inteiro = bytesLogica[k]
+            se (emStr) {
+                outB.empilhar(b)
+                se (b == 92 e k + 1 < m) {
+                    k++
+                    outB.empilhar(bytesLogica[k])
+                } senao se (b == 34) {
+                    emStr = falso
                 }
                 k++
+                continua
             }
-            se (!fechou) {
-                diag.erroDireto(nomeArquivo, linIniCom, 1, "comentario de bloco '/*' nao fechado",
-                    "", "", "E1001", 2, pilhaInc)
+            se (emChr) {
+                outB.empilhar(b)
+                se (b == 92 e k + 1 < m) {
+                    k++
+                    outB.empilhar(bytesLogica[k])
+                } senao se (b == 39) {
+                    emChr = falso
+                }
+                k++
+                continua
             }
-            continua
+            se (b == 34) {
+                emStr = verdadeiro
+                outB.empilhar(b)
+                k++
+                continua
+            }
+            se (b == 39) {
+                emChr = verdadeiro
+                outB.empilhar(b)
+                k++
+                continua
+            }
+            se (b == 47 e k + 1 < m e bytesLogica[k + 1] == 47) {
+                outB.empilhar(32)
+                sustar
+            }
+            se (b == 47 e k + 1 < m e bytesLogica[k + 1] == 42) {
+                emBlocoCom = verdadeiro
+                linIniCom = idx + 1
+                outB.empilhar(32)
+                k = k + 2
+                continua
+            }
+            outB.empilhar(b)
+            k++
         }
-        out.empilhar(b)
-        k++
+
+        saida.empilhar(bytesMod.Bytes.deVetor(outB).paraTexto())
+        para (var extra: inteiro = 1; extra < linhasConsumidas; extra++) {
+            saida.empilhar("")
+        }
+        idx = idx + linhasConsumidas
     }
 
-    retorna bytesMod.Bytes.deVetor(out).paraTexto()
+    se (emBlocoCom) {
+        diag.erroDireto(nomeArquivo, linIniCom, 1, "comentario de bloco '/*' nao fechado",
+            "", "", "E1001", 2, pilhaInc)
+    }
+
+    retorna saida
 }
 
 // Descoberta de diretorios do sistema sem uso de /bin/sh (Processo.executar("find") + cgd:arquivos)
@@ -248,7 +256,10 @@ classe PreprocessadorDCC {
     includesResolvidos: inteiro
     profundidadeInclude: inteiro
     profundidadeMacro: inteiro
-    tokensExpandidosTotal: inteiro
+    tokensEntradaTotal: inteiro
+    tokensMacroLinha: inteiro
+    tokensMacroTotal: inteiro
+    macrosExpandidasLinha: inteiro
     macrosExpandidasTotal: inteiro
     pilhaInclusao: texto[]
 
@@ -274,7 +285,10 @@ classe PreprocessadorDCC {
         isto.includesResolvidos = 0
         isto.profundidadeInclude = 0
         isto.profundidadeMacro = 0
-        isto.tokensExpandidosTotal = 0
+        isto.tokensEntradaTotal = 0
+        isto.tokensMacroLinha = 0
+        isto.tokensMacroTotal = 0
+        isto.macrosExpandidasLinha = 0
         isto.macrosExpandidasTotal = 0
         isto.pilhaInclusao = []
 
@@ -386,26 +400,86 @@ classe PreprocessadorDCC {
         retorna tupla(["", -1])
     }
 
+    // Verificacao rapida O(N) sobre bytes (evita indexacao UTF-8 O(L^2) em linhas de 360+ KiB):
+    // retorna verdadeiro apenas se a linha contiver algum identificador em isto.macros ou predefinida.
+    linhaContemMacroAtiva(linhaStr: texto): logico {
+        const raw: inteiro[] = isto.bytesMod.Bytes.deTexto(linhaStr).paraVetor()
+        const n: inteiro = raw.tamanho()
+        var i: inteiro = 0
+        enquanto (i < n) {
+            const b: inteiro = raw[i]
+            se (b == 34 ou b == 39) {
+                const delim: inteiro = b
+                i++
+                enquanto (i < n) {
+                    const ch: inteiro = raw[i]
+                    i++
+                    se (ch == 92 e i < n) i++
+                    senao se (ch == delim) sustar
+                }
+                continua
+            }
+            se ((b >= 65 e b <= 90) ou (b >= 97 e b <= 122) ou b == 95 ou b == 36) {
+                var idB: inteiro[] = [b]
+                i++
+                enquanto (i < n) {
+                    const c: inteiro = raw[i]
+                    se ((c >= 65 e c <= 90) ou (c >= 97 e c <= 122) ou (c >= 48 e c <= 57) ou c == 95 ou c == 36) {
+                        idB.empilhar(c)
+                        i++
+                    } senao {
+                        sustar
+                    }
+                }
+                const id: texto = isto.bytesMod.Bytes.deVetor(idB).paraTexto()
+                se (isto.macros.contem(id) ou id == "__LINE__" ou id == "__FILE__" ou id == "_Pragma") {
+                    retorna verdadeiro
+                }
+                continua
+            }
+            i++
+        }
+        retorna falso
+    }
+
+    cobrarTokensMacro(qtd: inteiro, arquivoAtual: texto, linhaAtual: inteiro): vazio {
+        const maxToksMacroLinha: inteiro = 50000
+        const maxToksMacroTU: inteiro = 2000000
+        isto.tokensMacroLinha = isto.tokensMacroLinha + qtd
+        isto.tokensMacroTotal = isto.tokensMacroTotal + qtd
+        se (isto.tokensMacroLinha > maxToksMacroLinha ou isto.tokensMacroTotal > maxToksMacroTU) {
+            isto.diag.erroDireto(arquivoAtual, linhaAtual, 1, "limite maximo de tokens gerados por expansao de macros excedido (possivel expansao exponencial)",
+                "", "", "E1011", 1, isto.copiarPilhaInclusao())
+        }
+    }
+
     expandirTokens(entrada: qualquer[], arquivoAtual: texto, linhaAtual: inteiro, modoIf: logico,
         dirAtual: texto, idxDirAtual: inteiro): qualquer[] {
+        const ehTopo: logico = isto.profundidadeMacro == 0
+        se (ehTopo) {
+            isto.tokensMacroLinha = 0
+            isto.macrosExpandidasLinha = 0
+        }
         isto.profundidadeMacro++
         se (isto.profundidadeMacro > 128) {
             isto.diag.erroDireto(arquivoAtual, linhaAtual, 1, "profundidade maxima de expansao de macro excedida (limite 128)",
                 "", "", "E1010", 1, isto.copiarPilhaInclusao())
         }
 
+        const maxTokensEntradaTU: inteiro = 20000000
+        se (ehTopo) {
+            isto.tokensEntradaTotal = isto.tokensEntradaTotal + entrada.tamanho()
+            se (isto.tokensEntradaTotal > maxTokensEntradaTU) {
+                isto.diag.erroDireto(arquivoAtual, linhaAtual, 1, "limite maximo de tokens de entrada da unidade de traducao excedido (20000000)",
+                    "", "", "E1018", 1, isto.copiarPilhaInclusao())
+            }
+        }
+
         var out: qualquer[] = []
         var i: inteiro = 0
         const n: inteiro = entrada.tamanho()
-        const maxToksExpansao: inteiro = 50000
-        const maxToksTotal: inteiro = 400000
 
         enquanto (i < n) {
-            isto.tokensExpandidosTotal++
-            se (out.tamanho() > maxToksExpansao ou isto.tokensExpandidosTotal > maxToksTotal) {
-                isto.diag.erroDireto(arquivoAtual, linhaAtual, 1, "limite maximo de tokens expandidos por macros excedido (possivel expansao exponencial)",
-                    "", "", "E1011", 1, isto.copiarPilhaInclusao())
-            }
             const tok: qualquer = entrada[i]
 
             // Operador 'defined' em #if/#elif
@@ -501,24 +575,27 @@ classe PreprocessadorDCC {
                 continua
             }
 
-            se (!isto.macros.contem(tok.val) ou tok.hideSet.contem(tok.val)) {
+            se (!isto.macros.contem(tok.val) ou tok.temHide(tok.val)) {
                 out.empilhar(tok)
                 i++
                 continua
             }
 
             const def: qualquer = isto.macros[tok.val]
-            isto.macrosExpandidasTotal++
-            se (isto.macrosExpandidasTotal > 50000) {
-                isto.diag.erroDireto(arquivoAtual, linhaAtual, 1, "limite maximo de expansoes de macros excedido (possivel expansao exponencial)",
-                    "", "", "E1011", 1, isto.copiarPilhaInclusao())
-            }
 
             // Macro de objeto
             se (!def.ehFuncao) {
+                isto.macrosExpandidasLinha++
+                isto.macrosExpandidasTotal++
+                se (isto.macrosExpandidasLinha > 50000 ou isto.macrosExpandidasTotal > 500000) {
+                    isto.diag.erroDireto(arquivoAtual, linhaAtual, 1, "limite maximo de expansoes de macros excedido (possivel expansao exponencial)",
+                        "", "", "E1011", 1, isto.copiarPilhaInclusao())
+                }
                 var novoHide: dicionario = {}
-                const chavesH: texto[] = tok.hideSet.chaves()
-                para (var k: inteiro = 0; k < chavesH.tamanho(); k++) novoHide[chavesH[k]] = verdadeiro
+                se (tok.hideSet != nulo) {
+                    const chavesH: texto[] = tok.hideSet.chaves()
+                    para (var k: inteiro = 0; k < chavesH.tamanho(); k++) novoHide[chavesH[k]] = verdadeiro
+                }
                 novoHide[def.nome] = verdadeiro
 
                 var subst: qualquer[] = []
@@ -527,23 +604,29 @@ classe PreprocessadorDCC {
                     se (k == 0) cp.espaco = tok.espaco
                     subst.empilhar(cp)
                 }
-                const colados: qualquer[] = isto.macMod.aplicarTokenPastingPP(subst, linhaAtual)
+                isto.cobrarTokensMacro(subst.tamanho(), arquivoAtual, linhaAtual)
+                const colados: qualquer[] = isto.macMod.aplicarTokenPastingPP(subst, linhaAtual,
+                    isto.cls)
                 const reexpandidos: qualquer[] = isto.expandirTokens(colados, arquivoAtual,
                     linhaAtual, modoIf, dirAtual, idxDirAtual)
-                se (out.tamanho() + reexpandidos.tamanho() > maxToksExpansao) {
-                    isto.diag.erroDireto(arquivoAtual, linhaAtual, 1, "limite maximo de tokens expandidos por macros excedido (possivel expansao exponencial)",
-                        "", "", "E1011", 1, isto.copiarPilhaInclusao())
-                }
+                isto.cobrarTokensMacro(reexpandidos.tamanho(), arquivoAtual, linhaAtual)
                 para (var k: inteiro = 0; k < reexpandidos.tamanho(); k++) out.empilhar(reexpandidos[k])
                 i++
                 continua
             }
 
-            // Macro funcional exige '(' imediatamente apos o nome
+            // Macro funcional exige '(' imediatamente apos o nome (nao conta como expansao se nao houver '(')
             se (i + 1 >= n ou entrada[i + 1].val != "(") {
                 out.empilhar(tok)
                 i++
                 continua
+            }
+
+            isto.macrosExpandidasLinha++
+            isto.macrosExpandidasTotal++
+            se (isto.macrosExpandidasLinha > 50000 ou isto.macrosExpandidasTotal > 500000) {
+                isto.diag.erroDireto(arquivoAtual, linhaAtual, 1, "limite maximo de expansoes de macros excedido (possivel expansao exponencial)",
+                    "", "", "E1011", 1, isto.copiarPilhaInclusao())
             }
 
             var argsBrutos: qualquer[] = []
@@ -601,8 +684,10 @@ classe PreprocessadorDCC {
             }
 
             var novoHide: dicionario = {}
-            const chavesH: texto[] = tok.hideSet.chaves()
-            para (var k: inteiro = 0; k < chavesH.tamanho(); k++) novoHide[chavesH[k]] = verdadeiro
+            se (tok.hideSet != nulo) {
+                const chavesH: texto[] = tok.hideSet.chaves()
+                para (var k: inteiro = 0; k < chavesH.tamanho(); k++) novoHide[chavesH[k]] = verdadeiro
+            }
             novoHide[def.nome] = verdadeiro
 
             var subst: qualquer[] = []
@@ -651,10 +736,13 @@ classe PreprocessadorDCC {
                 cIdx++
             }
 
-            const colados: qualquer[] = isto.macMod.aplicarTokenPastingPP(subst, linhaAtual)
+            isto.cobrarTokensMacro(subst.tamanho(), arquivoAtual, linhaAtual)
+            const colados: qualquer[] = isto.macMod.aplicarTokenPastingPP(subst, linhaAtual,
+                isto.cls)
             se (colados.tamanho() > 0) colados[0].espaco = tok.espaco
             const reexpandidos: qualquer[] = isto.expandirTokens(colados, arquivoAtual, linhaAtual,
                 modoIf, dirAtual, idxDirAtual)
+            isto.cobrarTokensMacro(reexpandidos.tamanho(), arquivoAtual, linhaAtual)
             para (var k: inteiro = 0; k < reexpandidos.tamanho(); k++) out.empilhar(reexpandidos[k])
             i = j
         }
@@ -756,14 +844,21 @@ classe PreprocessadorDCC {
                 "", "", "E1002", 1, isto.copiarPilhaInclusao())
         }
 
+        const maxBytesArquivo: inteiro = 67108864 // 64 MiB
+        se (fonteBruta.tamanho() > maxBytesArquivo) {
+            isto.diag.erroDireto(nomeArquivo, 1, 1, "tamanho maximo de arquivo fonte excedido (limite 64 MiB)",
+                "", "", "E1019", 1, isto.copiarPilhaInclusao())
+        }
+
         var linhas: texto[] = []
         se (isto.cacheLinhasArquivo.contem(nomeArquivo) e fonteBruta.tamanho() == 0) {
             linhas = isto.cacheLinhasArquivo[nomeArquivo]
         } senao {
-            const limpa: texto = fasesIniciaisELimpezaPP(fonteBruta, nomeArquivo, isto.diag,
-                isto.copiarPilhaInclusao(), isto.bytesMod)
-            linhas = limpa.dividir("\n")
-            se (nomeArquivo.tamanho() > 0) isto.cacheLinhasArquivo[nomeArquivo] = linhas
+            linhas = fasesIniciaisELimpezaLinhasPP(fonteBruta, nomeArquivo, isto.diag, isto.copiarPilhaInclusao(),
+                isto.bytesMod)
+            se (isto.profundidadeInclude > 1 e nomeArquivo.tamanho() > 0 e fonteBruta.tamanho() <= 524288) {
+                isto.cacheLinhasArquivo[nomeArquivo] = linhas
+            }
         }
         var pilhaIf: QuadroIf[] = []
         var arquivoLogico: texto = nomeArquivo
@@ -978,6 +1073,14 @@ classe PreprocessadorDCC {
             }
 
             se (guardCandidato.tamanho() == 0) guardElegivel = falso
+
+            // Caminho rapido sem alocacao de PPToken[] para linhas sem nenhuma macro ativa
+            se (!isto.linhaContemMacroAtiva(linhaRaw)) {
+                saidaGlobal.empilhar(linhaRaw)
+                isto.diag.mapaFonte.registrar(arquivoLogico, numLinha, linhaRaw, snapInc)
+                idx++
+                continua
+            }
 
             var toksLinha: qualquer[] = isto.macMod.tokenizarLinhaPP(linhaRaw, numLinha,
                 isto.cls)

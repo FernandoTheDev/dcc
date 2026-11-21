@@ -569,6 +569,50 @@ loop_lbl:
         [],
         ["alpha", "beta", "zzz"],
     ),
+    (
+        "c99_desig_aninhado_comma_agg_str_ops_builtin_expect",
+        r"""
+#include <stdio.h>
+#include <stdbool.h>
+#include <string.h>
+
+typedef struct {
+    int type;
+    union {
+        long num;
+        struct { const char *ptr; int len; } text;
+    } value;
+} Val;
+
+static Val make_num(long n) {
+    return (Val){ .type = 1, .value.num = n };
+}
+
+static Val make_txt(const char *s, int len) {
+    return (Val){ .type = 2, .value.text.ptr = s, .value.text.len = len };
+}
+
+static bool is_neg_str(const char *s) {
+    return strcmp(s, "\055") == 0; // "-" via escape octal (nao deve colidir com operador unario '-')
+}
+
+int main(void) {
+    int side = 0;
+    Val v1 = make_num(42);
+    Val v2 = make_txt("\053", 1); // "+"
+    long n = (side++, make_num(10)).value.num;
+    int exp_ok = __builtin_expect(v1.value.num == 42, 1) ? 1 : 0;
+    bool b_neg = is_neg_str("-");
+    bool b_pos = is_neg_str("+");
+    printf("v1=%ld v2=%s,%d n=%ld side=%d exp=%d b=%d,%d\n",
+           v1.value.num, v2.value.text.ptr, v2.value.text.len,
+           n, side, exp_ok, (int)b_neg, (int)b_pos);
+    return (int)(v1.value.num + n + side + exp_ok + (int)b_neg);
+}
+""",
+        ["-std=gnu99"],
+        [],
+    ),
 ]
 
 
@@ -744,6 +788,38 @@ int main(void) {
             falhas += 1
         else:
             print(f"[OK] {nome} -> exit={ec}")
+
+    # Teste ABI TLS (__thread / R_X86_64_GOTTPOFF + STT_TLS) e retorno bool estreito (bits superiores RAX)
+    (tmp / "abi_tls_def.c").write_text(
+        "#include <stdbool.h>\n"
+        "__thread int g_abi_tls = 40;\n"
+        "int abi_tls_get(void) { return g_abi_tls; }\n"
+        "bool abi_ret_false_dirty(unsigned long x) { return (x & 1UL) != 0UL; }\n",
+        encoding="utf-8",
+    )
+    (tmp / "abi_tls_use.c").write_text(
+        "#include <stdbool.h>\n"
+        "extern __thread int g_abi_tls;\n"
+        "int abi_tls_get(void);\n"
+        "bool abi_ret_false_dirty(unsigned long x);\n"
+        "int main(void) {\n"
+        "    g_abi_tls += 2;\n"
+        "    int r = abi_tls_get();\n"
+        "    if (abi_ret_false_dirty(0x1234567800UL)) return 99;\n"
+        "    if (!abi_ret_false_dirty(0x1234567801UL)) return 98;\n"
+        "    return r;\n"
+        "}\n",
+        encoding="utf-8",
+    )
+    subprocess.run(["gcc", "-std=gnu99", "-O2", "-c", str(tmp / "abi_tls_def.c"), "-o", str(tmp / "abi_tls_def.o")], check=True)
+    r_tu = subprocess.run([str(DCC_BIN), "-std=gnu99", "-c", str(tmp / "abi_tls_use.c"), "-o", str(tmp / "abi_tls_use.o")], capture_output=True, text=True, check=False)
+    r_tl = subprocess.run(["gcc", str(tmp / "abi_tls_use.o"), str(tmp / "abi_tls_def.o"), "-o", str(tmp / "abi_tls_bin")], capture_output=True, text=True, check=False) if r_tu.returncode == 0 else r_tu
+    ec_t, _ = rodar_bin(tmp / "abi_tls_bin") if r_tl.returncode == 0 else (-1, "")
+    if ec_t != 42:
+        print(f"[FALHA abi_tls_e_bool_estreito] ec={ec_t} err={r_tu.stderr}\n{r_tl.stderr}")
+        falhas += 1
+    else:
+        print("[OK] abi_tls_e_bool_estreito -> exit=42")
     return falhas
 
 
@@ -929,7 +1005,7 @@ def main() -> int:
         falhas += rodar_testes_abi_bidirecional(tmp)
         falhas += rodar_testes_linker_cruzado(tmp)
         falhas += rodar_testes_diagnosticos_e_cli(tmp)
-        total = len(CASOS_DIFERENCIAIS) * 3 + 4 + 9 + 18
+        total = len(CASOS_DIFERENCIAIS) * 3 + 5 + 9 + 18
         print(f"\nResumo DCC: {total - falhas}/{total} verificacoes aprovadas, {falhas} falhas.")
         return 1 if falhas > 0 else 0
     finally:

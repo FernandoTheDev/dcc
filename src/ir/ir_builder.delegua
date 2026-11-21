@@ -328,26 +328,37 @@ classe ConstrutorSSA {
                 var bfWidInit: inteiro = 0
 
                 se (item.kind == isto.Kind.ExprInicDesignado) {
-                    exprItem = item.filhos[0]
-                    se (item.ehSeta) {
-                        subTipo = tipoAlvo.alvo
-                        offItem = item.valor * isto.tabela.tamanhoDe(subTipo)
-                        idxSeq = item.valor + 1
-                    } senao {
-                        offItem = item.valor
-                        subTipo = item.tipoC
-                        se (tipoAlvo.base == isto.TB.Struct e isto.tabela.structs.contem(tipoAlvo.nomeAgregado)) {
-                            const agD: qualquer = isto.tabela.structs[tipoAlvo.nomeAgregado]
-                            se (agD.campos.contem(item.nome)) {
-                                const cD: qualquer = agD.campos[item.nome]
-                                se (cD.ehBitField) {
-                                    ehBfInit = verdadeiro
-                                    bfOffInit = cD.bitOffset
-                                    bfWidInit = cD.bitWidth
+                    var curD: qualquer = item
+                    var curTipoD: qualquer = tipoAlvo
+                    var offAcum: inteiro = 0
+                    enquanto (curD.kind == isto.Kind.ExprInicDesignado) {
+                        se (curD.ehSeta) {
+                            const elemT: qualquer = curTipoD.alvo
+                            offAcum = offAcum + curD.valor * isto.tabela.tamanhoDe(elemT)
+                            se (curD == item) idxSeq = curD.valor + 1
+                            curTipoD = elemT
+                            ehBfInit = falso
+                        } senao {
+                            offAcum = offAcum + curD.valor
+                            ehBfInit = falso
+                            se (curTipoD.base == isto.TB.Struct e isto.tabela.structs.contem(curTipoD.nomeAgregado)) {
+                                const agD: qualquer = isto.tabela.structs[curTipoD.nomeAgregado]
+                                se (agD.campos.contem(curD.nome)) {
+                                    const cD: qualquer = agD.campos[curD.nome]
+                                    se (cD.ehBitField) {
+                                        ehBfInit = verdadeiro
+                                        bfOffInit = cD.bitOffset
+                                        bfWidInit = cD.bitWidth
+                                    }
                                 }
                             }
+                            curTipoD = curD.tipoC
                         }
+                        curD = curD.filhos[0]
                     }
+                    offItem = offAcum
+                    subTipo = curTipoD
+                    exprItem = curD
                 } senao se (tipoAlvo.base == isto.TB.Array) {
                     subTipo = tipoAlvo.alvo
                     offItem = idxSeq * isto.tabela.tamanhoDe(subTipo)
@@ -443,7 +454,8 @@ classe ConstrutorSSA {
             const symG: texto = isto.tabela.nomesSimboloLink.contem(nomeVar) ? texto(isto.tabela.nomesSimboloLink[nomeVar]) : nomeVar
             isto.modulo.registrarExternoDado(symG)
             const dstEG: inteiro = isto.novoReg()
-            isto.emitir(isto.irTipos.InstSSA(isto.OpI.AddrExternGlobal, dstEG, 0, 0, symG))
+            const opExtG: qualquer = isto.tabela.globaisExternasTls.contem(nomeVar) ? isto.OpI.AddrExternTls : isto.OpI.AddrExternGlobal
+            isto.emitir(isto.irTipos.InstSSA(opExtG, dstEG, 0, 0, symG))
             retorna dstEG
         }
         const symF: texto = isto.tabela.nomesSimboloLink.contem(nomeVar) ? texto(isto.tabela.nomesSimboloLink[nomeVar]) : nomeVar
@@ -468,6 +480,21 @@ classe ConstrutorSSA {
             se (expr.tipoC.ehAgregado()) retorna isto.baixarExpr(expr)
             const dModT: qualquer = importar("../diagnostics/diag.delegua")
             falhar dModT.ErroDCC("Linha ${expr.linha}: expressao ternaria escalar nao possui endereco")
+            caso isto.Kind.ExprComma:
+            se (expr.tipoC.ehAgregado()) {
+                isto.baixarExpr(expr.filhos[0])
+                retorna isto.baixarEndereco(expr.filhos[1])
+            }
+            const dModV: qualquer = importar("../diagnostics/diag.delegua")
+            falhar dModV.ErroDCC("Linha ${expr.linha}: expressao virgula escalar nao possui endereco")
+            caso isto.Kind.ExprAtrib:
+            se (expr.tipoC.ehAgregado()) retorna isto.baixarExpr(expr)
+            const dModA: qualquer = importar("../diagnostics/diag.delegua")
+            falhar dModA.ErroDCC("Linha ${expr.linha}: atribuicao escalar nao possui endereco")
+            caso isto.Kind.ExprCast:
+            se (expr.tipoC.ehAgregado()) retorna isto.baixarEndereco(expr.filhos[0])
+            const dModC: qualquer = importar("../diagnostics/diag.delegua")
+            falhar dModC.ErroDCC("Linha ${expr.linha}: cast escalar nao possui endereco")
             caso isto.Kind.ExprStr:
             retorna isto.baixarExpr(expr)
             caso isto.Kind.ExprVar:
@@ -1451,6 +1478,10 @@ classe ConstrutorSSA {
     }
 
     baixarChamada(expr: qualquer): inteiro {
+        se (!expr.ehSeta e expr.nome == "__builtin_expect") {
+            const valExp: inteiro = isto.baixarExpr(expr.filhos[0])
+            retorna isto.converterValor(valExp, expr.filhos[0].tipoC, isto.tMod.TipoC.tipoLong())
+        }
         const retModo: inteiro = classificarStructModo(expr.tipoC, isto.tabela)
         var sretReg: inteiro = -1
         var offSretTmp: inteiro = 0
@@ -1575,6 +1606,20 @@ classe ConstrutorSSA {
         }
         se (retModo == 3) {
             retorna sretReg
+        }
+        // System V AMD64 ABI: bits superiores de RAX sao indefinidos em retornos < 64 bits
+        // (_Bool, char, short, int); trunca/estende explicitamente apos a chamada.
+        se (expr.tipoC != nulo e expr.tipoC.ehInteiro()) {
+            const tamRetC: inteiro = isto.tabela.tamanhoDe(expr.tipoC)
+            se (tamRetC > 0 e tamRetC < 8) {
+                const dstNorm: inteiro = isto.novoReg()
+                const ehU: logico = expr.tipoC.ehSemSinal ou expr.tipoC.base == isto.TB.Bool
+                const opNorm: qualquer = ehU ? isto.OpI.TruncZext : isto.OpI.TruncSext
+                const instNorm: qualquer = isto.irTipos.InstSSA(opNorm, dstNorm, dstC, 0)
+                instNorm.largura = tamRetC
+                isto.emitir(instNorm)
+                retorna dstNorm
+            }
         }
         retorna dstC
     }
@@ -1704,15 +1749,24 @@ funcao preencherBytesGlobal(g: qualquer, baseOff: inteiro, inic: qualquer, tipoA
             var subTipo: qualquer = tipoAlvo
             var exprItem: qualquer = item
             se (item.kind == Kind.ExprInicDesignado) {
-                exprItem = item.filhos[0]
-                se (item.ehSeta) {
-                    subTipo = tipoAlvo.alvo
-                    offItem = item.valor * tabela.tamanhoDe(subTipo)
-                    idxSeq = item.valor + 1
-                } senao {
-                    offItem = item.valor
-                    subTipo = item.tipoC
+                var curDG: qualquer = item
+                var curTipoDG: qualquer = tipoAlvo
+                var offAcumG: inteiro = 0
+                enquanto (curDG.kind == Kind.ExprInicDesignado) {
+                    se (curDG.ehSeta) {
+                        const elemTG: qualquer = curTipoDG.alvo
+                        offAcumG = offAcumG + curDG.valor * tabela.tamanhoDe(elemTG)
+                        se (curDG == item) idxSeq = curDG.valor + 1
+                        curTipoDG = elemTG
+                    } senao {
+                        offAcumG = offAcumG + curDG.valor
+                        curTipoDG = curDG.tipoC
+                    }
+                    curDG = curDG.filhos[0]
                 }
+                offItem = offAcumG
+                subTipo = curTipoDG
+                exprItem = curDG
             } senao se (tipoAlvo.base == TB.Array) {
                 subTipo = tipoAlvo.alvo
                 offItem = idxSeq * tabela.tamanhoDe(subTipo)
@@ -1758,18 +1812,25 @@ funcao preencherBytesGlobal(g: qualquer, baseOff: inteiro, inic: qualquer, tipoA
         } senao {
             fvalG = real(avaliarConstGlobal(inic, tabela, Kind, OpB, OpU))
         }
+        var bitsF: inteiro = 0
+        var largF: inteiro = 8
         se (tipoAlvo.base == TB.Float) {
-            irTipos.gravarIntLE(g.bytesInit, baseOff, tModG.floatParaBitsIEEE754(fvalG),
-                4)
+            bitsF = tModG.floatParaBitsIEEE754(fvalG)
+            largF = 4
         } senao {
-            irTipos.gravarIntLE(g.bytesInit, baseOff, tModG.doubleParaBitsIEEE754(fvalG),
-                8)
+            bitsF = tModG.doubleParaBitsIEEE754(fvalG)
+        }
+        para (var bf: inteiro = 0; bf < largF; bf++) {
+            se (baseOff + bf < g.bytesInit.tamanho()) g.bytesInit[baseOff + bf] = (bitsF >> (bf * 8)) & 255
         }
         retorna
     }
 
     const val: inteiro = avaliarConstGlobal(inic, tabela, Kind, OpB, OpU)
-    irTipos.gravarIntLE(g.bytesInit, baseOff, val, tabela.tamanhoDe(tipoAlvo))
+    const largV: inteiro = tabela.tamanhoDe(tipoAlvo)
+    para (var bv: inteiro = 0; bv < largV; bv++) {
+        se (baseOff + bv < g.bytesInit.tamanho()) g.bytesInit[baseOff + bv] = (val >> (bv * 8)) & 255
+    }
 }
 
 funcao construirModuloSSA(prog: qualquer, tabela: qualquer): qualquer {
@@ -1795,6 +1856,7 @@ funcao construirModuloSSA(prog: qualquer, tabela: qualquer): qualquer {
             para (var z: inteiro = 0; z < tam; z++) g.bytesInit.empilhar(0)
             preencherBytesGlobal(g, 0, no.filhos[0], no.tipoC, tabela, modulo, Kind, OpB,
                 OpU, TB, irTipos)
+            no.filhos = []
         }
         modulo.registrarGlobal(g)
     }
@@ -1846,6 +1908,7 @@ funcao construirModuloSSA(prog: qualquer, tabela: qualquer): qualquer {
             }
         }
         builder.baixarStmt(no.filhos[1])
+        no.filhos = []
         se (!builder.blocoAtual.terminado) {
             se (fnSSA.retornaFloat) {
                 const zf: inteiro = builder.emitirFConst(0.0)

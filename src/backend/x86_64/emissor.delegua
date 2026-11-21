@@ -199,6 +199,23 @@ classe EmissorX86_64 {
         isto.u32(0)
     }
 
+    // Initial-Exec TLS x86-64:
+    // mov rax, fs:[0]                     -> 64 48 8B 04 25 00 00 00 00
+    // add rax, [rip + sym@GOTTPOFF]       -> 48 03 05 disp32 (R_X86_64_GOTTPOFF = 22)
+    movRaxTlsGotReloc(simbolo: texto): vazio {
+        isto.u8(100)
+        isto.u8(72)
+        isto.u8(139)
+        isto.u8(4)
+        isto.u8(37)
+        isto.u32(0)
+        isto.u8(72)
+        isto.u8(3)
+        isto.u8(5)
+        isto.relocs.empilhar(RelocObj(isto.code.tamanho(), simbolo, 22, -4))
+        isto.u32(0)
+    }
+
     // call sym@PLT -> E8 disp32 (R_X86_64_PLT32 = 4)
     callExternReloc(simbolo: texto, numXmm: inteiro): vazio {
         isto.movEaxImm32(numXmm)

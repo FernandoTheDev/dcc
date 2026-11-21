@@ -27,6 +27,7 @@ enum TokC99 {
     KwRestrict,
     KwInline,
     KwExtern,
+    KwThreadLocal,
     KwStatic,
     KwAuto,
     KwRegister,
@@ -210,6 +211,7 @@ enum OpIR {
     AddrRbpDisp,
     AddrGlobal,
     AddrExternGlobal,
+    AddrExternTls,
     AddrFunc,
     AddrStr,
     Alloca,
@@ -549,6 +551,7 @@ classe TabelaTipos {
     constantesEnum: dicionario
     funcoesExternas: dicionario
     globaisExternas: dicionario
+    globaisExternasTls: dicionario
     nomesSimboloLink: dicionario
     assinaturasFuncoes: dicionario
 
@@ -559,6 +562,7 @@ classe TabelaTipos {
         isto.constantesEnum = {}
         isto.funcoesExternas = {}
         isto.globaisExternas = {}
+        isto.globaisExternasTls = {}
         isto.nomesSimboloLink = {}
         isto.assinaturasFuncoes = {}
 

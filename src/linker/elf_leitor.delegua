@@ -86,7 +86,7 @@ funcao ehArquivoAr(dados: inteiro[]): logico {
     retorna dados[0] == 33 e dados[1] == 60 e dados[2] == 97 e dados[3] == 114 e dados[4] == 99 e dados[5] == 104 e dados[6] == 62 e dados[7] == 10
 }
 
-funcao lerTextoAsciiFaixa(dados: inteiro[], ini: inteiro, tam: inteiro, bytesMod: qualquer): texto {
+funcao lerTextoAsciiFaixa(dados: qualquer, ini: inteiro, tam: inteiro, bytesMod: qualquer): texto {
     var bs: inteiro[] = []
     para (var i: inteiro = 0; i < tam e ini + i < dados.tamanho(); i++) {
         bs.empilhar(dados[ini + i] & 255)

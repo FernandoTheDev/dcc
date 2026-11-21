@@ -31,7 +31,7 @@ funcao formatarBytesLista(vals: inteiro[]): texto {
     retorna partes.juntar(", ")
 }
 
-funcao emitirCallAsm(linhas: texto[], fn: qualquer, inst: qualquer, alvoCall: texto, ehIndireto: logico,
+funcao emitirCallAsm(linhas: qualquer, fn: qualquer, inst: qualquer, alvoCall: texto, ehIndireto: logico,
     ehExtern: logico): vazio {
     const abiInt: texto[] = ["rdi", "rsi", "rdx", "rcx", "r8", "r9"]
     var intIdx: inteiro = (inst.callRetStructModo == 3 e inst.callSretReg >= 0) ? 1 : 0

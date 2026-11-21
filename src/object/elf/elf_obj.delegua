@@ -10,7 +10,7 @@ funcao mapearSecaoShndx(sec: texto): inteiro {
     retorna 0 // SHN_UNDEF
 }
 
-funcao emitirObjetoELF64(obj: qualquer): inteiro[] {
+funcao emitirObjetoELF64Bytes(obj: qualquer): qualquer {
     const bytesMod: qualquer = importar("cgd:bytes")
     const ec: qualquer = importar("elf_comum.delegua")
 
@@ -63,23 +63,29 @@ funcao emitirObjetoELF64(obj: qualquer): inteiro[] {
         symCount++
     }
 
-    // 2. Constroi .rela.text e .rela.data
+    // 2. Constroi .rela.text e .rela.data (escrita direta O(1) sem passar inteiro[] por parametro tipado)
     var relaText: inteiro[] = []
     para (var i: inteiro = 0; i < obj.relocsText.tamanho(); i++) {
         const r: qualquer = obj.relocsText[i]
         const sIdx: inteiro = inteiro(symIdxMap[r.simbolo])
-        ec.anexarU64(relaText, r.offset)
-        ec.anexarU64(relaText, (sIdx << 32) | (r.tipoReloc & 4294967295))
-        ec.anexarU64(relaText, r.addend)
+        const offR: inteiro = r.offset
+        const infoR: inteiro = (sIdx << 32) | (r.tipoReloc & 4294967295)
+        const addR: inteiro = r.addend
+        para (var k: inteiro = 0; k < 8; k++) relaText.empilhar((offR >> (k * 8)) & 255)
+        para (var k: inteiro = 0; k < 8; k++) relaText.empilhar((infoR >> (k * 8)) & 255)
+        para (var k: inteiro = 0; k < 8; k++) relaText.empilhar((addR >> (k * 8)) & 255)
     }
 
     var relaData: inteiro[] = []
     para (var i: inteiro = 0; i < obj.relocsData.tamanho(); i++) {
         const r: qualquer = obj.relocsData[i]
         const sIdx: inteiro = inteiro(symIdxMap[r.simbolo])
-        ec.anexarU64(relaData, r.offset)
-        ec.anexarU64(relaData, (sIdx << 32) | (r.tipoReloc & 4294967295))
-        ec.anexarU64(relaData, r.addend)
+        const offR: inteiro = r.offset
+        const infoR: inteiro = (sIdx << 32) | (r.tipoReloc & 4294967295)
+        const addR: inteiro = r.addend
+        para (var k: inteiro = 0; k < 8; k++) relaData.empilhar((offR >> (k * 8)) & 255)
+        para (var k: inteiro = 0; k < 8; k++) relaData.empilhar((infoR >> (k * 8)) & 255)
+        para (var k: inteiro = 0; k < 8; k++) relaData.empilhar((addR >> (k * 8)) & 255)
     }
 
     // 3. Constroi .shstrtab
@@ -95,96 +101,102 @@ funcao emitirObjetoELF64(obj: qualquer): inteiro[] {
     const nShstrtab: inteiro = ec.anexarCString(shstrtab, ".shstrtab", bytesMod)
     const nGnuStack: inteiro = ec.anexarCString(shstrtab, ".note.GNU-stack", bytesMod)
 
-    // 4. Monta o corpo apos o header de 64 bytes
-    var corpo: inteiro[] = []
-
-    const offText: inteiro = 64 + corpo.tamanho()
-    para (var i: inteiro = 0; i < obj.textBytes.tamanho(); i++) corpo.empilhar(obj.textBytes[i])
+    // 4. Calcula offsets exatos sem duplicar secoes em vetores inteiro[] gigantes
     const lenText: inteiro = obj.textBytes.tamanho()
-
-    ec.preencherAlinh(corpo, 8, 0)
-    const offRodata: inteiro = 64 + corpo.tamanho()
-    para (var i: inteiro = 0; i < obj.rodataBytes.tamanho(); i++) corpo.empilhar(obj.rodataBytes[i])
+    const offText: inteiro = 64
+    const offRodata: inteiro = ec.alinharValor(offText + lenText, 8)
+    const padRodata: inteiro = offRodata - (offText + lenText)
     const lenRodata: inteiro = obj.rodataBytes.tamanho()
 
-    ec.preencherAlinh(corpo, 8, 0)
-    const offData: inteiro = 64 + corpo.tamanho()
-    para (var i: inteiro = 0; i < obj.dataBytes.tamanho(); i++) corpo.empilhar(obj.dataBytes[i])
+    const offData: inteiro = ec.alinharValor(offRodata + lenRodata, 8)
+    const padData: inteiro = offData - (offRodata + lenRodata)
     const lenData: inteiro = obj.dataBytes.tamanho()
 
-    ec.preencherAlinh(corpo, 8, 0)
-    const offBss: inteiro = 64 + corpo.tamanho()
-
-    ec.preencherAlinh(corpo, 8, 0)
-    const offRelaText: inteiro = 64 + corpo.tamanho()
-    para (var i: inteiro = 0; i < relaText.tamanho(); i++) corpo.empilhar(relaText[i])
+    const offBss: inteiro = ec.alinharValor(offData + lenData, 8)
+    const offRelaText: inteiro = offBss
+    const padRelaText: inteiro = offRelaText - (offData + lenData)
     const lenRelaText: inteiro = relaText.tamanho()
 
-    ec.preencherAlinh(corpo, 8, 0)
-    const offRelaData: inteiro = 64 + corpo.tamanho()
-    para (var i: inteiro = 0; i < relaData.tamanho(); i++) corpo.empilhar(relaData[i])
+    const offRelaData: inteiro = ec.alinharValor(offRelaText + lenRelaText, 8)
+    const padRelaData: inteiro = offRelaData - (offRelaText + lenRelaText)
     const lenRelaData: inteiro = relaData.tamanho()
 
-    ec.preencherAlinh(corpo, 8, 0)
-    const offSymtab: inteiro = 64 + corpo.tamanho()
-    para (var i: inteiro = 0; i < symtab.tamanho(); i++) corpo.empilhar(symtab[i])
+    const offSymtab: inteiro = ec.alinharValor(offRelaData + lenRelaData, 8)
+    const padSymtab: inteiro = offSymtab - (offRelaData + lenRelaData)
     const lenSymtab: inteiro = symtab.tamanho()
 
-    const offStrtab: inteiro = 64 + corpo.tamanho()
-    para (var i: inteiro = 0; i < strtab.tamanho(); i++) corpo.empilhar(strtab[i])
+    const offStrtab: inteiro = offSymtab + lenSymtab
     const lenStrtab: inteiro = strtab.tamanho()
 
-    const offShstrtab: inteiro = 64 + corpo.tamanho()
-    para (var i: inteiro = 0; i < shstrtab.tamanho(); i++) corpo.empilhar(shstrtab[i])
+    const offShstrtab: inteiro = offStrtab + lenStrtab
     const lenShstrtab: inteiro = shstrtab.tamanho()
 
-    ec.preencherAlinh(corpo, 8, 0)
-    const offShdrs: inteiro = 64 + corpo.tamanho()
+    const offShdrs: inteiro = ec.alinharValor(offShstrtab + lenShstrtab, 8)
+    const padShdrs: inteiro = offShdrs - (offShstrtab + lenShstrtab)
     const numShdrs: inteiro = 11
 
-    // 5. ELF64 Header (ET_REL, EM_X86_64)
-    var elf: inteiro[] = [
+    // 5. ELF64 Header (64 bytes)
+    var hdr: inteiro[] = [
         ec.ELF_MAGIC_0, ec.ELF_MAGIC_1, ec.ELF_MAGIC_2, ec.ELF_MAGIC_3,
         ec.ELFCLASS64, ec.ELFDATA2LSB, ec.EV_CURRENT, 0,
         0, 0, 0, 0, 0, 0, 0, 0
     ]
-    ec.anexarU16(elf, ec.ET_REL)
-    ec.anexarU16(elf, ec.EM_X86_64)
-    ec.anexarU32(elf, ec.EV_CURRENT)
-    ec.anexarU64(elf, 0)
-    ec.anexarU64(elf, 0)
-    ec.anexarU64(elf, offShdrs)
-    ec.anexarU32(elf, 0)
-    ec.anexarU16(elf, 64)
-    ec.anexarU16(elf, 0)
-    ec.anexarU16(elf, 0)
-    ec.anexarU16(elf, 64)
-    ec.anexarU16(elf, numShdrs)
-    ec.anexarU16(elf, 9) // e_shstrndx = 9 (.shstrtab)
+    ec.anexarU16(hdr, ec.ET_REL)
+    ec.anexarU16(hdr, ec.EM_X86_64)
+    ec.anexarU32(hdr, ec.EV_CURRENT)
+    ec.anexarU64(hdr, 0)
+    ec.anexarU64(hdr, 0)
+    ec.anexarU64(hdr, offShdrs)
+    ec.anexarU32(hdr, 0)
+    ec.anexarU16(hdr, 64)
+    ec.anexarU16(hdr, 0)
+    ec.anexarU16(hdr, 0)
+    ec.anexarU16(hdr, 64)
+    ec.anexarU16(hdr, numShdrs)
+    ec.anexarU16(hdr, 9) // e_shstrndx = 9 (.shstrtab)
 
-    para (var i: inteiro = 0; i < corpo.tamanho(); i++) elf.empilhar(corpo[i])
-
-    // 11 Section Headers:
-    // 0:NULL, 1:.text, 2:.rela.text, 3:.rodata, 4:.data, 5:.rela.data, 6:.bss, 7:.symtab, 8:.strtab, 9:.shstrtab, 10:.note.GNU-stack
-    ec.anexarShdr(elf, 0, ec.SHT_NULL, 0, 0, 0, 0, 0, 0, 0, 0)
-    ec.anexarShdr(elf, nText, ec.SHT_PROGBITS, ec.SHF_ALLOC | ec.SHF_EXECINSTR, 0, offText,
+    // 6. 11 Section Headers (704 bytes)
+    var shdrs: inteiro[] = []
+    ec.anexarShdr(shdrs, 0, ec.SHT_NULL, 0, 0, 0, 0, 0, 0, 0, 0)
+    ec.anexarShdr(shdrs, nText, ec.SHT_PROGBITS, ec.SHF_ALLOC | ec.SHF_EXECINSTR, 0, offText,
         lenText, 0, 0, 16, 0)
-    ec.anexarShdr(elf, nRelaText, ec.SHT_RELA, ec.SHF_INFO_LINK, 0, offRelaText, lenRelaText,
+    ec.anexarShdr(shdrs, nRelaText, ec.SHT_RELA, ec.SHF_INFO_LINK, 0, offRelaText, lenRelaText,
         7, 1, 8, 24)
-    ec.anexarShdr(elf, nRodata, ec.SHT_PROGBITS, ec.SHF_ALLOC, 0, offRodata, lenRodata, 0,
-        0, 8, 0)
-    ec.anexarShdr(elf, nData, ec.SHT_PROGBITS, ec.SHF_ALLOC | ec.SHF_WRITE, 0, offData, lenData,
+    ec.anexarShdr(shdrs, nRodata, ec.SHT_PROGBITS, ec.SHF_ALLOC, 0, offRodata, lenRodata,
         0, 0, 8, 0)
-    ec.anexarShdr(elf, nRelaData, ec.SHT_RELA, ec.SHF_INFO_LINK, 0, offRelaData, lenRelaData,
+    ec.anexarShdr(shdrs, nData, ec.SHT_PROGBITS, ec.SHF_ALLOC | ec.SHF_WRITE, 0, offData,
+        lenData, 0, 0, 8, 0)
+    ec.anexarShdr(shdrs, nRelaData, ec.SHT_RELA, ec.SHF_INFO_LINK, 0, offRelaData, lenRelaData,
         7, 4, 8, 24)
-    ec.anexarShdr(elf, nBss, ec.SHT_NOBITS, ec.SHF_ALLOC | ec.SHF_WRITE, 0, offBss, obj.bssSize,
+    ec.anexarShdr(shdrs, nBss, ec.SHT_NOBITS, ec.SHF_ALLOC | ec.SHF_WRITE, 0, offBss, obj.bssSize,
         0, 0, 8, 0)
-    ec.anexarShdr(elf, nSymtab, ec.SHT_SYMTAB, 0, 0, offSymtab, lenSymtab, 8, firstGlobalIdx,
+    ec.anexarShdr(shdrs, nSymtab, ec.SHT_SYMTAB, 0, 0, offSymtab, lenSymtab, 8, firstGlobalIdx,
         8, 24)
-    ec.anexarShdr(elf, nStrtab, ec.SHT_STRTAB, 0, 0, offStrtab, lenStrtab, 0, 0, 1, 0)
-    ec.anexarShdr(elf, nShstrtab, ec.SHT_STRTAB, 0, 0, offShstrtab, lenShstrtab, 0, 0, 1,
-        0)
-    ec.anexarShdr(elf, nGnuStack, ec.SHT_PROGBITS, 0, 0, offShdrs, 0, 0, 0, 1, 0)
+    ec.anexarShdr(shdrs, nStrtab, ec.SHT_STRTAB, 0, 0, offStrtab, lenStrtab, 0, 0, 1, 0)
+    ec.anexarShdr(shdrs, nShstrtab, ec.SHT_STRTAB, 0, 0, offShstrtab, lenShstrtab, 0, 0,
+        1, 0)
+    ec.anexarShdr(shdrs, nGnuStack, ec.SHT_PROGBITS, 0, 0, offShdrs, 0, 0, 0, 1, 0)
 
-    retorna elf
+    // 7. Monta buffer nativo cgd:bytes (1 byte por byte, evitando alocacoes de centenas de MiB)
+    var out: qualquer = bytesMod.Bytes.deVetor(hdr)
+    se (lenText > 0) out = out.concatenar(bytesMod.Bytes.deVetor(obj.textBytes))
+    se (padRodata > 0) out = out.concatenar(bytesMod.Bytes.criar(padRodata))
+    se (lenRodata > 0) out = out.concatenar(bytesMod.Bytes.deVetor(obj.rodataBytes))
+    se (padData > 0) out = out.concatenar(bytesMod.Bytes.criar(padData))
+    se (lenData > 0) out = out.concatenar(bytesMod.Bytes.deVetor(obj.dataBytes))
+    se (padRelaText > 0) out = out.concatenar(bytesMod.Bytes.criar(padRelaText))
+    se (lenRelaText > 0) out = out.concatenar(bytesMod.Bytes.deVetor(relaText))
+    se (padRelaData > 0) out = out.concatenar(bytesMod.Bytes.criar(padRelaData))
+    se (lenRelaData > 0) out = out.concatenar(bytesMod.Bytes.deVetor(relaData))
+    se (padSymtab > 0) out = out.concatenar(bytesMod.Bytes.criar(padSymtab))
+    se (lenSymtab > 0) out = out.concatenar(bytesMod.Bytes.deVetor(symtab))
+    se (lenStrtab > 0) out = out.concatenar(bytesMod.Bytes.deVetor(strtab))
+    se (lenShstrtab > 0) out = out.concatenar(bytesMod.Bytes.deVetor(shstrtab))
+    se (padShdrs > 0) out = out.concatenar(bytesMod.Bytes.criar(padShdrs))
+    out = out.concatenar(bytesMod.Bytes.deVetor(shdrs))
+    retorna out
+}
+
+funcao emitirObjetoELF64(obj: qualquer): inteiro[] {
+    retorna emitirObjetoELF64Bytes(obj).paraVetor()
 }

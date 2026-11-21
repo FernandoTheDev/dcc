@@ -293,6 +293,9 @@ classe AnalisadorSemanticoDCC {
                     se (!isto.tabela.globaisExternas.contem(no.nome)) {
                         isto.tabela.globaisExternas[no.nome] = verdadeiro
                     }
+                    se (no.ehThreadLocal) {
+                        isto.tabela.globaisExternasTls[no.nome] = verdadeiro
+                    }
                 } senao {
                     se (isto.tabela.globaisExternas.contem(no.nome)) {
                         isto.tabela.globaisExternas.remover(no.nome)
@@ -398,6 +401,22 @@ classe AnalisadorSemanticoDCC {
     }
 
     verificarInicializador(inic: qualquer, tipoAlvo: qualquer, escopos: dicionario[]): vazio {
+        se (inic.kind == isto.Kind.ExprInicDesignado) {
+            se (inic.ehSeta) {
+                se (tipoAlvo.base != isto.TB.Array) {
+                    isto.diag.erroEm(inic.linha, inic.coluna, "inicializador designado '[idx]' exige array",
+                        "", "E3013", 1)
+                }
+                isto.verificarInicializador(inic.filhos[0], tipoAlvo.alvo, escopos)
+            } senao {
+                const campoD: qualquer = isto.buscarCampoOuErro(tipoAlvo, inic.nome, inic.linha,
+                    inic.coluna)
+                inic.valor = campoD.offset
+                inic.tipoC = campoD.tipoCampo
+                isto.verificarInicializador(inic.filhos[0], campoD.tipoCampo, escopos)
+            }
+            retorna
+        }
         se (inic.kind == isto.Kind.ExprInitList) {
             var idxSeq: inteiro = 0
             para (var i: inteiro = 0; i < inic.filhos.tamanho(); i++) {
@@ -829,6 +848,16 @@ classe AnalisadorSemanticoDCC {
             }
             retorna expr.tipoC
             caso isto.Kind.ExprChamada:
+            se (!expr.ehSeta e expr.nome == "__builtin_expect") {
+                se (expr.filhos.tamanho() != 2) {
+                    isto.diag.erroEm(expr.linha, expr.coluna, "__builtin_expect exige exatamente 2 argumentos",
+                        "", "E3012", expr.nome.tamanho())
+                }
+                isto.verificarExpr(expr.filhos[0], escopos)
+                isto.verificarExpr(expr.filhos[1], escopos)
+                expr.tipoC = isto.tMod.TipoC.tipoLong()
+                retorna expr.tipoC
+            }
             se (!expr.ehSeta) {
                 const tVarFn: qualquer = isto.buscarVar(escopos, expr.nome)
                 se (tVarFn != nulo e tVarFn.base == isto.TB.Ponteiro e tVarFn.alvo != nulo e tVarFn.alvo.base == isto.TB.Funcao) {

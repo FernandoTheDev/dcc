@@ -46,6 +46,7 @@ const STT_NOTYPE: inteiro = 0
 const STT_OBJECT: inteiro = 1
 const STT_FUNC: inteiro = 2
 const STT_SECTION: inteiro = 3
+const STT_TLS: inteiro = 6
 
 // Special Section Indices (SHN_*)
 const SHN_UNDEF: inteiro = 0
@@ -72,24 +73,27 @@ const R_X86_64_GLOB_DAT: inteiro = 6
 const R_X86_64_GOTPCREL: inteiro = 9
 const R_X86_64_32: inteiro = 10
 const R_X86_64_32S: inteiro = 11
+const R_X86_64_GOTTPOFF: inteiro = 22
 const R_X86_64_GOTPCRELX: inteiro = 41
 const R_X86_64_REX_GOTPCRELX: inteiro = 42
 
-funcao lerU16LE(buf: inteiro[], off: inteiro): inteiro {
+// Nota de desempenho CGD: funcoes de buffer ELF recebem `buf: qualquer` (vetor inteiro[])
+// para evitar validacao O(N) de parametro tipado `inteiro[]` a cada chamada em loops quentes.
+funcao lerU16LE(buf: qualquer, off: inteiro): inteiro {
     retorna (buf[off] & 255) | ((buf[off + 1] & 255) << 8)
 }
 
-funcao lerU32LE(buf: inteiro[], off: inteiro): inteiro {
+funcao lerU32LE(buf: qualquer, off: inteiro): inteiro {
     retorna (buf[off] & 255) | ((buf[off + 1] & 255) << 8) | ((buf[off + 2] & 255) << 16) | ((buf[off + 3] & 255) << 24)
 }
 
-funcao lerU64LE(buf: inteiro[], off: inteiro): inteiro {
+funcao lerU64LE(buf: qualquer, off: inteiro): inteiro {
     const lo: inteiro = lerU32LE(buf, off)
     const hi: inteiro = lerU32LE(buf, off + 4)
     retorna lo | (hi << 32)
 }
 
-funcao lerCStringLim(buf: inteiro[], off: inteiro, limite: inteiro, bytesMod: qualquer): texto {
+funcao lerCStringLim(buf: qualquer, off: inteiro, limite: inteiro, bytesMod: qualquer): texto {
     se (off < 0 ou off >= limite ou off >= buf.tamanho()) retorna ""
     const teto: inteiro = limite < buf.tamanho() ? limite : buf.tamanho()
     var bs: inteiro[] = []
@@ -104,31 +108,31 @@ funcao lerCStringLim(buf: inteiro[], off: inteiro, limite: inteiro, bytesMod: qu
     retorna bytesMod.Bytes.deVetor(bs).paraTexto()
 }
 
-funcao anexarU16(buf: inteiro[], v: inteiro): vazio {
+funcao anexarU16(buf: qualquer, v: inteiro): vazio {
     buf.empilhar(v & 255)
     buf.empilhar((v >> 8) & 255)
 }
 
-funcao anexarU32(buf: inteiro[], v: inteiro): vazio {
+funcao anexarU32(buf: qualquer, v: inteiro): vazio {
     buf.empilhar(v & 255)
     buf.empilhar((v >> 8) & 255)
     buf.empilhar((v >> 16) & 255)
     buf.empilhar((v >> 24) & 255)
 }
 
-funcao anexarU64(buf: inteiro[], v: inteiro): vazio {
+funcao anexarU64(buf: qualquer, v: inteiro): vazio {
     anexarU32(buf, v)
     anexarU32(buf, v >> 32)
 }
 
-funcao gravarU32(buf: inteiro[], pos: inteiro, v: inteiro): vazio {
+funcao gravarU32(buf: qualquer, pos: inteiro, v: inteiro): vazio {
     buf[pos] = v & 255
     buf[pos + 1] = (v >> 8) & 255
     buf[pos + 2] = (v >> 16) & 255
     buf[pos + 3] = (v >> 24) & 255
 }
 
-funcao gravarU64(buf: inteiro[], pos: inteiro, v: inteiro): vazio {
+funcao gravarU64(buf: qualquer, pos: inteiro, v: inteiro): vazio {
     gravarU32(buf, pos, v)
     gravarU32(buf, pos + 4, v >> 32)
 }
@@ -140,7 +144,7 @@ funcao alinharValor(n: inteiro, modAlinh: inteiro): inteiro {
     retorna n + (modAlinh - r)
 }
 
-funcao preencherAlinh(buf: inteiro[], modAlinh: inteiro, bytePad: inteiro = 0): vazio {
+funcao preencherAlinh(buf: qualquer, modAlinh: inteiro, bytePad: inteiro = 0): vazio {
     se (modAlinh <= 1) retorna
     enquanto (buf.tamanho() % modAlinh != 0) buf.empilhar(bytePad & 255)
 }
@@ -150,7 +154,7 @@ funcao ehPotenciaDeDois(v: inteiro): logico {
     retorna (v & (v - 1)) == 0
 }
 
-funcao anexarCString(buf: inteiro[], s: texto, bytesMod: qualquer): inteiro {
+funcao anexarCString(buf: qualquer, s: texto, bytesMod: qualquer): inteiro {
     const ini: inteiro = buf.tamanho()
     const dados: inteiro[] = bytesMod.Bytes.deTexto(s).paraVetor()
     para (var i: inteiro = 0; i < dados.tamanho(); i++) buf.empilhar(dados[i])
@@ -158,7 +162,7 @@ funcao anexarCString(buf: inteiro[], s: texto, bytesMod: qualquer): inteiro {
     retorna ini
 }
 
-funcao anexarPhdr(buf: inteiro[], pType: inteiro, pFlags: inteiro, pOff: inteiro, pVaddr: inteiro,
+funcao anexarPhdr(buf: qualquer, pType: inteiro, pFlags: inteiro, pOff: inteiro, pVaddr: inteiro,
     pFilesz: inteiro, pMemsz: inteiro, pAlign: inteiro): vazio {
     anexarU32(buf, pType)
     anexarU32(buf, pFlags)
@@ -170,7 +174,7 @@ funcao anexarPhdr(buf: inteiro[], pType: inteiro, pFlags: inteiro, pOff: inteiro
     anexarU64(buf, pAlign)
 }
 
-funcao anexarShdr(buf: inteiro[], shName: inteiro, shType: inteiro, shFlags: inteiro, shAddr: inteiro,
+funcao anexarShdr(buf: qualquer, shName: inteiro, shType: inteiro, shFlags: inteiro, shAddr: inteiro,
     shOffset: inteiro, shSize: inteiro, shLink: inteiro, shInfo: inteiro, shAddrAlign: inteiro,
     shEntSize: inteiro): vazio {
     anexarU32(buf, shName)
@@ -185,7 +189,7 @@ funcao anexarShdr(buf: inteiro[], shName: inteiro, shType: inteiro, shFlags: int
     anexarU64(buf, shEntSize)
 }
 
-funcao anexarSym64(buf: inteiro[], stName: inteiro, stInfo: inteiro, stShndx: inteiro, stValue: inteiro,
+funcao anexarSym64(buf: qualquer, stName: inteiro, stInfo: inteiro, stShndx: inteiro, stValue: inteiro,
     stSize: inteiro): vazio {
     anexarU32(buf, stName)
     buf.empilhar(stInfo & 255)
