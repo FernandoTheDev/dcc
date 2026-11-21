@@ -1,0 +1,370 @@
+// Leitor seguro e validado de arquivos objeto ELF64 (ET_REL) e arquivos estaticos GNU ar (.a).
+// Trata toda entrada binaria como potencialmente maliciosa: valida magic, classe 64-bit,
+// endianness, offsets, tamanhos, alinhamentos, indices de secoes/simbolos e relocacoes.
+
+classe SecaoElfLida {
+    indice: inteiro
+    nome: texto
+    shType: inteiro
+    shFlags: inteiro
+    shOffset: inteiro
+    shSize: inteiro
+    shLink: inteiro
+    shInfo: inteiro
+    shAlign: inteiro
+    shEntSize: inteiro
+
+    construtor(indice: inteiro, nome: texto, shType: inteiro, shFlags: inteiro, shOffset: inteiro,
+        shSize: inteiro, shLink: inteiro, shInfo: inteiro, shAlign: inteiro, shEntSize: inteiro) {
+        isto.indice = indice
+        isto.nome = nome
+        isto.shType = shType
+        isto.shFlags = shFlags
+        isto.shOffset = shOffset
+        isto.shSize = shSize
+        isto.shLink = shLink
+        isto.shInfo = shInfo
+        isto.shAlign = shAlign
+        isto.shEntSize = shEntSize
+    }
+}
+
+classe SimboloElfLido {
+    nome: texto
+    bind: inteiro
+    tipoSym: inteiro
+    shndx: inteiro
+    valor: inteiro
+    tamanho: inteiro
+
+    construtor(nome: texto, bind: inteiro, tipoSym: inteiro, shndx: inteiro, valor: inteiro,
+        tamanho: inteiro) {
+        isto.nome = nome
+        isto.bind = bind
+        isto.tipoSym = tipoSym
+        isto.shndx = shndx
+        isto.valor = valor
+        isto.tamanho = tamanho
+    }
+}
+
+classe RelocElfLida {
+    alvoSecIdx: inteiro
+    rOffset: inteiro
+    symIdx: inteiro
+    rType: inteiro
+    rAddend: inteiro
+
+    construtor(alvoSecIdx: inteiro, rOffset: inteiro, symIdx: inteiro, rType: inteiro, rAddend: inteiro) {
+        isto.alvoSecIdx = alvoSecIdx
+        isto.rOffset = rOffset
+        isto.symIdx = symIdx
+        isto.rType = rType
+        isto.rAddend = rAddend
+    }
+}
+
+classe ObjetoElfLido {
+    nomeArquivo: texto
+    dados: inteiro[]
+    secoes: SecaoElfLida[]
+    simbolos: SimboloElfLido[]
+    relocs: RelocElfLida[]
+
+    construtor(nomeArquivo: texto, dados: inteiro[]) {
+        isto.nomeArquivo = nomeArquivo
+        isto.dados = dados
+        isto.secoes = []
+        isto.simbolos = []
+        isto.relocs = []
+    }
+}
+
+funcao ehArquivoAr(dados: inteiro[]): logico {
+    // "!<arch>\n" = 33, 60, 97, 114, 99, 104, 62, 10
+    se (dados.tamanho() < 8) retorna falso
+    retorna dados[0] == 33 e dados[1] == 60 e dados[2] == 97 e dados[3] == 114 e dados[4] == 99 e dados[5] == 104 e dados[6] == 62 e dados[7] == 10
+}
+
+funcao lerTextoAsciiFaixa(dados: inteiro[], ini: inteiro, tam: inteiro, bytesMod: qualquer): texto {
+    var bs: inteiro[] = []
+    para (var i: inteiro = 0; i < tam e ini + i < dados.tamanho(); i++) {
+        bs.empilhar(dados[ini + i] & 255)
+    }
+
+    se (bs.tamanho() == 0) retorna ""
+    retorna bytesMod.Bytes.deVetor(bs).paraTexto()
+}
+
+funcao parseDecimalAr(s: texto): inteiro {
+    const t: texto = s.aparar()
+    se (t.tamanho() == 0) retorna -1
+    var acc: inteiro = 0
+    para (var i: inteiro = 0; i < t.tamanho(); i++) {
+        const ch: texto = t[i]
+        se (ch < "0" ou ch > "9") retorna -1
+        const litMod: qualquer = importar("../lexer/literais.delegua")
+        acc = acc * 10 + (litMod.codigoChar(ch) - 48)
+        se (acc > 1073741824) retorna -1
+    }
+
+    retorna acc
+}
+
+// Extrai membros ELF64 (.o) de uma biblioteca estatica GNU ar (.a) com checagem estrita de limites.
+funcao extrairObjetosDeAr(dados: inteiro[], nomeArq: texto, diag: qualquer): ObjetoElfLido[] {
+    const bytesMod: qualquer = importar("cgd:bytes")
+    const ec: qualquer = importar("../object/elf/elf_comum.delegua")
+    const n: inteiro = dados.tamanho()
+    se (!ehArquivoAr(dados)) {
+        diag.erroDireto(nomeArq, 0, 0, "arquivo estatico '.a' invalido (magic '!<arch>' ausente)",
+            "", "", "E5001")
+    }
+
+    var membros: ObjetoElfLido[] = []
+    var pos: inteiro = 8
+    var tabelaNomesLongos: texto = ""
+    var contMembros: inteiro = 0
+
+    enquanto (pos < n) {
+        se (pos + 60 > n) {
+            diag.erroDireto(nomeArq, 0, 0, "cabecalho de membro truncado em arquivo '.a'",
+                "", "", "E5002")
+        }
+        se (dados[pos + 58] != 96 ou dados[pos + 59] != 10) {
+            diag.erroDireto(nomeArq, 0, 0, "assinatura de cabecalho de membro invalida em '.a'",
+                "", "", "E5002")
+        }
+        const nomeCampo: texto = lerTextoAsciiFaixa(dados, pos, 16, bytesMod).aparar()
+        const tamCampo: texto = lerTextoAsciiFaixa(dados, pos + 48, 10, bytesMod)
+        const tamMembro: inteiro = parseDecimalAr(tamCampo)
+        se (tamMembro < 0 ou tamMembro > n - (pos + 60)) {
+            diag.erroDireto(nomeArq, 0, 0, "tamanho de membro fora dos limites em arquivo '.a' (${tamMembro})",
+                "", "", "E5002")
+        }
+
+        const iniDados: inteiro = pos + 60
+        contMembros++
+        se (contMembros > 4096) {
+            diag.erroDireto(nomeArq, 0, 0, "numero maximo de membros em '.a' excedido (4096)",
+                "", "", "E5002")
+        }
+
+        se (nomeCampo == "//") {
+            tabelaNomesLongos = lerTextoAsciiFaixa(dados, iniDados, tamMembro, bytesMod)
+        } senao se (nomeCampo == "/" ou nomeCampo == "/SYM64/") {
+            var skipSymIdx: inteiro = 0
+        } senao se (tamMembro >= 64 e dados[iniDados] == ec.ELF_MAGIC_0 e dados[iniDados + 1] == ec.ELF_MAGIC_1 e dados[iniDados + 2] == ec.ELF_MAGIC_2 e dados[iniDados + 3] == ec.ELF_MAGIC_3) {
+            var nomeMembro: texto = nomeCampo
+            se (nomeCampo.tamanho() > 1 e nomeCampo[0] == "/" e tabelaNomesLongos.tamanho() > 0) {
+                const offLong: inteiro = parseDecimalAr(nomeCampo.fatiar(1, nomeCampo.tamanho()))
+                se (offLong >= 0 e offLong < tabelaNomesLongos.tamanho()) {
+                    var fimL: inteiro = offLong
+                    enquanto (fimL < tabelaNomesLongos.tamanho() e tabelaNomesLongos[fimL] != "/" e tabelaNomesLongos[fimL] != "\n") {
+                        fimL++
+                    }
+                    nomeMembro = tabelaNomesLongos.fatiar(offLong, fimL)
+                }
+            } senao se (nomeMembro.tamanho() > 0 e nomeMembro[nomeMembro.tamanho() - 1] == "/") {
+                nomeMembro = nomeMembro.fatiar(0, nomeMembro.tamanho() - 1)
+            }
+            var fatia: inteiro[] = []
+            para (var k: inteiro = 0; k < tamMembro; k++) fatia.empilhar(dados[iniDados + k] & 255)
+            membros.empilhar(lerObjetoELF64(fatia, "${nomeArq}(${nomeMembro})", diag))
+        }
+
+        pos = iniDados + tamMembro
+        se (pos % 2 == 1) pos++
+    }
+
+    retorna membros
+}
+
+funcao lerObjetoELF64(dados: inteiro[], nomeArq: texto, diag: qualquer): ObjetoElfLido {
+    const bytesMod: qualquer = importar("cgd:bytes")
+    const ec: qualquer = importar("../object/elf/elf_comum.delegua")
+    const nBytes: inteiro = dados.tamanho()
+
+    se (nBytes < 64) {
+        diag.erroDireto(nomeArq, 0, 0, "arquivo objeto ELF64 truncado (${nBytes} bytes; minimo 64)",
+            "", "", "E5001")
+    }
+
+    se (dados[0] != ec.ELF_MAGIC_0 ou dados[1] != ec.ELF_MAGIC_1 ou dados[2] != ec.ELF_MAGIC_2 ou dados[3] != ec.ELF_MAGIC_3) {
+        diag.erroDireto(nomeArq, 0, 0, "arquivo objeto ELF64 invalido (magic incorreto)",
+            "", "", "E5001")
+    }
+
+    se (dados[4] != ec.ELFCLASS64) {
+        diag.erroDireto(nomeArq, 0, 0, "objeto ELF invalido: classe ELF64 (2) esperada, obtido ${dados[4]}",
+            "", "", "E5001")
+    }
+
+    se (dados[5] != ec.ELFDATA2LSB) {
+        diag.erroDireto(nomeArq, 0, 0, "objeto ELF invalido: codificacao little-endian (1) esperada, obtido ${dados[5]}",
+            "", "", "E5001")
+    }
+
+    se (dados[6] != ec.EV_CURRENT) {
+        diag.erroDireto(nomeArq, 0, 0, "versao de identificacao ELF invalida: ${dados[6]}",
+            "", "", "E5001")
+    }
+
+    const eType: inteiro = ec.lerU16LE(dados, 16)
+    const eMachine: inteiro = ec.lerU16LE(dados, 18)
+    const eVersion: inteiro = ec.lerU32LE(dados, 20)
+    se (eType != ec.ET_REL ou eMachine != ec.EM_X86_64 ou eVersion != ec.EV_CURRENT) {
+        diag.erroDireto(nomeArq, 0, 0, "objeto ELF64 esperado (ET_REL x86-64), obtido type=${eType} machine=${eMachine}",
+            "", "", "E5001")
+    }
+
+    const eShoff: inteiro = ec.lerU64LE(dados, 40)
+    const eShentsize: inteiro = ec.lerU16LE(dados, 58)
+    const eShnum: inteiro = ec.lerU16LE(dados, 60)
+    const eShstrndx: inteiro = ec.lerU16LE(dados, 62)
+
+    se (eShentsize < 64 ou eShentsize > 4096) {
+        diag.erroDireto(nomeArq, 0, 0, "e_shentsize invalido (${eShentsize}) em objeto ELF64",
+            "", "", "E5003")
+    }
+
+    se (eShnum <= 0 ou eShnum > 65535) {
+        diag.erroDireto(nomeArq, 0, 0, "numero de secoes e_shnum invalido (${eShnum})", "",
+            "", "E5003")
+    }
+
+    se (eShoff < 64 ou eShoff > nBytes ou eShnum > (nBytes - eShoff) \ eShentsize) {
+        diag.erroDireto(nomeArq, 0, 0, "tabela de Section Headers fora dos limites do arquivo (e_shoff=${eShoff}, e_shnum=${eShnum})",
+            "", "", "E5003")
+    }
+
+    se (eShstrndx >= eShnum) {
+        diag.erroDireto(nomeArq, 0, 0, "indice e_shstrndx (${eShstrndx}) fora dos limites (e_shnum=${eShnum})",
+            "", "", "E5003")
+    }
+
+    const shstrHdrBase: inteiro = eShoff + eShstrndx * eShentsize
+    const shstrOff: inteiro = ec.lerU64LE(dados, shstrHdrBase + 24)
+    const shstrSz: inteiro = ec.lerU64LE(dados, shstrHdrBase + 32)
+    se (shstrOff < 0 ou shstrSz < 0 ou shstrOff > nBytes ou shstrSz > nBytes - shstrOff) {
+        diag.erroDireto(nomeArq, 0, 0, "secao .shstrtab fora dos limites do arquivo", "",
+            "", "E5003")
+    }
+
+    const shstrFim: inteiro = shstrOff + shstrSz
+
+    const obj: ObjetoElfLido = ObjetoElfLido(nomeArq, dados)
+    var symtabSecIdx: inteiro = -1
+
+    para (var i: inteiro = 0; i < eShnum; i++) {
+        const base: inteiro = eShoff + i * eShentsize
+        const shNameOff: inteiro = ec.lerU32LE(dados, base)
+        const shType: inteiro = ec.lerU32LE(dados, base + 4)
+        const shFlags: inteiro = ec.lerU64LE(dados, base + 8)
+        const shOffset: inteiro = ec.lerU64LE(dados, base + 24)
+        const shSize: inteiro = ec.lerU64LE(dados, base + 32)
+        const shLink: inteiro = ec.lerU32LE(dados, base + 40)
+        const shInfo: inteiro = ec.lerU32LE(dados, base + 44)
+        const shAlign: inteiro = ec.lerU64LE(dados, base + 48)
+        const shEntSize: inteiro = ec.lerU64LE(dados, base + 56)
+
+        se (shAlign < 0 ou shAlign > 65536 ou (shAlign > 1 e !ec.ehPotenciaDeDois(shAlign))) {
+            diag.erroDireto(nomeArq, 0, 0, "alinhamento de secao invalido ou excessivo (sh_addralign=${shAlign}) na secao #${i}",
+                "", "", "E5004")
+        }
+        se (shSize < 0 ou shSize > 1073741824) {
+            diag.erroDireto(nomeArq, 0, 0, "tamanho de secao invalido ou excessivo (sh_size=${shSize}) na secao #${i}",
+                "", "", "E5004")
+        }
+        se (shType != ec.SHT_NULL e shType != ec.SHT_NOBITS) {
+            se (shOffset < 0 ou shOffset > nBytes ou shSize > nBytes - shOffset) {
+                diag.erroDireto(nomeArq, 0, 0, "secao #${i} fora dos limites do arquivo (offset=${shOffset}, size=${shSize}, file=${nBytes})",
+                    "", "", "E5004")
+            }
+        }
+        se (shNameOff < 0 ou shNameOff >= shstrSz) {
+            diag.erroDireto(nomeArq, 0, 0, "offset de nome sh_name (${shNameOff}) fora de .shstrtab na secao #${i}",
+                "", "", "E5004")
+        }
+        const nomeSec: texto = ec.lerCStringLim(dados, shstrOff + shNameOff, shstrFim, bytesMod)
+        obj.secoes.empilhar(SecaoElfLida(i, nomeSec, shType, shFlags, shOffset, shSize, shLink,
+            shInfo, shAlign, shEntSize))
+        se (shType == ec.SHT_SYMTAB) symtabSecIdx = i
+    }
+
+    // Le e valida .symtab
+    se (symtabSecIdx >= 0) {
+        const sTab: SecaoElfLida = obj.secoes[symtabSecIdx]
+        se (sTab.shLink <= 0 ou sTab.shLink >= obj.secoes.tamanho()) {
+            diag.erroDireto(nomeArq, 0, 0, "sh_link invalido (${sTab.shLink}) em .symtab",
+                "", "", "E5005")
+        }
+        const strSec: SecaoElfLida = obj.secoes[sTab.shLink]
+        const strFim: inteiro = strSec.shOffset + strSec.shSize
+        const entSz: inteiro = sTab.shEntSize > 0 ? sTab.shEntSize : 24
+        se (entSz < 24 ou entSz > 1024) {
+            diag.erroDireto(nomeArq, 0, 0, "sh_entsize invalido (${entSz}) em .symtab", "",
+                "", "E5005")
+        }
+        const nSyms: inteiro = sTab.shSize \ entSz
+        para (var s: inteiro = 0; s < nSyms; s++) {
+            const p: inteiro = sTab.shOffset + s * entSz
+            se (p + 24 > nBytes) {
+                diag.erroDireto(nomeArq, 0, 0, "entrada .symtab #${s} fora dos limites",
+                    "", "", "E5005")
+            }
+            const stName: inteiro = ec.lerU32LE(dados, p)
+            const stInfo: inteiro = dados[p + 4] & 255
+            const stShndx: inteiro = ec.lerU16LE(dados, p + 6)
+            const stValue: inteiro = ec.lerU64LE(dados, p + 8)
+            const stSize: inteiro = ec.lerU64LE(dados, p + 16)
+            se (stName < 0 ou (stName > 0 e stName >= strSec.shSize)) {
+                diag.erroDireto(nomeArq, 0, 0, "offset st_name (${stName}) fora de .strtab no simbolo #${s}",
+                    "", "", "E5005")
+            }
+            const nomeSym: texto = ec.lerCStringLim(dados, strSec.shOffset + stName, strFim,
+                bytesMod)
+            obj.simbolos.empilhar(SimboloElfLido(nomeSym, stInfo >> 4, stInfo & 15, stShndx,
+                stValue, stSize))
+        }
+    }
+
+    // Le e valida todas as secoes SHT_RELA
+    para (var i: inteiro = 0; i < obj.secoes.tamanho(); i++) {
+        const sec: SecaoElfLida = obj.secoes[i]
+        se (sec.shType != ec.SHT_RELA) continua
+        se (sec.shInfo < 0 ou sec.shInfo >= obj.secoes.tamanho()) {
+            diag.erroDireto(nomeArq, 0, 0, "secao alvo de relocacao sh_info (${sec.shInfo}) fora dos limites",
+                "", "", "E5006")
+        }
+        const entSz: inteiro = sec.shEntSize > 0 ? sec.shEntSize : 24
+        se (entSz < 24 ou entSz > 1024) {
+            diag.erroDireto(nomeArq, 0, 0, "sh_entsize invalido (${entSz}) em secao RELA",
+                "", "", "E5006")
+        }
+        const nRel: inteiro = sec.shSize \ entSz
+        para (var r: inteiro = 0; r < nRel; r++) {
+            const p: inteiro = sec.shOffset + r * entSz
+            se (p + 24 > nBytes) {
+                diag.erroDireto(nomeArq, 0, 0, "entrada RELA #${r} fora dos limites", "",
+                    "", "E5006")
+            }
+            const rOff: inteiro = ec.lerU64LE(dados, p)
+            const rInfo: inteiro = ec.lerU64LE(dados, p + 8)
+            const rAdd: inteiro = ec.lerU64LE(dados, p + 16)
+            const symIdx: inteiro = (rInfo >> 32) & 4294967295
+            const rType: inteiro = rInfo & 4294967295
+            se (symIdx < 0 ou symIdx >= obj.simbolos.tamanho()) {
+                diag.erroDireto(nomeArq, 0, 0, "indice de simbolo invalido (${symIdx}) em relocacao #${r}",
+                    "", "", "E5006")
+            }
+            se (rOff < 0) {
+                diag.erroDireto(nomeArq, 0, 0, "offset de relocacao negativo (${rOff}) na secao '${sec.nome}'",
+                    "", "", "E5006")
+            }
+            obj.relocs.empilhar(RelocElfLida(sec.shInfo, rOff, symIdx, rType, rAdd))
+        }
+    }
+
+    retorna obj
+}

@@ -1,0 +1,365 @@
+// Avaliador de expressoes constantes inteiras para diretivas #if e #elif (ISO C99 6.10.1).
+// Suporta curto-circuito seguro, aritmetica signed/unsigned de 64 bits, protecao contra
+// divisao por zero, INT64_MIN / -1, profundidade excessiva e tokens residuais.
+
+funcao unsignedLt64(a: inteiro, b: inteiro): logico {
+    se ((a < 0) != (b < 0)) retorna b < 0
+    retorna a < b
+}
+
+funcao unsignedLe64(a: inteiro, b: inteiro): logico {
+    retorna a == b ou unsignedLt64(a, b)
+}
+
+funcao codigoCharPP(lit: texto): inteiro {
+    const litMod: qualquer = importar("../lexer/literais.delegua")
+    var s: texto = lit
+    se (s.tamanho() >= 4 e (s[0] == "L" ou s[0] == "u" ou s[0] == "U") e s[1] == "'") {
+        s = s.fatiar(1, s.tamanho())
+    }
+
+    se (s.tamanho() < 3) retorna 0
+    se (s[1] == "\\" e s.tamanho() >= 4) {
+        const dec: (inteiro, inteiro) = litMod.decodificarEscapeC99(s, 2, s.tamanho() - 1)
+        retorna dec[0]
+    }
+
+    retorna litMod.codigoChar(s[1])
+}
+
+classe ValPP {
+    valor: inteiro
+    ehSemSinal: logico
+
+    construtor(valor: inteiro, ehSemSinal: logico = falso) {
+        isto.valor = valor
+        isto.ehSemSinal = ehSemSinal
+    }
+}
+
+classe AvaliadorExprPP {
+    toks: qualquer[]
+    pos: inteiro
+    diag: qualquer
+    arquivo: texto
+    linha: inteiro
+    trecho: texto
+    pilhaInc: texto[]
+    profundidade: inteiro
+    litMod: qualquer
+    TokKind: qualquer
+
+    construtor(toks: qualquer[], diag: qualquer, arquivo: texto, linha: inteiro, TokKind: qualquer,
+        trecho: texto = "", pilhaInc: texto[] = []) {
+        isto.toks = toks
+        isto.pos = 0
+        isto.diag = diag
+        isto.arquivo = arquivo
+        isto.linha = linha
+        isto.trecho = trecho
+        isto.pilhaInc = pilhaInc
+        isto.profundidade = 0
+        isto.litMod = importar("../lexer/literais.delegua")
+        isto.TokKind = TokKind
+    }
+
+    entrar(): vazio {
+        isto.profundidade++
+        se (isto.profundidade > 128) {
+            isto.diag.erroDireto(isto.arquivo, isto.linha, 1, "profundidade maxima de expressao em #if excedida (limite 128)",
+                isto.trecho, "", "E1005", 1, isto.pilhaInc)
+        }
+    }
+
+    sair(): vazio {
+        isto.profundidade--
+    }
+
+    atual(): qualquer {
+        se (isto.pos >= isto.toks.tamanho()) retorna nulo
+        retorna isto.toks[isto.pos]
+    }
+
+    atualVal(): texto {
+        const t: qualquer = isto.atual()
+        se (t == nulo) retorna ""
+        retorna t.val
+    }
+
+    avancar(): qualquer {
+        const t: qualquer = isto.atual()
+        se (isto.pos < isto.toks.tamanho()) isto.pos++
+        retorna t
+    }
+
+    avaliar(): inteiro {
+        se (isto.toks.tamanho() == 0) {
+            isto.diag.erroDireto(isto.arquivo, isto.linha, 1, "expressao vazia em diretiva #if/#elif",
+                isto.trecho, "", "E1004", 1, isto.pilhaInc)
+        }
+        const res: ValPP = isto.parseVirgula(verdadeiro)
+        se (isto.pos < isto.toks.tamanho()) {
+            const sobra: qualquer = isto.atual()
+            isto.diag.erroDireto(isto.arquivo, isto.linha, 1, "token inesperado apos expressao em #if/#elif: '${sobra.val}'",
+                isto.trecho, "", "E1007", 1, isto.pilhaInc)
+        }
+        retorna res.valor
+    }
+
+    parseVirgula(ativo: logico): ValPP {
+        isto.entrar()
+        var esq: ValPP = isto.parseTernario(ativo)
+        enquanto (isto.atualVal() == ",") {
+            isto.avancar()
+            esq = isto.parseTernario(ativo)
+        }
+        isto.sair()
+        retorna esq
+    }
+
+    parseTernario(ativo: logico): ValPP {
+        isto.entrar()
+        const cond: ValPP = isto.parseOrLog(ativo)
+        se (isto.atualVal() == "?") {
+            isto.avancar()
+            const sim: ValPP = isto.parseTernario(ativo e cond.valor != 0)
+            se (isto.atualVal() != ":") {
+                isto.diag.erroDireto(isto.arquivo, isto.linha, 1, "':' esperado em expressao #if",
+                    isto.trecho, "", "E1008", 1, isto.pilhaInc)
+            }
+            isto.avancar()
+            const naoVal: ValPP = isto.parseTernario(ativo e cond.valor == 0)
+            isto.sair()
+            const uns: logico = sim.ehSemSinal ou naoVal.ehSemSinal
+            retorna ValPP(cond.valor != 0 ? sim.valor : naoVal.valor, uns)
+        }
+        isto.sair()
+        retorna cond
+    }
+
+    parseOrLog(ativo: logico): ValPP {
+        var esq: ValPP = isto.parseAndLog(ativo)
+        enquanto (isto.atualVal() == "||") {
+            isto.avancar()
+            const dir: ValPP = isto.parseAndLog(ativo e esq.valor == 0)
+            esq = ValPP((esq.valor != 0 ou dir.valor != 0) ? 1 : 0, falso)
+        }
+        retorna esq
+    }
+
+    parseAndLog(ativo: logico): ValPP {
+        var esq: ValPP = isto.parseBitOr(ativo)
+        enquanto (isto.atualVal() == "&&") {
+            isto.avancar()
+            const dir: ValPP = isto.parseBitOr(ativo e esq.valor != 0)
+            esq = ValPP((esq.valor != 0 e dir.valor != 0) ? 1 : 0, falso)
+        }
+        retorna esq
+    }
+
+    parseBitOr(ativo: logico): ValPP {
+        var esq: ValPP = isto.parseBitXor(ativo)
+        enquanto (isto.atualVal() == "|") {
+            isto.avancar()
+            const dir: ValPP = isto.parseBitXor(ativo)
+            esq = ValPP(esq.valor | dir.valor, esq.ehSemSinal ou dir.ehSemSinal)
+        }
+        retorna esq
+    }
+
+    parseBitXor(ativo: logico): ValPP {
+        var esq: ValPP = isto.parseBitAnd(ativo)
+        enquanto (isto.atualVal() == "^") {
+            isto.avancar()
+            const dir: ValPP = isto.parseBitAnd(ativo)
+            esq = ValPP(esq.valor ^ dir.valor, esq.ehSemSinal ou dir.ehSemSinal)
+        }
+        retorna esq
+    }
+
+    parseBitAnd(ativo: logico): ValPP {
+        var esq: ValPP = isto.parseIgualdade(ativo)
+        enquanto (isto.atualVal() == "&") {
+            isto.avancar()
+            const dir: ValPP = isto.parseIgualdade(ativo)
+            esq = ValPP(esq.valor & dir.valor, esq.ehSemSinal ou dir.ehSemSinal)
+        }
+        retorna esq
+    }
+
+    parseIgualdade(ativo: logico): ValPP {
+        var esq: ValPP = isto.parseRel(ativo)
+        enquanto (isto.atualVal() == "==" ou isto.atualVal() == "!=") {
+            const op: texto = isto.avancar().val
+            const dir: ValPP = isto.parseRel(ativo)
+            se (op == "==") esq = ValPP(esq.valor == dir.valor ? 1 : 0, falso)
+            senao esq = ValPP(esq.valor != dir.valor ? 1 : 0, falso)
+        }
+        retorna esq
+    }
+
+    parseRel(ativo: logico): ValPP {
+        var esq: ValPP = isto.parseShift(ativo)
+        enquanto (isto.atualVal() == "<" ou isto.atualVal() == "<=" ou isto.atualVal() == ">" ou isto.atualVal() == ">=") {
+            const op: texto = isto.avancar().val
+            const dir: ValPP = isto.parseShift(ativo)
+            const uns: logico = esq.ehSemSinal ou dir.ehSemSinal
+            var ok: logico = falso
+            se (uns) {
+                se (op == "<") ok = unsignedLt64(esq.valor, dir.valor)
+                senao se (op == "<=") ok = unsignedLe64(esq.valor, dir.valor)
+                senao se (op == ">") ok = unsignedLt64(dir.valor, esq.valor)
+                senao ok = unsignedLe64(dir.valor, esq.valor)
+            } senao {
+                se (op == "<") ok = esq.valor < dir.valor
+                senao se (op == "<=") ok = esq.valor <= dir.valor
+                senao se (op == ">") ok = esq.valor > dir.valor
+                senao ok = esq.valor >= dir.valor
+            }
+            esq = ValPP(ok ? 1 : 0, falso)
+        }
+        retorna esq
+    }
+
+    parseShift(ativo: logico): ValPP {
+        var esq: ValPP = isto.parseAdd(ativo)
+        enquanto (isto.atualVal() == "<<" ou isto.atualVal() == ">>") {
+            const op: texto = isto.avancar().val
+            const dir: ValPP = isto.parseAdd(ativo)
+            const sh: inteiro = dir.valor
+            se (sh < 0 ou sh >= 64) {
+                esq = ValPP(0, esq.ehSemSinal)
+            } senao se (op == "<<") {
+                esq = ValPP(esq.valor << sh, esq.ehSemSinal)
+            } senao {
+                se (esq.ehSemSinal e esq.valor < 0 e sh > 0) {
+                    const semSinal: inteiro = (esq.valor >> sh) & ((1 << (64 - sh)) - 1)
+                    esq = ValPP(semSinal, verdadeiro)
+                } senao {
+                    esq = ValPP(esq.valor >> sh, esq.ehSemSinal)
+                }
+            }
+        }
+        retorna esq
+    }
+
+    parseAdd(ativo: logico): ValPP {
+        var esq: ValPP = isto.parseMul(ativo)
+        enquanto (isto.atualVal() == "+" ou isto.atualVal() == "-") {
+            const op: texto = isto.avancar().val
+            const dir: ValPP = isto.parseMul(ativo)
+            const uns: logico = esq.ehSemSinal ou dir.ehSemSinal
+            se (op == "+") esq = ValPP(esq.valor + dir.valor, uns)
+            senao esq = ValPP(esq.valor - dir.valor, uns)
+        }
+        retorna esq
+    }
+
+    parseMul(ativo: logico): ValPP {
+        var esq: ValPP = isto.parseUnario(ativo)
+        const int64Min: inteiro = -9223372036854775807 - 1
+        enquanto (isto.atualVal() == "*" ou isto.atualVal() == "/" ou isto.atualVal() == "%") {
+            const op: texto = isto.avancar().val
+            const dir: ValPP = isto.parseUnario(ativo)
+            const uns: logico = esq.ehSemSinal ou dir.ehSemSinal
+            se (op == "*") {
+                esq = ValPP(esq.valor * dir.valor, uns)
+            } senao se (dir.valor == 0) {
+                se (ativo) {
+                    isto.diag.erroDireto(isto.arquivo, isto.linha, 1, "divisao por zero em diretiva #if",
+                        isto.trecho, "", "E1006", 1, isto.pilhaInc)
+                }
+                esq = ValPP(0, uns)
+            } senao se (esq.valor == int64Min e dir.valor == -1 e !uns) {
+                se (op == "/") esq = ValPP(int64Min, falso)
+                senao esq = ValPP(0, falso)
+            } senao se (op == "/") {
+                esq = ValPP(esq.valor \ dir.valor, uns)
+            } senao {
+                esq = ValPP(esq.valor % dir.valor, uns)
+            }
+        }
+        retorna esq
+    }
+
+    parseUnario(ativo: logico): ValPP {
+        isto.entrar()
+        const v: texto = isto.atualVal()
+        se (v == "+") {
+            isto.avancar()
+            const r: ValPP = isto.parseUnario(ativo)
+            isto.sair()
+            retorna r
+        }
+        se (v == "-") {
+            isto.avancar()
+            const r: ValPP = isto.parseUnario(ativo)
+            isto.sair()
+            retorna ValPP(-r.valor, r.ehSemSinal)
+        }
+        se (v == "!") {
+            isto.avancar()
+            const r: ValPP = isto.parseUnario(ativo)
+            isto.sair()
+            retorna ValPP(r.valor == 0 ? 1 : 0, falso)
+        }
+        se (v == "~") {
+            isto.avancar()
+            const r: ValPP = isto.parseUnario(ativo)
+            isto.sair()
+            retorna ValPP(~r.valor, r.ehSemSinal)
+        }
+        const prim: ValPP = isto.parsePrimario(ativo)
+        isto.sair()
+        retorna prim
+    }
+
+    parsePrimario(ativo: logico): ValPP {
+        const t: qualquer = isto.atual()
+        se (t == nulo) {
+            se (!ativo) retorna ValPP(0, falso)
+            isto.diag.erroDireto(isto.arquivo, isto.linha, 1, "fim inesperado de expressao em diretiva #if",
+                isto.trecho, "", "E1008", 1, isto.pilhaInc)
+        }
+        se (t.val == "(") {
+            isto.avancar()
+            const v: ValPP = isto.parseVirgula(ativo)
+            se (isto.atualVal() != ")") {
+                isto.diag.erroDireto(isto.arquivo, isto.linha, 1, "')' esperado em diretiva #if",
+                    isto.trecho, "", "E1008", 1, isto.pilhaInc)
+            }
+            isto.avancar()
+            retorna v
+        }
+        se (t.kind == isto.TokKind.Num) {
+            isto.avancar()
+            const info: (inteiro, logico, logico) = isto.litMod.parseInteiroC99(t.val)
+            retorna ValPP(info[0], info[1])
+        }
+        se (t.kind == isto.TokKind.Char) {
+            isto.avancar()
+            retorna ValPP(codigoCharPP(t.val), falso)
+        }
+        se (t.kind == isto.TokKind.Ident) {
+            isto.avancar()
+            // Em ramos mortos de #if (ex: 0 && macro_indef(x)), consome argumentos se houver '('
+            se (!ativo e isto.atualVal() == "(") {
+                isto.avancar()
+                var d: inteiro = 1
+                enquanto (d > 0 e isto.atual() != nulo) {
+                    se (isto.atualVal() == "(") d++
+                    senao se (isto.atualVal() == ")") d--
+                    isto.avancar()
+                }
+            }
+            retorna ValPP(0, falso)
+        }
+        se (!ativo) {
+            isto.avancar()
+            retorna ValPP(0, falso)
+        }
+        isto.diag.erroDireto(isto.arquivo, isto.linha, 1, "token inesperado em diretiva #if: '" + t.val + "'",
+            isto.trecho, "", "E1008", 1, isto.pilhaInc)
+        retorna ValPP(0, falso)
+    }
+}

@@ -1,99 +1,116 @@
 // Driver CLI completo do DCC (Delegua C Compiler).
 // Suporta compilacao de .c -> -E / -S / -c (.o ELF64) / executavel ELF64 via linker nativo,
-// combinando arquivos .c e .o (inclusive objetos produzidos por GCC/Clang).
+// combinando arquivos .c, .o e bibliotecas estaticas .a (inclusive objetos de GCC/Clang).
+// Utiliza a biblioteca padrao CGD (cgd:io, cgd:caminhos, cgd:textos, cgd:arquivos, cgd:bytes,
+// cgd:processo, cgd:tempo) e envia todos os erros e avisos exclusivamente para stderr.
 
-funcao subtextoCli(s: texto, ini: inteiro, fim: inteiro): texto {
-    var out: texto[] = []
-    para (var i: inteiro = ini; i < fim e i < s.tamanho(); i++) out.empilhar(s[i])
-    retorna out.juntar("")
+@definicao(biblioteca = "c", abi = "c")
+classe estrangeira LibCChmod {
+    @definicao(simbolo = "chmod")
+    estatico chmodArq(caminho: texto, modo: inteiro): inteiro;
 }
 
-funcao terminaCom(s: texto, suf: texto): logico {
-    se (s.tamanho() < suf.tamanho()) retorna falso
-    const off: inteiro = s.tamanho() - suf.tamanho()
-    para (var i: inteiro = 0; i < suf.tamanho(); i++) {
-        se (s[off + i] != suf[i]) retorna falso
-    }
-
-    retorna verdadeiro
+funcao escreverErro(msg: texto): vazio {
+    const ioMod: qualquer = importar("cgd:io")
+    ioMod.IO.erroLinha(msg)
 }
 
-funcao trocarExtensao(caminho: texto, novaExt: texto): texto {
-    var ultimoPonto: inteiro = -1
-    var ultimaBarra: inteiro = -1
-    para (var i: inteiro = 0; i < caminho.tamanho(); i++) {
-        se (caminho[i] == ".") ultimoPonto = i
-        senao se (caminho[i] == "/") ultimaBarra = i
-    }
-
-    const iniNome: inteiro = ultimaBarra >= 0 ? ultimaBarra + 1 : 0
-    const fimBase: inteiro = ultimoPonto > ultimaBarra ? ultimoPonto : caminho.tamanho()
-    retorna subtextoCli(caminho, iniNome, fimBase) + novaExt
+funcao trocarExtensaoLocal(caminho: texto, novaExt: texto): texto {
+    const camMod: qualquer = importar("cgd:caminhos")
+    const baseNome: texto = camMod.Caminhos.nome(caminho)
+    retorna camMod.Caminhos.semExtensao(baseNome) + novaExt
 }
 
+// Grava buffer binario em disco sem interpolar caminhos em comando shell;
+// aplica permissao 0755 diretamente via syscall POSIX chmod (FFI).
 funcao gravarBinario(caminhoSaida: texto, vetorBytes: inteiro[], executavel: logico): vazio {
     const bytesMod: qualquer = importar("cgd:bytes")
     const procMod: qualquer = importar("cgd:processo")
     const b: qualquer = bytesMod.Bytes.deVetor(vetorBytes)
-    const cmd: texto = executavel ? "base64 -d > \"$1\" && chmod +x \"$1\"" : "base64 -d > \"$1\""
-    const res: qualquer = procMod.Processo.executar("/bin/sh", ["-c", cmd, "_", caminhoSaida],
-        "", {}, 15000, 65536, b.paraBase64())
+    const res: qualquer = procMod.Processo.executar("/bin/sh", [
+        "-c",
+        "exec base64 -d > \"$1\"",
+        "_",
+        caminhoSaida
+    ], "", {}, 15000, 65536, b.paraBase64())
     res.exigirSucesso()
+    se (executavel) {
+        LibCChmod.chmodArq(caminhoSaida, 493) // 0755
+    }
 }
 
 funcao lerBinario(caminho: texto): inteiro[] {
     const bytesMod: qualquer = importar("cgd:bytes")
     const procMod: qualquer = importar("cgd:processo")
     const res: qualquer = procMod.Processo.executar("base64", ["-w", "0", caminho], "", {},
-        15000, 33554432)
+        15000, 67108864)
     res.exigirSucesso()
     const b64: texto = res.saidaPadrao().aparar()
     retorna bytesMod.Bytes.deBase64(b64).paraVetor()
 }
 
-funcao mapearNomeBiblioteca(nomeL: texto, dirsLib: texto[]): texto {
-    se (nomeL == "m") retorna "libm.so.6"
-    se (nomeL == "c") retorna "libc.so.6"
-    se (nomeL == "pthread") retorna "libpthread.so.0"
-    se (nomeL == "dl") retorna "libdl.so.2"
-    se (nomeL == "rt") retorna "librt.so.1"
+// Busca primeiro biblioteca estatica lib<nome>.a em -L; se nao achar, mapeia para .so dinamica.
+funcao resolverBibliotecaCli(nomeL: texto, dirsLib: texto[]): (texto, logico) {
     const arquivos: qualquer = importar("cgd:arquivos")
+    const camMod: qualquer = importar("cgd:caminhos")
     para (var i: inteiro = 0; i < dirsLib.tamanho(); i++) {
-        const cand: texto = dirsLib[i] + "/lib" + nomeL + ".so"
-        se (arquivos.Arquivo(cand).existe()) retorna cand
+        const candA: texto = camMod.Caminhos.juntar([dirsLib[i], "lib" + nomeL + ".a"])
+        se (arquivos.Arquivo(candA).existe()) retorna tupla([candA, verdadeiro])
     }
 
-    retorna "lib" + nomeL + ".so"
-}
+    se (nomeL == "m") retorna tupla(["libm.so.6", falso])
+    se (nomeL == "c") retorna tupla(["libc.so.6", falso])
+    se (nomeL == "pthread") retorna tupla(["libpthread.so.0", falso])
+    se (nomeL == "dl") retorna tupla(["libdl.so.2", falso])
+    se (nomeL == "rt") retorna tupla(["librt.so.1", falso])
+    para (var i: inteiro = 0; i < dirsLib.tamanho(); i++) {
+        const candSo: texto = camMod.Caminhos.juntar([dirsLib[i], "lib" + nomeL + ".so"])
+        se (arquivos.Arquivo(candSo).existe()) retorna tupla([candSo, falso])
+    }
 
-funcao escreverErro(msg: texto): vazio {
-    const nativo: qualquer = importar("cgd:nativo").Primitivas
-    nativo.sistemaEscrever(msg + "\n", verdadeiro)
+    retorna tupla(["lib" + nomeL + ".so", falso])
 }
 
 funcao imprimirAjuda(): vazio {
-    escreva("Uso: dcc [opcoes] arquivo1.c|arquivo1.o [arquivo2...]")
+    escreva("Uso: dcc [opcoes] arquivo1.c|arquivo1.o|lib.a [arquivo2...]")
     escreva("")
-    escreva("DCC - Delegua C Compiler v0.1.0 (Linux x86-64 / System V AMD64 ABI)")
+    escreva("DCC - Delegua C Compiler v0.2.0 (Linux x86-64 / System V AMD64 ABI)")
     escreva("")
     escreva("Opcoes:")
-    escreva("  -o <arquivo>        Define o arquivo de saida (padrao: a.out)")
-    escreva("  -c                  Compila e monta para objeto relocavel ELF64 (.o) sem linkar")
-    escreva("  -S                  Emite Assembly x86-64 (Intel) sem montar")
-    escreva("  -E                  Executa apenas o pre-processador C99/GNU99")
-    escreva("  -I <dir>            Adiciona diretorio de busca de headers")
-    escreva("  -D <MACRO[=VAL]>    Define macro no pre-processador")
-    escreva("  -U <MACRO>          Remove definicao de macro no pre-processador")
-    escreva("  -L <dir>            Adiciona diretorio de busca de bibliotecas compartilhadas")
-    escreva("  -l <lib>            Vincula biblioteca dinamica (ex: -lm -> libm.so.6)")
-    escreva("  -std=c99            Modo ISO C99 (padrao)")
-    escreva("  -std=gnu99          Modo C99 com extensoes GNU delimitadas")
-    escreva("  -O0, -O1, -O2, -O3  Nivel de otimizacao da IR SSA")
-    escreva("  -Wall, -Wextra      Ativa avisos adicionais")
-    escreva("  -Werror             Trata avisos como erros")
-    escreva("  -v                  Modo detalhado (verbose)")
-    escreva("  --version           Exibe versao e alvo")
-    escreva("  --help              Exibe esta ajuda")
+    escreva("  -o <arquivo>                 Define o arquivo de saida (padrao: a.out)")
+    escreva("  -c                           Compila para objeto relocavel ELF64 (.o) sem linkar")
+    escreva("  -S                           Emite Assembly x86-64 (Intel) sem montar")
+    escreva("  -E                           Executa apenas o pre-processador C99/GNU99")
+    escreva("  -I <dir>                     Adiciona diretorio de busca de headers")
+    escreva("  -D <MACRO[=VAL]>             Define macro no pre-processador")
+    escreva("  -U <MACRO>                   Remove definicao de macro no pre-processador")
+    escreva("  -L <dir>                     Adiciona diretorio de busca de bibliotecas (.a / .so)")
+    escreva("  -l <lib>                     Vincula biblioteca estatica (.a) ou dinamica (.so)")
+    escreva("  -std=c99                     Modo ISO C99 (padrao)")
+    escreva("  -std=gnu99                   Modo C99 com extensoes GNU delimitadas")
+    escreva("  -O0, -O1, -O2, -O3           Nivel de otimizacao da IR SSA")
+    escreva("  -Wall, -Wextra               Ativa avisos adicionais")
+    escreva("  -Werror                      Trata avisos como erros")
+    escreva("  -Wno-<categoria>             Suprime avisos da categoria especificada")
+    escreva("  -fdiagnostics-color=<modo>   Cores ANSI nos diagnosticos: auto, always, never")
+    escreva("  -fdiagnostics-format=<fmt>   Formato de diagnosticos: text, json")
+    escreva("  -ftime-report                Exibe tempo detalhado por fase de compilacao em stderr")
+    escreva("  -v                           Modo detalhado (verbose)")
+    escreva("  --version                    Exibe versao e alvo")
+    escreva("  --help                       Exibe esta ajuda")
+}
+
+funcao emitirAvisosDiag(diag: qualquer): vazio {
+    se (diag.formatoJson) {
+        se (diag.itens.tamanho() > 0) {
+            escreverErro(diag.serializarItensJson())
+        }
+        retorna
+    }
+
+    para (var w: inteiro = 0; w < diag.avisos.tamanho(); w++) {
+        escreverErro(diag.avisos[w])
+    }
 }
 
 funcao executarDriverDCC(args: texto[]): inteiro {
@@ -108,6 +125,8 @@ funcao executarDriverDCC(args: texto[]): inteiro {
     const elfObjMod: qualquer = importar("../object/elf/elf_obj.delegua")
     const lnkMod: qualquer = importar("../linker/linker.delegua")
     const arquivos: qualquer = importar("cgd:arquivos")
+    const texMod: qualquer = importar("cgd:textos")
+    const tempoMod: qualquer = importar("cgd:tempo")
 
     se (args.tamanho() == 0) {
         escreverErro("dcc: error: nenhum arquivo de entrada especificado (use --help)")
@@ -129,6 +148,10 @@ funcao executarDriverDCC(args: texto[]): inteiro {
     var wall: logico = falso
     var wextra: logico = falso
     var werror: logico = falso
+    var modoCor: texto = "auto"
+    var formatoJson: logico = falso
+    var catsDesab: dicionario = {}
+    var timeReport: logico = falso
     var verbose: logico = falso
 
     var i: inteiro = 0
@@ -138,7 +161,7 @@ funcao executarDriverDCC(args: texto[]): inteiro {
             imprimirAjuda()
             retorna 0
         } senao se (a == "--version") {
-            escreva("dcc (Delegua C Compiler) 0.1.0")
+            escreva("dcc (Delegua C Compiler) 0.2.0")
             escreva("Target: x86_64-linux-gnu (System V AMD64 ABI)")
             escreva("Implementation: Delegua / CGD")
             retorna 0
@@ -156,8 +179,8 @@ funcao executarDriverDCC(args: texto[]): inteiro {
             }
             dirsInclude.empilhar(args[i + 1])
             i = i + 2
-        } senao se (a.tamanho() > 2 e a[0] == "-" e a[1] == "I") {
-            dirsInclude.empilhar(subtextoCli(a, 2, a.tamanho()))
+        } senao se (a.tamanho() > 2 e texMod.Textos.comecaCom(a, "-I")) {
+            dirsInclude.empilhar(a.fatiar(2, a.tamanho()))
             i++
         } senao se (a == "-D") {
             se (i + 1 >= args.tamanho()) {
@@ -166,8 +189,8 @@ funcao executarDriverDCC(args: texto[]): inteiro {
             }
             defsCli.empilhar(args[i + 1])
             i = i + 2
-        } senao se (a.tamanho() > 2 e a[0] == "-" e a[1] == "D") {
-            defsCli.empilhar(subtextoCli(a, 2, a.tamanho()))
+        } senao se (a.tamanho() > 2 e texMod.Textos.comecaCom(a, "-D")) {
+            defsCli.empilhar(a.fatiar(2, a.tamanho()))
             i++
         } senao se (a == "-U") {
             se (i + 1 >= args.tamanho()) {
@@ -176,8 +199,8 @@ funcao executarDriverDCC(args: texto[]): inteiro {
             }
             undefsCli.empilhar(args[i + 1])
             i = i + 2
-        } senao se (a.tamanho() > 2 e a[0] == "-" e a[1] == "U") {
-            undefsCli.empilhar(subtextoCli(a, 2, a.tamanho()))
+        } senao se (a.tamanho() > 2 e texMod.Textos.comecaCom(a, "-U")) {
+            undefsCli.empilhar(a.fatiar(2, a.tamanho()))
             i++
         } senao se (a == "-L") {
             se (i + 1 >= args.tamanho()) {
@@ -186,8 +209,8 @@ funcao executarDriverDCC(args: texto[]): inteiro {
             }
             dirsLib.empilhar(args[i + 1])
             i = i + 2
-        } senao se (a.tamanho() > 2 e a[0] == "-" e a[1] == "L") {
-            dirsLib.empilhar(subtextoCli(a, 2, a.tamanho()))
+        } senao se (a.tamanho() > 2 e texMod.Textos.comecaCom(a, "-L")) {
+            dirsLib.empilhar(a.fatiar(2, a.tamanho()))
             i++
         } senao se (a == "-l") {
             se (i + 1 >= args.tamanho()) {
@@ -196,8 +219,8 @@ funcao executarDriverDCC(args: texto[]): inteiro {
             }
             libsCli.empilhar(args[i + 1])
             i = i + 2
-        } senao se (a.tamanho() > 2 e a[0] == "-" e a[1] == "l") {
-            libsCli.empilhar(subtextoCli(a, 2, a.tamanho()))
+        } senao se (a.tamanho() > 2 e texMod.Textos.comecaCom(a, "-l")) {
+            libsCli.empilhar(a.fatiar(2, a.tamanho()))
             i++
         } senao se (a == "-E") {
             somentePreproc = verdadeiro
@@ -235,6 +258,21 @@ funcao executarDriverDCC(args: texto[]): inteiro {
         } senao se (a == "-Werror") {
             werror = verdadeiro
             i++
+        } senao se (texMod.Textos.comecaCom(a, "-Wno-") e a.tamanho() > 5) {
+            catsDesab[a.fatiar(5, a.tamanho())] = verdadeiro
+            i++
+        } senao se (a == "-fdiagnostics-color=auto" ou a == "-fdiagnostics-color=always" ou a == "-fdiagnostics-color=never") {
+            modoCor = a.fatiar(20, a.tamanho())
+            i++
+        } senao se (a == "-fdiagnostics-format=text") {
+            formatoJson = falso
+            i++
+        } senao se (a == "-fdiagnostics-format=json") {
+            formatoJson = verdadeiro
+            i++
+        } senao se (a == "-ftime-report") {
+            timeReport = verdadeiro
+            i++
         } senao se (a == "-v") {
             verbose = verdadeiro
             i++
@@ -267,13 +305,14 @@ funcao executarDriverDCC(args: texto[]): inteiro {
             para (var k: inteiro = 0; k < entradas.tamanho(); k++) {
                 const arq: qualquer = arquivos.Arquivo(entradas[k])
                 se (!arq.existe()) {
-                    escreva("dcc: error: arquivo nao encontrado: '${entradas[k]}'")
+                    escreverErro("dcc: error: arquivo nao encontrado: '${entradas[k]}'")
                     retorna 1
                 }
-                const diagPP: qualquer = diagMod.ContextoDiag(wall, wextra, werror)
+                const diagPP: qualquer = diagMod.ContextoDiag(wall, wextra, werror, modoCor,
+                    formatoJson, catsDesab)
                 const resP: (texto, inteiro) = preMod.preprocessarDCC(arq.ler(), entradas[k],
                     dirsInclude, defsCli, undefsCli, diagPP, modoGnu)
-                para (var w: inteiro = 0; w < diagPP.avisos.tamanho(); w++) escreva(diagPP.avisos[w])
+                emitirAvisosDiag(diagPP)
                 saidasPP.empilhar(resP[0])
             }
             const textoPP: texto = saidasPP.juntar("\n")
@@ -284,82 +323,130 @@ funcao executarDriverDCC(args: texto[]): inteiro {
 
         var objetosLinkar: qualquer[] = []
         var nomesObjetos: texto[] = []
+        var tPre: real = 0.0
+        var tLex: real = 0.0
+        var tPar: real = 0.0
+        var tSem: real = 0.0
+        var tIr: real = 0.0
+        var tOpt: real = 0.0
+        var tCg: real = 0.0
+        var tElf: real = 0.0
+        var tLnk: real = 0.0
+        const cron: qualquer = tempoMod.Cronometro()
 
         para (var k: inteiro = 0; k < entradas.tamanho(); k++) {
             const arqPath: texto = entradas[k]
             se (!arquivos.Arquivo(arqPath).existe()) {
-                escreva("dcc: error: arquivo nao encontrado: '${arqPath}'")
+                escreverErro("dcc: error: arquivo nao encontrado: '${arqPath}'")
                 retorna 1
             }
 
-            se (terminaCom(arqPath, ".o")) {
+            se (texMod.Textos.terminaCom(arqPath, ".o") ou texMod.Textos.terminaCom(arqPath,
+                ".a")) {
                 se (somenteObjeto ou somenteAsm) {
-                    escreva("dcc: error: arquivo objeto '${arqPath}' nao pode ser usado com -c ou -S")
+                    escreverErro("dcc: error: arquivo binario '${arqPath}' nao pode ser usado com -c ou -S")
                     retorna 1
                 }
-                se (verbose) escreva("[dcc] lendo objeto ELF64: ${arqPath}")
+                se (verbose) escreverErro("[dcc] lendo binario ELF64/ar: ${arqPath}")
                 objetosLinkar.empilhar(lerBinario(arqPath))
                 nomesObjetos.empilhar(arqPath)
                 continua
             }
 
-            // Compila unidade de traducao .c
-            const diag: qualquer = diagMod.ContextoDiag(wall, wextra, werror)
-            se (verbose) escreva("[dcc] pre-processando ${arqPath} (std=${modoGnu ? "gnu99" : "c99"})")
+            const diag: qualquer = diagMod.ContextoDiag(wall, wextra, werror, modoCor, formatoJson,
+                catsDesab)
+            se (verbose) escreverErro("[dcc] pre-processando ${arqPath} (std=${modoGnu ? "gnu99" : "c99"})")
+
+            cron.reiniciar()
             const resPre: (texto, inteiro) = preMod.preprocessarDCC(arquivos.Arquivo(arqPath).ler(),
                 arqPath, dirsInclude, defsCli, undefsCli, diag, modoGnu)
-            se (verbose) escreva("[dcc] includes resolvidos: ${resPre[1]}")
+            tPre = tPre + cron.milisegundos()
+            se (verbose) escreverErro("[dcc] includes resolvidos: ${resPre[1]}")
 
+            cron.reiniciar()
             const tokens: qualquer[] = lexMod.tokenizarDCC(resPre[0], diag, modoGnu)
+            tLex = tLex + cron.milisegundos()
+
+            cron.reiniciar()
             const ast: qualquer = parMod.analisarSintaxeDCC(tokens, diag, modoGnu)
+            tPar = tPar + cron.milisegundos()
+
+            cron.reiniciar()
             const resSema: qualquer = semMod.analisarSemanticaDCC(ast, diag, falso)
+            tSem = tSem + cron.milisegundos()
+
+            cron.reiniciar()
             const moduloSSA: qualquer = irMod.construirModuloSSA(ast, resSema.tabela)
+            tIr = tIr + cron.milisegundos()
+
+            cron.reiniciar()
             se (nivelOpt > 0) {
                 para (var p: inteiro = 0; p < nivelOpt; p++) {
                     irMod.otimizarModuloSSA(moduloSSA)
                 }
             }
             irMod.verificarModuloSSA(moduloSSA)
+            tOpt = tOpt + cron.milisegundos()
 
-            para (var w: inteiro = 0; w < diag.avisos.tamanho(); w++) escreva(diag.avisos[w])
+            emitirAvisosDiag(diag)
 
             se (somenteAsm) {
+                cron.reiniciar()
                 const codigoAsm: texto = asmMod.emitirAssemblyX86_64(moduloSSA)
-                const destAsm: texto = caminhoSaida.tamanho() > 0 ? caminhoSaida : trocarExtensao(arqPath,
+                tCg = tCg + cron.milisegundos()
+                const destAsm: texto = caminhoSaida.tamanho() > 0 ? caminhoSaida : trocarExtensaoLocal(arqPath,
                     ".s")
                 arquivos.Arquivo(destAsm).escrever(codigoAsm)
-                se (verbose) escreva("[dcc] assembly emitido em ${destAsm}")
+                se (verbose) escreverErro("[dcc] assembly emitido em ${destAsm}")
                 continua
             }
 
+            cron.reiniciar()
             const codObj: qualquer = cgMod.gerarCodigoObjetoX86_64(moduloSSA)
+            tCg = tCg + cron.milisegundos()
+
+            cron.reiniciar()
             const bytesObj: inteiro[] = elfObjMod.emitirObjetoELF64(codObj)
+            tElf = tElf + cron.milisegundos()
 
             se (somenteObjeto) {
-                const destObj: texto = caminhoSaida.tamanho() > 0 ? caminhoSaida : trocarExtensao(arqPath,
+                const destObj: texto = caminhoSaida.tamanho() > 0 ? caminhoSaida : trocarExtensaoLocal(arqPath,
                     ".o")
                 gravarBinario(destObj, bytesObj, falso)
-                se (verbose) escreva("[dcc] objeto ELF64 emitido em ${destObj} (${bytesObj.tamanho()} bytes)")
+                se (verbose) escreverErro("[dcc] objeto ELF64 emitido em ${destObj} (${bytesObj.tamanho()} bytes)")
             } senao {
                 objetosLinkar.empilhar(bytesObj)
                 nomesObjetos.empilhar(arqPath)
             }
         }
 
-        se (somenteAsm ou somenteObjeto) retorna 0
-
-        // Linkagem nativa ELF64 dos objetos (.o) para executavel dinamico
-        var libsMapeadas: texto[] = []
-        para (var k: inteiro = 0; k < libsCli.tamanho(); k++) {
-            libsMapeadas.empilhar(mapearNomeBiblioteca(libsCli[k], dirsLib))
+        se (!somenteAsm e !somenteObjeto) {
+            var libsDinamicas: texto[] = []
+            para (var k: inteiro = 0; k < libsCli.tamanho(); k++) {
+                const resLib: (texto, logico) = resolverBibliotecaCli(libsCli[k], dirsLib)
+                se (resLib[1]) {
+                    objetosLinkar.empilhar(lerBinario(resLib[0]))
+                    nomesObjetos.empilhar(resLib[0])
+                } senao {
+                    libsDinamicas.empilhar(resLib[0])
+                }
+            }
+            const diagLink: qualquer = diagMod.ContextoDiag(wall, wextra, werror, modoCor,
+                formatoJson, catsDesab)
+            se (verbose) escreverErro("[dcc] linkando ${objetosLinkar.tamanho()} entrada(s) ELF64/ar -> executavel")
+            cron.reiniciar()
+            const elfExec: inteiro[] = lnkMod.linkarObjetosELF64(objetosLinkar, nomesObjetos,
+                libsDinamicas, diagLink)
+            tLnk = tLnk + cron.milisegundos()
+            const destExec: texto = caminhoSaida.tamanho() > 0 ? caminhoSaida : "a.out"
+            gravarBinario(destExec, elfExec, verdadeiro)
+            se (verbose) escreverErro("[dcc] executavel ELF64 gerado em ${destExec} (${elfExec.tamanho()} bytes)")
         }
-        const diagLink: qualquer = diagMod.ContextoDiag(wall, wextra, werror)
-        se (verbose) escreva("[dcc] linkando ${objetosLinkar.tamanho()} objeto(s) ELF64 -> executavel")
-        const elfExec: inteiro[] = lnkMod.linkarObjetosELF64(objetosLinkar, nomesObjetos,
-            libsMapeadas, diagLink)
-        const destExec: texto = caminhoSaida.tamanho() > 0 ? caminhoSaida : "a.out"
-        gravarBinario(destExec, elfExec, verdadeiro)
-        se (verbose) escreva("[dcc] executavel ELF64 gerado em ${destExec} (${elfExec.tamanho()} bytes)")
+
+        se (timeReport) {
+            const totalMs: real = tPre + tLex + tPar + tSem + tIr + tOpt + tCg + tElf + tLnk
+            escreverErro("[dcc-time] preprocess=${inteiro(tPre)}ms lex=${inteiro(tLex)}ms parse=${inteiro(tPar)}ms sema=${inteiro(tSem)}ms ir=${inteiro(tIr)}ms opt+verify=${inteiro(tOpt)}ms codegen=${inteiro(tCg)}ms elf_obj=${inteiro(tElf)}ms link=${inteiro(tLnk)}ms total=${inteiro(totalMs)}ms")
+        }
         retorna 0
     } pegue (erro: Excecao) {
         escreverErro(erro.mensagem)

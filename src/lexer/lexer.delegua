@@ -1,109 +1,64 @@
 // Fase 1 + Fase 6 (concatenacao de strings adjacentes): Lexer ISO C99 / GNU99 para o DCC.
-// Usa dicionarios O(1), rastreamento exato de linha/coluna e diagnosticos estruturados.
+// Usa dicionarios O(1), rastreamento exato de linha/coluna, bytes exatos em literais string
+// (preservando '\0', octais e '\xNN'), literais hex-float C99 e diagnosticos estruturados.
 
 classe TokenC99 {
     tag: qualquer
     lexema: texto
+    bytesStr: inteiro[]
     linha: inteiro
     coluna: inteiro
     valorInt: inteiro
     valorReal: real
     ehSemSinal: logico
     ehLongo: logico
+    ehFloat32: logico
 
     construtor(tag: qualquer, lexema: texto, linha: inteiro, coluna: inteiro) {
         isto.tag = tag
         isto.lexema = lexema
+        isto.bytesStr = []
         isto.linha = linha
         isto.coluna = coluna
         isto.valorInt = 0
         isto.valorReal = 0.0
         isto.ehSemSinal = falso
         isto.ehLongo = falso
+        isto.ehFloat32 = falso
     }
 }
 
-funcao codigoAsciiChar(ch: texto): inteiro {
-    const tabela: texto = " !\"#$%&'()*+,-./0123456789:;<=>?@ABCDEFGHIJKLMNOPQRSTUVWXYZ[\\]^_`abcdefghijklmnopqrstuvwxyz{|}~"
-    se (ch == "\n") retorna 10
-    se (ch == "\t") retorna 9
-    se (ch == "\r") retorna 13
-    para (var i: inteiro = 0; i < tabela.tamanho(); i++) {
-        se (tabela[i] == ch) retorna 32 + i
-    }
-
-    retorna 0
-}
-
-funcao hexDigito(ch: texto): inteiro {
-    const hex: texto = "0123456789abcdef"
-    const lower: texto = ch.minusculo()
-    para (var i: inteiro = 0; i < 16; i++) {
-        se (hex[i] == lower) retorna i
-    }
-
-    retorna -1
-}
-
-funcao parseInteiroLit(lex: texto): (inteiro, logico, logico) {
-    var semSinal: logico = falso
-    var longo: logico = falso
+funcao parseFloatDecimal(lex: texto, diag: qualquer, linha: inteiro, col: inteiro): (real,
+    logico) {
     var fim: inteiro = lex.tamanho()
+    var ehF32: logico = falso
     enquanto (fim > 0) {
         const ch: texto = lex[fim - 1]
-        se (ch == "u" ou ch == "U") {
-            semSinal = verdadeiro
+        se (ch == "f" ou ch == "F") {
+            ehF32 = verdadeiro
             fim--
         } senao se (ch == "l" ou ch == "L") {
-            longo = verdadeiro
             fim--
         } senao {
             sustar
         }
     }
 
-    var buf: texto[] = []
-    para (var i: inteiro = 0; i < fim; i++) buf.empilhar(lex[i])
-    const s: texto = buf.juntar("")
-    se (s.tamanho() == 0) retorna tupla([0, semSinal, longo])
-
-    var val: inteiro = 0
-    se (s.tamanho() >= 2 e s[0] == "0" e (s[1] == "x" ou s[1] == "X")) {
-        para (var i: inteiro = 2; i < s.tamanho(); i++) {
-            const d: inteiro = hexDigito(s[i])
-            se (d >= 0) val = (val << 4) | d
-        }
-    } senao se (s.tamanho() >= 2 e s[0] == "0" e (s[1] == "b" ou s[1] == "B")) {
-        para (var i: inteiro = 2; i < s.tamanho(); i++) {
-            val = (val << 1) | (s[i] == "1" ? 1 : 0)
-        }
-    } senao se (s.tamanho() >= 2 e s[0] == "0") {
-        para (var i: inteiro = 1; i < s.tamanho(); i++) {
-            const d: inteiro = hexDigito(s[i])
-            se (d >= 0) val = (val << 3) | d
-        }
-    } senao {
-        // Parse digito a digito sem falhar em UINT64_MAX (18446744073709551615UL)
-        para (var i: inteiro = 0; i < s.tamanho(); i++) {
-            const d: inteiro = hexDigito(s[i])
-            se (d >= 0) val = val * 10 + d
-        }
+    const limpo: texto = lex.fatiar(0, fim)
+    tente {
+        retorna tupla([real(limpo), ehF32])
+    } pegue (erro: Excecao) {
+        diag.erroEm(linha, col, "literal de ponto flutuante invalido '${lex}'", "", "E2003",
+            lex.tamanho())
+        retorna tupla([0.0, ehF32])
     }
-
-    se (val > 2147483647 ou val < -2147483648) longo = verdadeiro
-    retorna tupla([val, semSinal, longo])
-}
-
-funcao parseFloatLit(lex: texto): real {
-    var fim: inteiro = lex.tamanho()
-    enquanto (fim > 0 e "fFlL".contem(lex[fim - 1])) fim--
-    var buf: texto[] = []
-    para (var i: inteiro = 0; i < fim; i++) buf.empilhar(lex[i])
-    retorna real(buf.juntar(""))
 }
 
 classe LexerDCC {
     tMod: qualquer
+    litMod: qualquer
+    cls: qualquer
+    bytesMod: qualquer
     Tok: qualquer
     diag: qualquer
     modoGnu: logico
@@ -111,10 +66,12 @@ classe LexerDCC {
     opsTriplos: dicionario
     opsDuplos: dicionario
     opsSimples: dicionario
-    escapes: dicionario
 
     construtor(diag: qualquer, modoGnu: logico = falso) {
         isto.tMod = importar("../types/tipos.delegua")
+        isto.litMod = importar("literais.delegua")
+        isto.cls = isto.litMod.ClassificadorChar()
+        isto.bytesMod = importar("cgd:bytes")
         isto.Tok = isto.tMod.TokC99
         isto.diag = diag
         isto.modoGnu = modoGnu
@@ -241,15 +198,6 @@ classe LexerDCC {
             ";": isto.Tok.Semi,
             ",": isto.Tok.Comma
         }
-
-        isto.escapes = {
-            "n": "\n",
-            "t": "\t",
-            "r": "\r",
-            "\\": "\\",
-            "\"": "\"",
-            "'": "'"
-        }
     }
 
     tokenizar(fonte: texto): TokenC99[] {
@@ -261,7 +209,8 @@ classe LexerDCC {
                 emComentarioBloco)
         }
         se (emComentarioBloco) {
-            isto.diag.erroEm(linhasTexto.tamanho(), 1, "comentario de bloco nao fechado")
+            isto.diag.erroEm(linhasTexto.tamanho(), 1, "comentario de bloco nao fechado",
+                "", "E2001", 2)
         }
         out.empilhar(TokenC99(isto.Tok.Fim, "<fim>", linhasTexto.tamanho(), 1))
         retorna out
@@ -301,13 +250,21 @@ classe LexerDCC {
                 continua
             }
 
-            // String literal (com concatenacao automatica de strings adjacentes - C99 Fase 6)
+            // Prefixo L'...' para caractere largo (tratado como constante inteira wchar_t)
+            se (c == "L" e pos + 1 < n e fonte[pos + 1] == "'") {
+                pos++
+                col++
+                continua
+            }
+
+            // String literal (com bytes exatos e concatenacao automatica - C99 Fase 6)
             se (c == "\"") {
                 const colIni: inteiro = col
                 const linIni: inteiro = linha
                 pos++
                 col++
-                var chars: texto[] = []
+                var charsVis: texto[] = []
+                var bytesOut: inteiro[] = []
                 var fechouStr: logico = falso
                 enquanto (pos < n) {
                     const ch: texto = fonte[pos]
@@ -318,102 +275,69 @@ classe LexerDCC {
                         sustar
                     }
                     se (ch == "\\" e pos + 1 < n) {
-                        const esc: texto = fonte[pos + 1]
-                        se (isto.escapes.contem(esc)) {
-                            chars.empilhar(texto(isto.escapes[esc]))
-                            pos = pos + 2
-                            col = col + 2
-                        } senao se (esc == "0") {
-                            pos = pos + 2
-                            col = col + 2
-                        } senao {
-                            chars.empilhar(esc)
-                            pos = pos + 2
-                            col = col + 2
+                        const dec: (inteiro, inteiro) = isto.litMod.decodificarEscapeC99(fonte,
+                            pos + 1, n)
+                        const bVal: inteiro = dec[0]
+                        const cons: inteiro = dec[1]
+                        bytesOut.empilhar(bVal & 255)
+                        se (bVal >= 32 e bVal <= 126) {
+                            charsVis.empilhar(isto.cls.prim.caractereUnicode(bVal))
                         }
+                        pos = pos + 1 + cons
+                        col = col + 1 + cons
                         continua
                     }
-                    chars.empilhar(ch)
+                    charsVis.empilhar(ch)
+                    const chBytes: inteiro[] = isto.bytesMod.Bytes.deTexto(ch).paraVetor()
+                    para (var bi: inteiro = 0; bi < chBytes.tamanho(); bi++) {
+                        bytesOut.empilhar(chBytes[bi] & 255)
+                    }
                     pos++
                     col++
                 }
-                se (!fechouStr) isto.diag.erroEm(linIni, colIni, "string literal nao terminada")
-                const valorStr: texto = chars.juntar("")
+                se (!fechouStr) {
+                    isto.diag.erroEm(linIni, colIni, "string literal nao terminada", "",
+                        "E2002", 1)
+                }
+                const valorStr: texto = charsVis.juntar("")
                 se (out.tamanho() > 0 e out[out.tamanho() - 1].tag == isto.Tok.StrLit) {
-                    out[out.tamanho() - 1].lexema = out[out.tamanho() - 1].lexema + valorStr
+                    const prevT: TokenC99 = out[out.tamanho() - 1]
+                    prevT.lexema = prevT.lexema + valorStr
+                    para (var bi: inteiro = 0; bi < bytesOut.tamanho(); bi++) {
+                        prevT.bytesStr.empilhar(bytesOut[bi])
+                    }
                 } senao {
-                    out.empilhar(TokenC99(isto.Tok.StrLit, valorStr, linIni, colIni))
+                    const tokS: TokenC99 = TokenC99(isto.Tok.StrLit, valorStr, linIni, colIni)
+                    tokS.bytesStr = bytesOut
+                    out.empilhar(tokS)
                 }
                 continua
             }
 
-            // Char literal: 'a', '\n', '\0', '\x41'
+            // Char literal: 'a', '\n', '\0', '\012', '\x41'
             se (c == "'") {
                 const colIni: inteiro = col
                 pos++
                 col++
+                se (pos < n e fonte[pos] == "'") {
+                    isto.diag.erroEm(linha, colIni, "caractere literal vazio ''", "", "E2004",
+                        2)
+                }
                 var codigo: inteiro = 0
                 se (pos < n e fonte[pos] == "\\") {
-                    pos++
-                    col++
-                    se (pos < n) {
-                        const esc: texto = fonte[pos]
-                        se (esc == "n") {
-                            codigo = 10;
-                            pos++;
-                            col++
-                        }
-                        senao se (esc == "t") {
-                            codigo = 9;
-                            pos++;
-                            col++
-                        }
-                        senao se (esc == "r") {
-                            codigo = 13;
-                            pos++;
-                            col++
-                        }
-                        senao se (esc == "0") {
-                            codigo = 0;
-                            pos++;
-                            col++
-                        }
-                        senao se (esc == "\\") {
-                            codigo = 92;
-                            pos++;
-                            col++
-                        }
-                        senao se (esc == "'") {
-                            codigo = 39;
-                            pos++;
-                            col++
-                        }
-                        senao se (esc == "\"") {
-                            codigo = 34;
-                            pos++;
-                            col++
-                        }
-                        senao se (esc == "x") {
-                            pos++
-                            col++
-                            enquanto (pos < n e hexDigito(fonte[pos]) >= 0) {
-                                codigo = codigo * 16 + hexDigito(fonte[pos])
-                                pos++
-                                col++
-                            }
-                        } senao {
-                            codigo = codigoAsciiChar(esc)
-                            pos++
-                            col++
-                        }
-                    }
+                    const decC: (inteiro, inteiro) = isto.litMod.decodificarEscapeC99(fonte,
+                        pos + 1, n)
+                    codigo = decC[0]
+                    pos = pos + 1 + decC[1]
+                    col = col + 1 + decC[1]
                 } senao se (pos < n) {
-                    codigo = codigoAsciiChar(fonte[pos])
+                    codigo = isto.cls.codigo(fonte[pos])
                     pos++
                     col++
                 }
                 se (pos >= n ou fonte[pos] != "'") {
-                    isto.diag.erroEm(linha, colIni, "caractere literal nao terminado")
+                    isto.diag.erroEm(linha, colIni, "caractere literal nao terminado", "",
+                        "E2004", 1)
                 }
                 pos++
                 col++
@@ -423,87 +347,127 @@ classe LexerDCC {
                 continua
             }
 
-            // Numeros inteiros e ponto flutuante
-            se ("0123456789".contem(c) ou (c == "." e pos + 1 < n e "0123456789".contem(fonte[pos + 1]))) {
+            // Numeros inteiros e ponto flutuante (decimal, octal, binario, hex, hex-float C99)
+            se (isto.cls.ehDigitoDec(c) ou (c == "." e pos + 1 < n e isto.cls.ehDigitoDec(fonte[pos + 1]))) {
+                const posIni: inteiro = pos
                 const colIni: inteiro = col
                 var ehFloat: logico = falso
                 var ehHex: logico = falso
-                var buf: texto[] = []
                 se (c == "0" e pos + 1 < n e (fonte[pos + 1] == "x" ou fonte[pos + 1] == "X")) {
                     ehHex = verdadeiro
-                    buf.empilhar(fonte[pos])
-                    buf.empilhar(fonte[pos + 1])
                     pos = pos + 2
                     col = col + 2
-                    enquanto (pos < n e "0123456789abcdefABCDEFuUlL".contem(fonte[pos])) {
-                        buf.empilhar(fonte[pos])
-                        pos++
-                        col++
-                    }
-                } senao se (c == "0" e pos + 1 < n e (fonte[pos + 1] == "b" ou fonte[pos + 1] == "B")) {
-                    buf.empilhar(fonte[pos])
-                    buf.empilhar(fonte[pos + 1])
-                    pos = pos + 2
-                    col = col + 2
-                    enquanto (pos < n e "01uUlL".contem(fonte[pos])) {
-                        buf.empilhar(fonte[pos])
-                        pos++
-                        col++
-                    }
-                } senao {
-                    enquanto (pos < n e "0123456789".contem(fonte[pos])) {
-                        buf.empilhar(fonte[pos])
+                    enquanto (pos < n e isto.cls.hexDigitoValor(fonte[pos]) >= 0) {
                         pos++
                         col++
                     }
                     se (pos < n e fonte[pos] == ".") {
                         ehFloat = verdadeiro
-                        buf.empilhar(".")
                         pos++
                         col++
-                        enquanto (pos < n e "0123456789".contem(fonte[pos])) {
-                            buf.empilhar(fonte[pos])
+                        enquanto (pos < n e isto.cls.hexDigitoValor(fonte[pos]) >= 0) {
+                            pos++
+                            col++
+                        }
+                    }
+                    se (pos < n e (fonte[pos] == "p" ou fonte[pos] == "P")) {
+                        ehFloat = verdadeiro
+                        pos++
+                        col++
+                        se (pos < n e (fonte[pos] == "+" ou fonte[pos] == "-")) {
+                            pos++
+                            col++
+                        }
+                        enquanto (pos < n e isto.cls.ehDigitoDec(fonte[pos])) {
+                            pos++
+                            col++
+                        }
+                    }
+                    se (ehFloat) {
+                        enquanto (pos < n e (fonte[pos] == "f" ou fonte[pos] == "F" ou fonte[pos] == "l" ou fonte[pos] == "L")) {
+                            pos++
+                            col++
+                        }
+                    } senao {
+                        enquanto (pos < n e (fonte[pos] == "u" ou fonte[pos] == "U" ou fonte[pos] == "l" ou fonte[pos] == "L")) {
+                            pos++
+                            col++
+                        }
+                    }
+                } senao se (c == "0" e pos + 1 < n e (fonte[pos + 1] == "b" ou fonte[pos + 1] == "B")) {
+                    pos = pos + 2
+                    col = col + 2
+                    enquanto (pos < n e (fonte[pos] == "0" ou fonte[pos] == "1" ou fonte[pos] == "u" ou fonte[pos] == "U" ou fonte[pos] == "l" ou fonte[pos] == "L")) {
+                        pos++
+                        col++
+                    }
+                } senao {
+                    enquanto (pos < n e isto.cls.ehDigitoDec(fonte[pos])) {
+                        pos++
+                        col++
+                    }
+                    se (pos < n e fonte[pos] == ".") {
+                        ehFloat = verdadeiro
+                        pos++
+                        col++
+                        enquanto (pos < n e isto.cls.ehDigitoDec(fonte[pos])) {
                             pos++
                             col++
                         }
                     }
                     se (pos < n e (fonte[pos] == "e" ou fonte[pos] == "E")) {
                         ehFloat = verdadeiro
-                        buf.empilhar(fonte[pos])
                         pos++
                         col++
                         se (pos < n e (fonte[pos] == "+" ou fonte[pos] == "-")) {
-                            buf.empilhar(fonte[pos])
                             pos++
                             col++
                         }
-                        enquanto (pos < n e "0123456789".contem(fonte[pos])) {
-                            buf.empilhar(fonte[pos])
+                        var digExp: inteiro = 0
+                        enquanto (pos < n e isto.cls.ehDigitoDec(fonte[pos])) {
                             pos++
                             col++
+                            digExp++
+                        }
+                        se (digExp == 0) {
+                            const lexBad: texto = fonte.fatiar(posIni, pos)
+                            isto.diag.erroEm(linha, colIni, "expoente sem digitos em literal de ponto flutuante '${lexBad}'",
+                                "", "E2003", lexBad.tamanho())
                         }
                     }
                     se (ehFloat) {
-                        enquanto (pos < n e "fFlL".contem(fonte[pos])) {
-                            buf.empilhar(fonte[pos])
+                        enquanto (pos < n e (fonte[pos] == "f" ou fonte[pos] == "F" ou fonte[pos] == "l" ou fonte[pos] == "L")) {
                             pos++
                             col++
                         }
                     } senao {
-                        enquanto (pos < n e "uUlL".contem(fonte[pos])) {
-                            buf.empilhar(fonte[pos])
+                        enquanto (pos < n e (fonte[pos] == "u" ou fonte[pos] == "U" ou fonte[pos] == "l" ou fonte[pos] == "L")) {
                             pos++
                             col++
                         }
                     }
                 }
-                const lex: texto = buf.juntar("")
-                se (ehFloat e !ehHex) {
+                const lex: texto = fonte.fatiar(posIni, pos)
+                se (ehFloat) {
                     const tokF: TokenC99 = TokenC99(isto.Tok.FloatLit, lex, linha, colIni)
-                    tokF.valorReal = parseFloatLit(lex)
+                    se (ehHex) {
+                        const hf: (real, logico) = isto.litMod.parseHexFloatC99(lex)
+                        se (!hf[1]) {
+                            isto.diag.erroEm(linha, colIni, "literal hexadecimal de ponto flutuante invalido '${lex}'",
+                                "", "E2003", lex.tamanho())
+                        }
+                        tokF.valorReal = hf[0]
+                        const ultC: texto = lex[lex.tamanho() - 1]
+                        tokF.ehFloat32 = ultC == "f" ou ultC == "F"
+                    } senao {
+                        const df: (real, logico) = parseFloatDecimal(lex, isto.diag, linha,
+                            colIni)
+                        tokF.valorReal = df[0]
+                        tokF.ehFloat32 = df[1]
+                    }
                     out.empilhar(tokF)
                 } senao {
-                    const infoI: (inteiro, logico, logico) = parseInteiroLit(lex)
+                    const infoI: (inteiro, logico, logico) = isto.litMod.parseInteiroC99(lex)
                     const tokI: TokenC99 = TokenC99(isto.Tok.IntLit, lex, linha, colIni)
                     tokI.valorInt = infoI[0]
                     tokI.ehSemSinal = infoI[1]
@@ -514,15 +478,16 @@ classe LexerDCC {
             }
 
             // Identificadores e keywords
-            se ("abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ_$".contem(c)) {
+            se (isto.cls.ehInicioIdent(c)) {
+                const posIniId: inteiro = pos
                 const colIni: inteiro = col
-                var idBuf: texto[] = []
-                enquanto (pos < n e "abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ_$0123456789".contem(fonte[pos])) {
-                    idBuf.empilhar(fonte[pos])
+                pos++
+                col++
+                enquanto (pos < n e isto.cls.ehContIdent(fonte[pos])) {
                     pos++
                     col++
                 }
-                const lexId: texto = idBuf.juntar("")
+                const lexId: texto = fonte.fatiar(posIniId, pos)
                 const tagKw: qualquer = isto.keywords.contem(lexId) ? isto.keywords[lexId] : isto.Tok.Ident
                 out.empilhar(TokenC99(tagKw, lexId, linha, colIni))
                 continua
@@ -558,7 +523,7 @@ classe LexerDCC {
                 continua
             }
 
-            isto.diag.erroEm(linha, col, "caractere invalido '${c}'")
+            isto.diag.erroEm(linha, col, "caractere invalido '${c}'", "", "E2005", 1)
         }
 
         retorna emBloco

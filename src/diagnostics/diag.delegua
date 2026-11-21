@@ -1,16 +1,30 @@
 // Sistema de diagnosticos profissionais do DCC (Delégua C Compiler).
-// Formata erros, avisos e notas com arquivo, linha, coluna, trecho de codigo e marcador '^'.
+// Suporta arquivo, linha, coluna, intervalo (^~~~), severidade, codigo estavel, notas,
+// trilha de inclusao de headers, cores ANSI (auto/always/never com isatty) e saida JSON (cgd:json).
+
+@definicao(biblioteca = "c", abi = "c")
+classe estrangeira LibCTty {
+    @definicao(simbolo = "isatty")
+    estatico ehTerminal(fd: inteiro): inteiro;
+}
 
 classe ErroDCC herda Excecao {
     arquivo: texto
     linha: inteiro
     coluna: inteiro
+    codigo: texto
+    ehInterno: logico
+    jsonTexto: texto
 
-    construtor(mensagem: texto, arquivo: texto = "", linha: inteiro = 0, coluna: inteiro = 0) {
+    construtor(mensagem: texto, arquivo: texto = "", linha: inteiro = 0, coluna: inteiro = 0,
+        codigo: texto = "", ehInterno: logico = falso, jsonTexto: texto = "") {
         super(mensagem)
         isto.arquivo = arquivo
         isto.linha = linha
         isto.coluna = coluna
+        isto.codigo = codigo
+        isto.ehInterno = ehInterno
+        isto.jsonTexto = jsonTexto
     }
 }
 
@@ -18,11 +32,13 @@ classe OrigemLinha {
     arquivo: texto
     linha: inteiro
     textoLinha: texto
+    pilhaInclusao: texto[]
 
-    construtor(arquivo: texto, linha: inteiro, textoLinha: texto) {
+    construtor(arquivo: texto, linha: inteiro, textoLinha: texto, pilhaInclusao: texto[] = []) {
         isto.arquivo = arquivo
         isto.linha = linha
         isto.textoLinha = textoLinha
+        isto.pilhaInclusao = pilhaInclusao
     }
 }
 
@@ -33,8 +49,8 @@ classe MapaFonte {
         isto.linhas = []
     }
 
-    registrar(arquivo: texto, linha: inteiro, textoLinha: texto): vazio {
-        isto.linhas.empilhar(OrigemLinha(arquivo, linha, textoLinha))
+    registrar(arquivo: texto, linha: inteiro, textoLinha: texto, pilhaInclusao: texto[] = []): vazio {
+        isto.linhas.empilhar(OrigemLinha(arquivo, linha, textoLinha, pilhaInclusao))
     }
 
     consultar(linhaExpandida: inteiro): OrigemLinha {
@@ -42,41 +58,125 @@ classe MapaFonte {
         se (idx >= 0 e idx < isto.linhas.tamanho()) {
             retorna isto.linhas[idx]
         }
-        retorna OrigemLinha("<entrada>", linhaExpandida, "")
+        retorna OrigemLinha("<entrada>", linhaExpandida, "", [])
     }
 }
 
-funcao repetirEspacos(qtd: inteiro): texto {
-    var out: texto[] = []
-    para (var i: inteiro = 0; i < qtd; i++) out.empilhar(" ")
-    retorna out.juntar("")
+classe ItemDiag {
+    severidade: texto
+    codigo: texto
+    categoria: texto
+    arquivo: texto
+    linha: inteiro
+    coluna: inteiro
+    largura: inteiro
+    mensagem: texto
+    trecho: texto
+    nota: texto
+    pilhaInclusao: texto[]
+
+    construtor(severidade: texto, codigo: texto, categoria: texto, arquivo: texto, linha: inteiro,
+        coluna: inteiro, largura: inteiro, mensagem: texto, trecho: texto = "", nota: texto = "",
+        pilhaInclusao: texto[] = []) {
+        isto.severidade = severidade
+        isto.codigo = codigo
+        isto.categoria = categoria
+        isto.arquivo = arquivo
+        isto.linha = linha
+        isto.coluna = coluna
+        isto.largura = largura > 0 ? largura : 1
+        isto.mensagem = mensagem
+        isto.trecho = trecho
+        isto.nota = nota
+        isto.pilhaInclusao = pilhaInclusao
+    }
+
+    paraDicionario(): dicionario {
+        retorna {
+            "severity": isto.severidade,
+            "code": isto.codigo,
+            "category": isto.categoria,
+            "file": isto.arquivo,
+            "line": isto.linha,
+            "column": isto.coluna,
+            "length": isto.largura,
+            "message": isto.mensagem,
+            "snippet": isto.trecho,
+            "note": isto.nota,
+            "include_stack": isto.pilhaInclusao
+        }
+    }
+}
+
+funcao resolverUsoCor(modoCor: texto): logico {
+    se (modoCor == "always") retorna verdadeiro
+    se (modoCor == "never") retorna falso
+    const ambMod: qualquer = importar("cgd:ambiente")
+    const noColor: qualquer = ambMod.Ambiente.obter("NO_COLOR", nulo)
+    se (noColor != nulo) retorna falso
+    retorna LibCTty.ehTerminal(2) != 0
+}
+
+funcao aplicarCor(s: texto, codigoAnsi: texto, usarCor: logico): texto {
+    se (!usarCor) retorna s
+    const nat: qualquer = importar("cgd:nativo").Primitivas
+    const esc: texto = nat.caractereUnicode(27)
+    retorna "${esc}[${codigoAnsi}m${s}${esc}[0m"
+}
+
+funcao corSeveridade(sev: texto): texto {
+    se (sev == "error" ou sev == "internal compiler error") retorna "1;31"
+    se (sev == "warning") retorna "1;35"
+    se (sev == "note") retorna "1;36"
+    retorna "1"
 }
 
 funcao formatarDiagnostico(severidade: texto, arquivo: texto, linha: inteiro, coluna: inteiro,
-    mensagem: texto, trecho: texto = "", nota: texto = ""): texto {
-    var cab: texto = ""
-    se (arquivo.tamanho() > 0 e linha > 0 e coluna > 0) {
-        cab = "${arquivo}:${linha}:${coluna}: ${severidade}: ${mensagem}"
-    } senao se (arquivo.tamanho() > 0 e linha > 0) {
-        cab = "${arquivo}:${linha}: ${severidade}: ${mensagem}"
-    } senao se (linha > 0) {
-        cab = "<entrada>:${linha}: ${severidade}: ${mensagem}"
-    } senao {
-        cab = "dcc: ${severidade}: ${mensagem}"
+    mensagem: texto, trecho: texto = "", nota: texto = "", codigo: texto = "", largura: inteiro = 1,
+    pilhaInclusao: texto[] = [], usarCor: logico = falso, categoria: texto = ""): texto {
+    const texMod: qualquer = importar("cgd:textos")
+    var linhasOut: texto[] = []
+
+    para (var i: inteiro = 0; i < pilhaInclusao.tamanho(); i++) {
+        const prefInc: texto = i == 0 ? "In file included from " : "                 from "
+        const sufInc: texto = i + 1 < pilhaInclusao.tamanho() ? "," : ":"
+        linhasOut.empilhar(prefInc + pilhaInclusao[i] + sufInc)
     }
 
-    var linhasOut: texto[] = [cab]
+    const sevTxt: texto = aplicarCor(severidade, corSeveridade(severidade), usarCor)
+    const codSuf: texto = codigo.tamanho() > 0 ? " [${codigo}]" : ""
+    const catSuf: texto = categoria.tamanho() > 0 ? " [-W${categoria}]" : ""
+    var loc: texto = "dcc"
+    se (arquivo.tamanho() > 0 e linha > 0 e coluna > 0) {
+        loc = "${arquivo}:${linha}:${coluna}"
+    } senao se (arquivo.tamanho() > 0 e linha > 0) {
+        loc = "${arquivo}:${linha}"
+    } senao se (arquivo.tamanho() > 0) {
+        loc = arquivo
+    } senao se (linha > 0) {
+        loc = "<entrada>:${linha}"
+    }
+
+    const cab: texto = "${aplicarCor(loc, "1", usarCor)}: ${sevTxt}: ${mensagem}${catSuf}${codSuf}"
+    linhasOut.empilhar(cab)
+
     se (trecho.tamanho() > 0 e linha > 0) {
         const numStr: texto = texto(linha)
-        const padNum: texto = repetirEspacos(numStr.tamanho() < 5 ? 5 - numStr.tamanho() : 0)
+        const padNum: texto = numStr.tamanho() < 5 ? texMod.Textos.repetir(" ", 5 - numStr.tamanho()) : ""
         linhasOut.empilhar("${padNum}${numStr} | ${trecho}")
         const colCaret: inteiro = coluna > 1 ? coluna - 1 : 0
-        const espPrefixo: texto = repetirEspacos(padNum.tamanho() + numStr.tamanho())
-        linhasOut.empilhar("${espPrefixo} | " + repetirEspacos(colCaret) + "^")
+        const espPrefixo: texto = texMod.Textos.repetir(" ", padNum.tamanho() + numStr.tamanho())
+        var tilQtd: inteiro = 0
+        se (largura > 1) {
+            tilQtd = largura > 40 ? 39 : largura - 1
+        }
+        const marcador: texto = "^" + (tilQtd > 0 ? texMod.Textos.repetir("~", tilQtd) : "")
+        const marcCor: texto = aplicarCor(marcador, corSeveridade(severidade), usarCor)
+        linhasOut.empilhar("${espPrefixo} | " + texMod.Textos.repetir(" ", colCaret) + marcCor)
     }
 
     se (nota.tamanho() > 0) {
-        linhasOut.empilhar("note: ${nota}")
+        linhasOut.empilhar("${aplicarCor("note", "1;36", usarCor)}: ${nota}")
     }
 
     retorna linhasOut.juntar("\n")
@@ -85,41 +185,115 @@ funcao formatarDiagnostico(severidade: texto, arquivo: texto, linha: inteiro, co
 classe ContextoDiag {
     mapaFonte: MapaFonte
     avisos: texto[]
+    itens: ItemDiag[]
     wall: logico
     wextra: logico
     werror: logico
+    modoCor: texto
+    usarCor: logico
+    formatoJson: logico
+    categoriasDesabilitadas: dicionario
 
-    construtor(wall: logico = falso, wextra: logico = falso, werror: logico = falso) {
+    construtor(wall: logico = falso, wextra: logico = falso, werror: logico = falso, modoCor: texto = "auto",
+        formatoJson: logico = falso, categoriasDesab: dicionario = {}) {
         isto.mapaFonte = MapaFonte()
         isto.avisos = []
+        isto.itens = []
         isto.wall = wall
         isto.wextra = wextra
         isto.werror = werror
+        isto.modoCor = modoCor
+        isto.usarCor = formatoJson ? falso : resolverUsoCor(modoCor)
+        isto.formatoJson = formatoJson
+        isto.categoriasDesabilitadas = categoriasDesab
     }
 
-    erroEm(linhaExp: inteiro, coluna: inteiro, mensagem: texto, nota: texto = ""): vazio {
+    desabilitarCategoria(cat: texto): vazio {
+        isto.categoriasDesabilitadas[cat] = verdadeiro
+    }
+
+    categoriaAtiva(cat: texto): logico {
+        se (cat.tamanho() == 0) retorna verdadeiro
+        retorna !isto.categoriasDesabilitadas.contem(cat)
+    }
+
+    serializarItensJson(): texto {
+        const jsonMod: qualquer = importar("cgd:json")
+        var lista: dicionario[] = []
+        para (var i: inteiro = 0; i < isto.itens.tamanho(); i++) {
+            lista.empilhar(isto.itens[i].paraDicionario())
+        }
+        retorna jsonMod.JSON.serializar(lista)
+    }
+
+    emitirErroInterno(mensagem: texto, arquivo: texto = "", linha: inteiro = 0): vazio {
+        const item: ItemDiag = ItemDiag("internal compiler error", "E9000", "", arquivo,
+            linha, 1, 1, mensagem, "", "reporte este defeito com um caso minimo reproduzivel",
+            [])
+        isto.itens.empilhar(item)
+        const fmt: texto = formatarDiagnostico("internal compiler error", arquivo, linha,
+            1, mensagem, "", item.nota, "E9000", 1, [], isto.usarCor, "")
+        const js: texto = isto.formatoJson ? isto.serializarItensJson() : ""
+        falhar ErroDCC(isto.formatoJson ? js : fmt, arquivo, linha, 1, "E9000", verdadeiro,
+            js)
+    }
+
+    erroEm(linhaExp: inteiro, coluna: inteiro, mensagem: texto, nota: texto = "", codigo: texto = "E2000",
+        largura: inteiro = 1): vazio {
         const orig: OrigemLinha = isto.mapaFonte.consultar(linhaExp)
+        const item: ItemDiag = ItemDiag("error", codigo, "", orig.arquivo, orig.linha, coluna,
+            largura, mensagem, orig.textoLinha, nota, orig.pilhaInclusao)
+        isto.itens.empilhar(item)
         const fmt: texto = formatarDiagnostico("error", orig.arquivo, orig.linha, coluna,
-            mensagem, orig.textoLinha, nota)
-        falhar ErroDCC(fmt, orig.arquivo, orig.linha, coluna)
+            mensagem, orig.textoLinha, nota, codigo, largura, orig.pilhaInclusao, isto.usarCor,
+            "")
+        const js: texto = isto.formatoJson ? isto.serializarItensJson() : ""
+        falhar ErroDCC(isto.formatoJson ? js : fmt, orig.arquivo, orig.linha, coluna, codigo,
+            falso, js)
     }
 
     erroDireto(arquivo: texto, linha: inteiro, coluna: inteiro, mensagem: texto, trecho: texto = "",
-        nota: texto = ""): vazio {
+        nota: texto = "", codigo: texto = "E1000", largura: inteiro = 1, pilhaInclusao: texto[] = []): vazio {
+        const item: ItemDiag = ItemDiag("error", codigo, "", arquivo, linha, coluna, largura,
+            mensagem, trecho, nota, pilhaInclusao)
+        isto.itens.empilhar(item)
         const fmt: texto = formatarDiagnostico("error", arquivo, linha, coluna, mensagem,
-            trecho, nota)
-        falhar ErroDCC(fmt, arquivo, linha, coluna)
+            trecho, nota, codigo, largura, pilhaInclusao, isto.usarCor, "")
+        const js: texto = isto.formatoJson ? isto.serializarItensJson() : ""
+        falhar ErroDCC(isto.formatoJson ? js : fmt, arquivo, linha, coluna, codigo, falso,
+            js)
     }
 
-    avisoEm(linhaExp: inteiro, coluna: inteiro, mensagem: texto, nota: texto = ""): vazio {
+    avisoEm(linhaExp: inteiro, coluna: inteiro, mensagem: texto, nota: texto = "", categoria: texto = "",
+        codigo: texto = "W1000", largura: inteiro = 1): vazio {
+        se (!isto.categoriaAtiva(categoria)) retorna
         const orig: OrigemLinha = isto.mapaFonte.consultar(linhaExp)
+        isto.avisoDireto(orig.arquivo, orig.linha, coluna, mensagem, orig.textoLinha, nota,
+            categoria, codigo, largura, orig.pilhaInclusao)
+    }
+
+    avisoDireto(arquivo: texto, linha: inteiro, coluna: inteiro, mensagem: texto, trecho: texto = "",
+        nota: texto = "", categoria: texto = "", codigo: texto = "W1000", largura: inteiro = 1,
+        pilhaInclusao: texto[] = []): vazio {
+        se (!isto.categoriaAtiva(categoria)) retorna
         se (isto.werror) {
-            const fmtE: texto = formatarDiagnostico("error", orig.arquivo, orig.linha, coluna,
-                mensagem + " [-Werror]", orig.textoLinha, nota)
-            falhar ErroDCC(fmtE, orig.arquivo, orig.linha, coluna)
+            const msgErr: texto = mensagem + " [-Werror]"
+            const itemE: ItemDiag = ItemDiag("error", codigo, categoria, arquivo, linha,
+                coluna, largura, msgErr, trecho, nota, pilhaInclusao)
+            isto.itens.empilhar(itemE)
+            const fmtE: texto = formatarDiagnostico("error", arquivo, linha, coluna, msgErr,
+                trecho, nota, codigo, largura, pilhaInclusao, isto.usarCor, categoria)
+            const jsE: texto = isto.formatoJson ? isto.serializarItensJson() : ""
+            falhar ErroDCC(isto.formatoJson ? jsE : fmtE, arquivo, linha, coluna, codigo,
+                falso, jsE)
         }
-        const fmtW: texto = formatarDiagnostico("warning", orig.arquivo, orig.linha, coluna,
-            mensagem, orig.textoLinha, nota)
-        isto.avisos.empilhar(fmtW)
+        const itemW: ItemDiag = ItemDiag("warning", codigo, categoria, arquivo, linha, coluna,
+            largura, mensagem, trecho, nota, pilhaInclusao)
+        isto.itens.empilhar(itemW)
+        se (!isto.formatoJson) {
+            const fmtW: texto = formatarDiagnostico("warning", arquivo, linha, coluna, mensagem,
+                trecho, nota, codigo, largura, pilhaInclusao, isto.usarCor, categoria)
+            isto.avisos.empilhar(fmtW)
+        }
     }
 }

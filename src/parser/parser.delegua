@@ -1,7 +1,8 @@
 // Fase 2: AST tipada por Enums e Parser ISO C99 / GNU99 para o DCC (Delegua C Compiler).
 // Suporta declaracoes reais dos headers do sistema (/usr/include), camada formal GNU (Cat A/B/C),
 // bit-fields, struct/union anonimos, forward declarations, __asm__("sym"), __attribute__((...)),
-// __builtin_va_list/__builtin_offsetof, ponteiros de funcao complexos, VLAs e literais compostos.
+// __builtin_va_list/__builtin_offsetof, ponteiros de funcao complexos, VLAs, literais compostos,
+// pilha de escopos para typedefs e protecao contra recursao excessiva (anti-DoS).
 
 classe NoAST {
     kind: qualquer
@@ -10,15 +11,18 @@ classe NoAST {
     nome: texto
     nomeSimboloLink: texto
     textoLit: texto
+    bytesLit: inteiro[]
     valor: inteiro
     valorReal: real
     tipoC: qualquer
     ehSeta: logico
     ehExtern: logico
     ehStatic: logico
+    ehWeak: logico
     ehVariadica: logico
     ehSemSinal: logico
     ehLongo: logico
+    ehFloat32: logico
     ehPacked: logico
     alinhamentoExplicito: inteiro
     ehBitField: logico
@@ -34,15 +38,18 @@ classe NoAST {
         isto.nome = ""
         isto.nomeSimboloLink = ""
         isto.textoLit = ""
+        isto.bytesLit = []
         isto.valor = 0
         isto.valorReal = 0.0
         isto.tipoC = nulo
         isto.ehSeta = falso
         isto.ehExtern = falso
         isto.ehStatic = falso
+        isto.ehWeak = falso
         isto.ehVariadica = falso
         isto.ehSemSinal = falso
         isto.ehLongo = falso
+        isto.ehFloat32 = falso
         isto.ehPacked = falso
         isto.alinhamentoExplicito = 0
         isto.ehBitField = falso
@@ -54,16 +61,12 @@ classe NoAST {
 }
 
 funcao normalizarNomeAtributo(bruto: texto): texto {
-    var ini: inteiro = 0
-    var fim: inteiro = bruto.tamanho()
+    const fim: inteiro = bruto.tamanho()
     se (fim >= 4 e bruto[0] == "_" e bruto[1] == "_" e bruto[fim - 1] == "_" e bruto[fim - 2] == "_") {
-        ini = 2
-        fim = fim - 2
+        retorna bruto.fatiar(2, fim - 2)
     }
 
-    var out: texto[] = []
-    para (var i: inteiro = ini; i < fim; i++) out.empilhar(bruto[i])
-    retorna out.juntar("")
+    retorna bruto
 }
 
 classe ParserDCC {
@@ -77,13 +80,14 @@ classe ParserDCC {
     modoGnu: logico
     tokens: qualquer[]
     pos: inteiro
-    typedefs: dicionario
+    profundidade: inteiro
+    pilhaTypedefs: dicionario[]
     enumConsts: dicionario
     declsPendentes: NoAST[]
     contAnon: inteiro
     mapaAtrib: dicionario
-    mapaRel: dicionario
-    mapaFator: dicionario
+    mapaBinOp: dicionario
+    mapaBinPrec: dicionario
     mapaUnario: dicionario
     attrsCatA: dicionario
 
@@ -98,7 +102,8 @@ classe ParserDCC {
         isto.modoGnu = modoGnu
         isto.tokens = tokens
         isto.pos = 0
-        isto.typedefs = {}
+        isto.profundidade = 0
+        isto.pilhaTypedefs = [{}]
         isto.enumConsts = {}
         isto.declsPendentes = []
         isto.contAnon = 0
@@ -116,16 +121,45 @@ classe ParserDCC {
             "<<=": isto.OpB.ShlAssign,
             ">>=": isto.OpB.ShrAssign
         }
-        isto.mapaRel = {
+        isto.mapaBinOp = {
+            "||": isto.OpB.LogOr,
+            "&&": isto.OpB.LogAnd,
+            "|": isto.OpB.BitOr,
+            "^": isto.OpB.BitXor,
+            "&": isto.OpB.BitAnd,
+            "==": isto.OpB.Eq,
+            "!=": isto.OpB.Neq,
             "<": isto.OpB.Lt,
             "<=": isto.OpB.Le,
             ">": isto.OpB.Gt,
-            ">=": isto.OpB.Ge
-        }
-        isto.mapaFator = {
+            ">=": isto.OpB.Ge,
+            "<<": isto.OpB.Shl,
+            ">>": isto.OpB.Shr,
+            "+": isto.OpB.Add,
+            "-": isto.OpB.Sub,
             "*": isto.OpB.Mul,
             "/": isto.OpB.Div,
             "%": isto.OpB.Mod
+        }
+        isto.mapaBinPrec = {
+            "||": 1,
+            "&&": 2,
+            "|": 3,
+            "^": 4,
+            "&": 5,
+            "==": 6,
+            "!=": 6,
+            "<": 7,
+            "<=": 7,
+            ">": 7,
+            ">=": 7,
+            "<<": 8,
+            ">>": 8,
+            "+": 9,
+            "-": 9,
+            "*": 10,
+            "/": 10,
+            "%": 10
         }
         isto.mapaUnario = {
             "-": isto.OpU.Neg,
@@ -137,7 +171,7 @@ classe ParserDCC {
             "++": isto.OpU.PreInc,
             "--": isto.OpU.PreDec
         }
-        // Categoria A: metadados e dicas de otimizacao/diagnostico que nao alteram layout nem ABI
+        // Categoria A: metadados e dicas que nao alteram layout, semantica nem ABI
         isto.attrsCatA = {
             "nonnull": verdadeiro,
             "format": verdadeiro,
@@ -165,7 +199,6 @@ classe ParserDCC {
             "artificial": verdadeiro,
             "gnu_inline": verdadeiro,
             "may_alias": verdadeiro,
-            "weak": verdadeiro,
             "fd_arg": verdadeiro,
             "fd_arg_read": verdadeiro,
             "fd_arg_write": verdadeiro,
@@ -178,7 +211,54 @@ classe ParserDCC {
         }
     }
 
+    entrarProfundidade(): vazio {
+        isto.profundidade++
+        se (isto.profundidade > 96) {
+            const t: qualquer = isto.atual()
+            isto.diag.erroEm(t.linha, t.coluna, "profundidade maxima de aninhamento sintatico excedida (limite 96)",
+                "", "E2010", 1)
+        }
+    }
+
+    sairProfundidade(): vazio {
+        isto.profundidade--
+    }
+
+    entrarEscopoTypedef(): vazio {
+        isto.pilhaTypedefs.empilhar({})
+    }
+
+    sairEscopoTypedef(): vazio {
+        se (isto.pilhaTypedefs.tamanho() > 1) {
+            isto.pilhaTypedefs.removerUltimo()
+        }
+    }
+
+    definirTypedef(nome: texto, tipoT: qualquer): vazio {
+        isto.pilhaTypedefs[isto.pilhaTypedefs.tamanho() - 1][nome] = tipoT
+    }
+
+    sombrearNomeNoEscopo(nome: texto): vazio {
+        se (nome.tamanho() > 0) {
+            isto.pilhaTypedefs[isto.pilhaTypedefs.tamanho() - 1][nome] = nulo
+        }
+    }
+
+    buscarTypedef(nome: texto): qualquer {
+        para (var i: inteiro = isto.pilhaTypedefs.tamanho() - 1; i >= 0; i--) {
+            se (isto.pilhaTypedefs[i].contem(nome)) {
+                retorna isto.pilhaTypedefs[i][nome]
+            }
+        }
+        retorna nulo
+    }
+
+    ehTypedef(nome: texto): logico {
+        retorna isto.buscarTypedef(nome) != nulo
+    }
+
     atual(): qualquer {
+        se (isto.pos >= isto.tokens.tamanho()) retorna isto.tokens[isto.tokens.tamanho() - 1]
         retorna isto.tokens[isto.pos]
     }
 
@@ -189,24 +269,30 @@ classe ParserDCC {
     }
 
     avancar(): qualquer {
-        const t: qualquer = isto.tokens[isto.pos]
-        isto.pos++
+        const t: qualquer = isto.atual()
+        se (isto.pos < isto.tokens.tamanho() - 1) {
+            isto.pos++
+        }
         retorna t
     }
 
     consumir(tag: qualquer, msg: texto): qualquer {
-        se (isto.atual().tag != tag) {
-            isto.diag.erroEm(isto.atual().linha, isto.atual().coluna, "${msg}, encontrado '${isto.atual().lexema}'")
+        const t: qualquer = isto.atual()
+        se (t.tag != tag) {
+            isto.diag.erroEm(t.linha, t.coluna, "${msg}, encontrado '${t.lexema}'", "", "E2011",
+                t.lexema.tamanho())
         }
         retorna isto.avancar()
     }
 
     // Classificador formal GNU __attribute__((...)) — Cat A (metadado), Cat B (layout/ABI), Cat C (erro explicito)
+    // Retorna (ehPacked, alinhExp, ehWeak)
     lerAtributosGNU()
 
-    : (logico, inteiro) {
+    : (logico, inteiro, logico) {
         var ehPacked: logico = falso
         var alinhExp: inteiro = 0
+        var ehWeak: logico = falso
         enquanto (isto.atual().tag == isto.Tok.KwAttribute) {
             isto.avancar()
             isto.consumir(isto.Tok.LParen, "'(' esperado apos __attribute__")
@@ -232,28 +318,33 @@ classe ParserDCC {
                     }
                 }
 
-                // Categoria B: layout / alinhamento
+                // Categoria B: layout / alinhamento / binding ELF
                 se (norm == "packed") {
                     ehPacked = verdadeiro
+                } senao se (norm == "weak") {
+                    ehWeak = verdadeiro
                 } senao se (norm == "aligned") {
                     se (argsExpr.tamanho() > 0) {
                         const valAl: inteiro = isto.avaliarConstSimples(argsExpr[0])
+                        se (valAl <= 0 ou valAl > 65536 ou (valAl & (valAl - 1)) != 0) {
+                            isto.diag.erroEm(tokAttr.linha, tokAttr.coluna, "alinhamento invalido em __attribute__((aligned(${valAl}))): deve ser potencia de 2 entre 1 e 65536",
+                                "", "E2105", tokAttr.lexema.tamanho())
+                        }
                         se (valAl > alinhExp) alinhExp = valAl
                     } senao {
                         se (16 > alinhExp) alinhExp = 16
                     }
                 } senao se (isto.attrsCatA.contem(norm)) {
-                    // Categoria A: metadado aceito sem alterar semantica/ABI
                     var noopA: inteiro = 0
                 } senao {
-                    // Categoria C: atributo nao suportado -> erro explicito, nunca ignorar silenciosamente!
-                    isto.diag.erroEm(tokAttr.linha, tokAttr.coluna, "atributo GNU nao suportado (Categoria C): '${tokAttr.lexema}'")
+                    isto.diag.erroEm(tokAttr.linha, tokAttr.coluna, "atributo GNU nao suportado (Categoria C): '${tokAttr.lexema}'",
+                        "", "E2100", tokAttr.lexema.tamanho())
                 }
             }
             isto.consumir(isto.Tok.RParen, "')' esperado em __attribute__")
             isto.consumir(isto.Tok.RParen, "'))' esperado em __attribute__")
         }
-        retorna tupla([ehPacked, alinhExp])
+        retorna tupla([ehPacked, alinhExp, ehWeak])
     }
 
     // Redirecionamento de simbolo GNU: __asm__("nome_simbolo") em prototipos/externs (Cat B)
@@ -278,7 +369,7 @@ classe ParserDCC {
         se (tag == isto.Tok.KwVoid ou tag == isto.Tok.KwBool ou tag == isto.Tok.KwChar ou tag == isto.Tok.KwShort ou tag == isto.Tok.KwInt ou tag == isto.Tok.KwLong ou tag == isto.Tok.KwSigned ou tag == isto.Tok.KwUnsigned ou tag == isto.Tok.KwFloat ou tag == isto.Tok.KwDouble ou tag == isto.Tok.KwFloat32 ou tag == isto.Tok.KwFloat64 ou tag == isto.Tok.KwFloat32x ou tag == isto.Tok.KwFloat64x ou tag == isto.Tok.KwBuiltinVaList ou tag == isto.Tok.KwStruct ou tag == isto.Tok.KwUnion ou tag == isto.Tok.KwEnum) {
             retorna verdadeiro
         }
-        se (tag == isto.Tok.Ident e isto.typedefs.contem(t.lexema)) {
+        se (tag == isto.Tok.Ident e isto.ehTypedef(t.lexema)) {
             retorna verdadeiro
         }
         retorna falso
@@ -288,11 +379,16 @@ classe ParserDCC {
         retorna isto.iniciaTipoEm(0)
     }
 
+    // Retorna (tipoC, ehExtern, ehStatic, ehWeak)
     lerTipoBase()
 
-    : (qualquer, logico, logico) {
+    : (qualquer, logico, logico, logico) {
         var ehExtern: logico = falso
         var ehStatic: logico = falso
+        var ehWeak: logico = falso
+        var ehConst: logico = falso
+        var ehVolatile: logico = falso
+        var ehRestrict: logico = falso
         var viuSigned: logico = falso
         var viuUnsigned: logico = falso
         var viuShort: logico = falso
@@ -315,11 +411,30 @@ classe ParserDCC {
                 continua
             }
             se (tag == isto.Tok.KwAttribute) {
-                const attrInfo: (logico, inteiro) = isto.lerAtributosGNU()
+                const attrInfo: (logico, inteiro, logico) = isto.lerAtributosGNU()
                 se (attrInfo[1] > alinhAttr) alinhAttr = attrInfo[1]
+                se (attrInfo[2]) ehWeak = verdadeiro
                 continua
             }
-            se (tag == isto.Tok.KwConst ou tag == isto.Tok.KwVolatile ou tag == isto.Tok.KwRestrict ou tag == isto.Tok.KwInline ou tag == isto.Tok.KwAuto ou tag == isto.Tok.KwRegister) {
+            se (tag == isto.Tok.KwConst) {
+                isto.avancar()
+                ehConst = verdadeiro
+                consumiuAlgo = verdadeiro
+                continua
+            }
+            se (tag == isto.Tok.KwVolatile) {
+                isto.avancar()
+                ehVolatile = verdadeiro
+                consumiuAlgo = verdadeiro
+                continua
+            }
+            se (tag == isto.Tok.KwRestrict) {
+                isto.avancar()
+                ehRestrict = verdadeiro
+                consumiuAlgo = verdadeiro
+                continua
+            }
+            se (tag == isto.Tok.KwInline ou tag == isto.Tok.KwAuto ou tag == isto.Tok.KwRegister) {
                 isto.avancar()
                 consumiuAlgo = verdadeiro
                 continua
@@ -425,7 +540,7 @@ classe ParserDCC {
                 const ehUnion: logico = tag == isto.Tok.KwUnion
                 const linS: inteiro = t.linha
                 isto.avancar()
-                const attrAntes: (logico, inteiro) = isto.lerAtributosGNU()
+                const attrAntes: (logico, inteiro, logico) = isto.lerAtributosGNU()
                 var nomeA: texto = ""
                 se (isto.atual().tag == isto.Tok.Ident) {
                     nomeA = isto.avancar().lexema
@@ -435,7 +550,7 @@ classe ParserDCC {
                 }
                 se (isto.atual().tag == isto.Tok.LBrace) {
                     const declAg: NoAST = isto.parseCorpoAgregado(nomeA, ehUnion, linS)
-                    const attrDepois: (logico, inteiro) = isto.lerAtributosGNU()
+                    const attrDepois: (logico, inteiro, logico) = isto.lerAtributosGNU()
                     declAg.ehPacked = attrAntes[0] ou attrDepois[0]
                     const maxAl: inteiro = attrAntes[1] > attrDepois[1] ? attrAntes[1] : attrDepois[1]
                     declAg.alinhamentoExplicito = maxAl
@@ -464,9 +579,9 @@ classe ParserDCC {
                 continua
             }
             const temTipoBase: logico = tipoExplicito != nulo ou viuVoid ou viuBool ou viuChar ou viuShort ou viuInt ou viuLong > 0 ou viuSigned ou viuUnsigned ou viuFloat ou viuDouble
-            se (tag == isto.Tok.Ident e !temTipoBase e isto.typedefs.contem(t.lexema)) {
+            se (tag == isto.Tok.Ident e !temTipoBase e isto.ehTypedef(t.lexema)) {
                 isto.avancar()
-                tipoExplicito = isto.typedefs[t.lexema]
+                tipoExplicito = isto.buscarTypedef(t.lexema).clonar()
                 consumiuAlgo = verdadeiro
                 continua
             }
@@ -474,7 +589,9 @@ classe ParserDCC {
         }
 
         se (!consumiuAlgo) {
-            isto.diag.erroEm(isto.atual().linha, isto.atual().coluna, "tipo esperado, encontrado '${isto.atual().lexema}'")
+            const tErr: qualquer = isto.atual()
+            isto.diag.erroEm(tErr.linha, tErr.coluna, "tipo esperado, encontrado '${tErr.lexema}'",
+                "", "E2012", tErr.lexema.tamanho())
         }
 
         var resTipo: qualquer = tipoExplicito
@@ -489,11 +606,16 @@ classe ParserDCC {
             senao se (viuLong > 0) resTipo = isto.tMod.TipoC.tipoLong(viuUnsigned)
             senao se (viuInt ou viuSigned ou viuUnsigned) resTipo = isto.tMod.TipoC.tipoInt(viuUnsigned)
             senao resTipo = isto.tMod.TipoC.tipoInt(falso)
+        } senao {
+            resTipo = resTipo.clonar()
         }
-        se (alinhAttr > 0) {
-            resTipo.alinhamentoExplicito = alinhAttr
-        }
-        retorna tupla([resTipo, ehExtern, ehStatic])
+
+        se (ehConst) resTipo.ehConst = verdadeiro
+        se (ehVolatile) resTipo.ehVolatile = verdadeiro
+        se (ehRestrict) resTipo.ehRestrict = verdadeiro
+        se (alinhAttr > 0) resTipo.alinhamentoExplicito = alinhAttr
+
+        retorna tupla([resTipo, ehExtern, ehStatic, ehWeak])
     }
 
     lerPonteiros(tipoAtual: qualquer): qualquer {
@@ -502,6 +624,18 @@ classe ParserDCC {
             se (isto.atual().tag == isto.Tok.Vezes) {
                 isto.avancar()
                 t = isto.tMod.TipoC.ponteiroPara(t)
+            } senao se (isto.atual().tag == isto.Tok.KwConst) {
+                isto.avancar()
+                t = t.clonar()
+                t.ehConst = verdadeiro
+            } senao se (isto.atual().tag == isto.Tok.KwVolatile) {
+                isto.avancar()
+                t = t.clonar()
+                t.ehVolatile = verdadeiro
+            } senao se (isto.atual().tag == isto.Tok.KwRestrict) {
+                isto.avancar()
+                t = t.clonar()
+                t.ehRestrict = verdadeiro
             } senao se (isto.atual().tag == isto.Tok.KwAttribute) {
                 isto.lerAtributosGNU()
             } senao {
@@ -516,8 +650,9 @@ classe ParserDCC {
         var dimsExpr: qualquer[] = []
         var dimsVla: logico[] = []
         enquanto (isto.atual().tag == isto.Tok.LBracket) {
+            const linArr: inteiro = isto.atual().linha
+            const colArr: inteiro = isto.atual().coluna
             isto.avancar()
-            // Qualificadores de parametro em C99: [restrict N], [static N], [const N]
             enquanto (isto.atual().tag == isto.Tok.KwRestrict ou isto.atual().tag == isto.Tok.KwConst ou isto.atual().tag == isto.Tok.KwVolatile ou isto.atual().tag == isto.Tok.KwStatic) {
                 isto.avancar()
             }
@@ -530,6 +665,10 @@ classe ParserDCC {
                 const exprDim: NoAST = isto.parseExprAtribOuCond()
                 se (isto.ehConstSimples(exprDim)) {
                     tam = isto.avaliarConstSimples(exprDim)
+                    se (tam < 0) {
+                        isto.diag.erroEm(linArr, colArr, "tamanho de array negativo (${tam}) nao e permitido",
+                            "", "E2015", 1)
+                    }
                 } senao {
                     ehVla = verdadeiro
                     exprV = exprDim
@@ -571,6 +710,7 @@ classe ParserDCC {
     }
 
     avaliarConstSimples(no: NoAST): inteiro {
+        const int64Min: inteiro = -9223372036854775807 - 1
         se (no.kind == isto.Kind.ExprInt) retorna no.valor
         se (no.kind == isto.Kind.ExprVar e isto.enumConsts.contem(no.nome)) retorna inteiro(isto.enumConsts[no.nome])
         se (no.kind == isto.Kind.ExprCast) retorna isto.avaliarConstSimples(no.filhos[0])
@@ -593,10 +733,18 @@ classe ParserDCC {
                 caso isto.OpB.Add: retorna a + b
                 caso isto.OpB.Sub: retorna a - b
                 caso isto.OpB.Mul: retorna a * b
-                caso isto.OpB.Div: retorna b != 0 ? inteiro(a / b) : 0
-                caso isto.OpB.Mod: retorna b != 0 ? a % b : 0
-                caso isto.OpB.Shl: retorna a << b
-                caso isto.OpB.Shr: retorna a >> b
+                caso isto.OpB.Div:
+                se (b == 0) isto.diag.erroEm(no.linha, no.coluna, "divisao por zero em expressao constante",
+                    "", "E2016", 1)
+                se (a == int64Min e b == -1) retorna int64Min
+                retorna a \ b
+                caso isto.OpB.Mod:
+                se (b == 0) isto.diag.erroEm(no.linha, no.coluna, "modulo por zero em expressao constante",
+                    "", "E2016", 1)
+                se (a == int64Min e b == -1) retorna 0
+                retorna a % b
+                caso isto.OpB.Shl: retorna (b >= 0 e b < 64) ? a << b : 0
+                caso isto.OpB.Shr: retorna (b >= 0 e b < 64) ? a >> b : 0
                 caso isto.OpB.BitAnd: retorna a & b
                 caso isto.OpB.BitOr: retorna a | b
                 caso isto.OpB.BitXor: retorna a ^ b
@@ -617,8 +765,7 @@ classe ParserDCC {
     inferirTamanhoArrayDeInic(tipoV: qualquer, inic: NoAST): qualquer {
         se (tipoV.base != isto.TB.Array ou tipoV.tamArray != 0 ou tipoV.ehVLA) retorna tipoV
         se (inic.kind == isto.Kind.ExprStr) {
-            const bytesMod: qualquer = importar("cgd:bytes")
-            const nBytes: inteiro = bytesMod.Bytes.deTexto(inic.textoLit).tamanho() + 1
+            const nBytes: inteiro = inic.bytesLit.tamanho() + 1
             retorna isto.tMod.TipoC.arrayDe(tipoV.alvo, nBytes)
         }
         se (inic.kind == isto.Kind.ExprInitList) {
@@ -654,7 +801,7 @@ classe ParserDCC {
                         variadica = verdadeiro
                         sustar
                     }
-                    const ptInfo: (qualquer, logico, logico) = isto.lerTipoBase()
+                    const ptInfo: (qualquer, logico, logico, logico) = isto.lerTipoBase()
                     const pDecl: (qualquer, texto) = isto.lerDeclarador(ptInfo[0])
                     var pT: qualquer = pDecl[0]
                     se (pT.base == isto.TB.Array) pT = isto.tMod.TipoC.ponteiroPara(pT.alvo)
@@ -668,15 +815,15 @@ classe ParserDCC {
         retorna tupla([pTipos, variadica])
     }
 
-    // Declarador completo: ponteiros, (*fp)(...), (*fn(params...))(retParams...) (ex: signal.h), arrays
     lerDeclarador(tipoBase: qualquer)
 
     : (qualquer, texto) {
+        isto.entrarProfundidade()
         var t: qualquer = isto.lerPonteiros(tipoBase)
         var nome: texto = ""
 
         se (isto.atual().tag == isto.Tok.LParen e (isto.espiar(1).tag == isto.Tok.Vezes ou isto.espiar(1).tag == isto.Tok.LParen)) {
-            isto.avancar() // '('
+            isto.avancar()
             var ptrsInternos: inteiro = 0
             enquanto (isto.atual().tag == isto.Tok.Vezes ou isto.atual().tag == isto.Tok.KwConst ou isto.atual().tag == isto.Tok.KwVolatile ou isto.atual().tag == isto.Tok.KwRestrict) {
                 se (isto.atual().tag == isto.Tok.Vezes) ptrsInternos++
@@ -684,7 +831,6 @@ classe ParserDCC {
             }
             se (isto.atual().tag == isto.Tok.Ident) nome = isto.avancar().lexema
 
-            // Caso especial de declarador aninhado: void (*signal(int, void (*)(int)))(int)
             se (isto.atual().tag == isto.Tok.LParen) {
                 const paramsExterno: (qualquer[], logico) = isto.lerListaParamsTipo()
                 isto.consumir(isto.Tok.RParen, "')' esperado em declarador de funcao")
@@ -693,10 +839,10 @@ classe ParserDCC {
                     paramsRet[0], paramsRet[1]))
                 const fnCompleta: qualquer = isto.tMod.TipoC.funcaoTipo(retFnPtr, paramsExterno[0],
                     paramsExterno[1])
+                isto.sairProfundidade()
                 retorna tupla([fnCompleta, nome])
             }
 
-            // Array de ponteiros de funcao: int (*ops[4])(int)
             var dimFp: inteiro = 0
             var ehArrFp: logico = falso
             se (isto.atual().tag == isto.Tok.LBracket) {
@@ -714,6 +860,7 @@ classe ParserDCC {
                 fnTipo = isto.tMod.TipoC.ponteiroPara(fnTipo)
             }
             se (ehArrFp) fnTipo = isto.tMod.TipoC.arrayDe(fnTipo, dimFp)
+            isto.sairProfundidade()
             retorna tupla([fnTipo, nome])
         }
 
@@ -721,16 +868,16 @@ classe ParserDCC {
             nome = isto.avancar().lexema
         }
         t = isto.lerDimensoesArray(t)
-        // Prototipo de funcao usado em typedef: typedef void (*sighandler_t)(int) ou typedef int cmp_t(const void*, const void*)
         se (isto.atual().tag == isto.Tok.LParen e !isto.iniciaTipoEm(0) e nome.tamanho() == 0) {
             const pAbs: (qualquer[], logico) = isto.lerListaParamsTipo()
             t = isto.tMod.TipoC.funcaoTipo(t, pAbs[0], pAbs[1])
         }
+        isto.sairProfundidade()
         retorna tupla([t, nome])
     }
 
     lerTipoAbstrato(): qualquer {
-        const info: (qualquer, logico, logico) = isto.lerTipoBase()
+        const info: (qualquer, logico, logico, logico) = isto.lerTipoBase()
         const decl: (qualquer, texto) = isto.lerDeclarador(info[0])
         retorna decl[0]
     }
@@ -761,7 +908,7 @@ classe ParserDCC {
             }
             const lin: inteiro = isto.atual().linha
             const col: inteiro = isto.atual().coluna
-            const baseInfo: (qualquer, logico, logico) = isto.lerTipoBase()
+            const baseInfo: (qualquer, logico, logico, logico) = isto.lerTipoBase()
             isto.drenarPendentes(prog.filhos)
 
             se (isto.atual().tag == isto.Tok.Semi) {
@@ -773,16 +920,16 @@ classe ParserDCC {
             const tipoItem: qualquer = decl[0]
             const nomeItem: texto = decl[1]
 
-            // Declarador ja produziu tipo Funcao (ex: void (*signal(int, ...))(int);)
             se (tipoItem.base == isto.TB.Funcao) {
                 const linkSym: texto = isto.lerAsmSimboloLink()
-                isto.lerAtributosGNU()
+                const attrFn: (logico, inteiro, logico) = isto.lerAtributosGNU()
                 isto.consumir(isto.Tok.Semi, "';' esperado apos prototipo")
                 const protoAn: NoAST = NoAST(isto.Kind.Prototipo, lin, col)
                 protoAn.tipoC = tipoItem.alvo
                 protoAn.nome = nomeItem
                 protoAn.nomeSimboloLink = linkSym
                 protoAn.ehExtern = verdadeiro
+                protoAn.ehWeak = baseInfo[3] ou attrFn[2]
                 protoAn.ehVariadica = tipoItem.ehVariadica
                 const paramsAn: NoAST = NoAST(isto.Kind.Params, lin, col)
                 para (var p: inteiro = 0; p < tipoItem.paramsFn.tamanho(); p++) {
@@ -796,21 +943,19 @@ classe ParserDCC {
                 continua
             }
 
-            // Funcao ou prototipo
             se (isto.atual().tag == isto.Tok.LParen) {
                 prog.filhos.empilhar(isto.parseRestoFuncao(tipoItem, nomeItem, baseInfo[1],
-                    baseInfo[2], lin, col))
+                    baseInfo[2], baseInfo[3], lin, col))
                 continua
             }
 
-            // Variavel global (com suporte a multiplos declaradores, __asm__ e __attribute__)
             prog.filhos.empilhar(isto.parseRestoVarGlobal(tipoItem, nomeItem, baseInfo[1],
-                baseInfo[2], lin, col))
+                baseInfo[2], baseInfo[3], lin, col))
             enquanto (isto.atual().tag == isto.Tok.Comma) {
                 isto.avancar()
                 const proxD: (qualquer, texto) = isto.lerDeclarador(baseInfo[0])
                 prog.filhos.empilhar(isto.parseRestoVarGlobal(proxD[0], proxD[1], baseInfo[1],
-                    baseInfo[2], lin, col))
+                    baseInfo[2], baseInfo[3], lin, col))
             }
             isto.consumir(isto.Tok.Semi, "';' esperado apos declaracao global")
         }
@@ -818,16 +963,18 @@ classe ParserDCC {
     }
 
     parseRestoVarGlobal(tipoV: qualquer, nomeV: texto, ehExtern: logico, ehStatic: logico,
-        lin: inteiro, col: inteiro): NoAST {
+        ehWeak: logico, lin: inteiro, col: inteiro): NoAST {
         const no: NoAST = NoAST(isto.Kind.VarGlobal, lin, col)
-        var tFinal: qualquer = tipoV
+        var tFinal: qualquer = tipoV.clonar()
         no.nome = nomeV
         no.ehExtern = ehExtern
         no.ehStatic = ehStatic
+        no.ehWeak = ehWeak
         const linkSym: texto = isto.lerAsmSimboloLink()
         se (linkSym.tamanho() > 0) no.nomeSimboloLink = linkSym
-        const attrG: (logico, inteiro) = isto.lerAtributosGNU()
+        const attrG: (logico, inteiro, logico) = isto.lerAtributosGNU()
         se (attrG[1] > 0) tFinal.alinhamentoExplicito = attrG[1]
+        se (attrG[2]) no.ehWeak = verdadeiro
         se (isto.atual().tag == isto.Tok.Igual) {
             isto.avancar()
             const inic: NoAST = isto.parseInicializador()
@@ -842,18 +989,17 @@ classe ParserDCC {
         const lin: inteiro = isto.atual().linha
         const col: inteiro = isto.atual().coluna
         isto.consumir(isto.Tok.KwTypedef, "'typedef' esperado")
-        const baseInfo: (qualquer, logico, logico) = isto.lerTipoBase()
+        const baseInfo: (qualquer, logico, logico, logico) = isto.lerTipoBase()
         var lista: NoAST[] = []
         enquanto (verdadeiro) {
             const decl: (qualquer, texto) = isto.lerDeclarador(baseInfo[0])
             var tDef: qualquer = decl[0]
-            // typedef int fn_t(int);
             se (isto.atual().tag == isto.Tok.LParen) {
                 const pTd: (qualquer[], logico) = isto.lerListaParamsTipo()
                 tDef = isto.tMod.TipoC.funcaoTipo(tDef, pTd[0], pTd[1])
             }
             isto.lerAtributosGNU()
-            isto.typedefs[decl[1]] = tDef
+            isto.definirTypedef(decl[1], tDef)
             const no: NoAST = NoAST(isto.Kind.DeclTypedef, lin, col)
             no.nome = decl[1]
             no.tipoC = tDef
@@ -890,6 +1036,7 @@ classe ParserDCC {
     }
 
     parseCorpoAgregado(nomeA: texto, ehUnion: logico, lin: inteiro): NoAST {
+        isto.entrarProfundidade()
         isto.consumir(isto.Tok.LBrace, "'{' esperado")
         const no: NoAST = NoAST(ehUnion ? isto.Kind.DeclUnion : isto.Kind.DeclStruct, lin)
         no.nome = nomeA
@@ -900,9 +1047,8 @@ classe ParserDCC {
             }
             const cLin: inteiro = isto.atual().linha
             const cCol: inteiro = isto.atual().coluna
-            const cBase: (qualquer, logico, logico) = isto.lerTipoBase()
+            const cBase: (qualquer, logico, logico, logico) = isto.lerTipoBase()
 
-            // Campo struct/union anonimo embutido (C11/GNU usado em headers glibc): union { ... };
             se (isto.atual().tag == isto.Tok.Semi) {
                 isto.avancar()
                 const campoAnon: NoAST = NoAST(isto.Kind.Campo, cLin, cCol)
@@ -913,23 +1059,22 @@ classe ParserDCC {
             }
 
             enquanto (verdadeiro) {
-                var cTipo: qualquer = cBase[0]
+                var cTipo: qualquer = cBase[0].clonar()
                 var cNome: texto = ""
                 se (isto.atual().tag != isto.Tok.Colon) {
                     const cDecl: (qualquer, texto) = isto.lerDeclarador(cBase[0])
-                    cTipo = cDecl[0]
+                    cTipo = cDecl[0].clonar()
                     cNome = cDecl[1]
                 }
                 const campo: NoAST = NoAST(isto.Kind.Campo, cLin, cCol)
                 campo.nome = cNome
                 campo.tipoC = cTipo
-                // Bit-field C99: unsigned int flags : 3;
                 se (isto.atual().tag == isto.Tok.Colon) {
                     isto.avancar()
                     campo.ehBitField = verdadeiro
                     campo.bitWidth = isto.avaliarConstSimples(isto.parseExprAtribOuCond())
                 }
-                const cAttr: (logico, inteiro) = isto.lerAtributosGNU()
+                const cAttr: (logico, inteiro, logico) = isto.lerAtributosGNU()
                 se (cAttr[1] > 0) campo.tipoC.alinhamentoExplicito = cAttr[1]
                 no.filhos.empilhar(campo)
                 se (isto.atual().tag == isto.Tok.Comma) isto.avancar()
@@ -938,11 +1083,12 @@ classe ParserDCC {
             isto.consumir(isto.Tok.Semi, "';' esperado apos campo")
         }
         isto.consumir(isto.Tok.RBrace, "'}' esperado")
+        isto.sairProfundidade()
         retorna no
     }
 
     parseRestoFuncao(tipoRet: qualquer, nomeFn: texto, ehExtern: logico, ehStatic: logico,
-        lin: inteiro, col: inteiro): NoAST {
+        ehWeak: logico, lin: inteiro, col: inteiro): NoAST {
         isto.consumir(isto.Tok.LParen, "'(' esperado")
         const params: NoAST = NoAST(isto.Kind.Params, lin, col)
         var ehVariadica: logico = falso
@@ -959,7 +1105,7 @@ classe ParserDCC {
                     }
                     const pLin: inteiro = isto.atual().linha
                     const pCol: inteiro = isto.atual().coluna
-                    const pBase: (qualquer, logico, logico) = isto.lerTipoBase()
+                    const pBase: (qualquer, logico, logico, logico) = isto.lerTipoBase()
                     const pDecl: (qualquer, texto) = isto.lerDeclarador(pBase[0])
                     var pTipo: qualquer = pDecl[0]
                     se (pTipo.base == isto.TB.Array) {
@@ -980,13 +1126,14 @@ classe ParserDCC {
         }
         isto.consumir(isto.Tok.RParen, "')' esperado")
 
-        // Extensoes GNU pos-parametros em headers glibc: __asm__("sym") e __attribute__((...))
         var linkSym: texto = ""
+        var weakPos: logico = ehWeak
         enquanto (isto.atual().tag == isto.Tok.KwAsm ou isto.atual().tag == isto.Tok.KwAttribute) {
             se (isto.atual().tag == isto.Tok.KwAsm) {
                 linkSym = isto.lerAsmSimboloLink()
             } senao {
-                isto.lerAtributosGNU()
+                const aPos: (logico, inteiro, logico) = isto.lerAtributosGNU()
+                se (aPos[2]) weakPos = verdadeiro
             }
         }
 
@@ -998,6 +1145,7 @@ classe ParserDCC {
             proto.nomeSimboloLink = linkSym
             proto.ehExtern = ehExtern
             proto.ehStatic = ehStatic
+            proto.ehWeak = weakPos
             proto.ehVariadica = ehVariadica
             proto.filhos.empilhar(params)
             retorna proto
@@ -1008,16 +1156,25 @@ classe ParserDCC {
         fn.nome = nomeFn
         fn.nomeSimboloLink = linkSym
         fn.ehStatic = ehStatic
+        fn.ehWeak = weakPos
         fn.ehVariadica = ehVariadica
         fn.filhos.empilhar(params)
+
+        isto.entrarEscopoTypedef()
+        para (var p: inteiro = 0; p < params.filhos.tamanho(); p++) {
+            isto.sombrearNomeNoEscopo(params.filhos[p].nome)
+        }
         fn.filhos.empilhar(isto.parseBloco())
+        isto.sairEscopoTypedef()
         retorna fn
     }
 
     parseBloco(): NoAST {
+        isto.entrarProfundidade()
         const lin: inteiro = isto.atual().linha
         const col: inteiro = isto.atual().coluna
         isto.consumir(isto.Tok.LBrace, "'{' esperado")
+        isto.entrarEscopoTypedef()
         const bloco: NoAST = NoAST(isto.Kind.Bloco, lin, col)
         enquanto (isto.atual().tag != isto.Tok.RBrace e isto.atual().tag != isto.Tok.Fim) {
             se (isto.atual().tag == isto.Tok.Semi) {
@@ -1037,10 +1194,13 @@ classe ParserDCC {
             }
         }
         isto.consumir(isto.Tok.RBrace, "'}' esperado")
+        isto.sairEscopoTypedef()
+        isto.sairProfundidade()
         retorna bloco
     }
 
     parseInicializador(): NoAST {
+        isto.entrarProfundidade()
         se (isto.atual().tag == isto.Tok.LBrace) {
             const lin: inteiro = isto.atual().linha
             const col: inteiro = isto.atual().coluna
@@ -1076,15 +1236,18 @@ classe ParserDCC {
                 senao sustar
             }
             isto.consumir(isto.Tok.RBrace, "'}' esperado em lista de inicializacao")
+            isto.sairProfundidade()
             retorna lista
         }
-        retorna isto.parseAtrib()
+        const resInic: NoAST = isto.parseAtrib()
+        isto.sairProfundidade()
+        retorna resInic
     }
 
     parseDeclVarLocal(destino: NoAST[], comPontoVirgula: logico): vazio {
         const lin: inteiro = isto.atual().linha
         const col: inteiro = isto.atual().coluna
-        const baseInfo: (qualquer, logico, logico) = isto.lerTipoBase()
+        const baseInfo: (qualquer, logico, logico, logico) = isto.lerTipoBase()
         isto.drenarPendentes(destino)
         se (comPontoVirgula e isto.atual().tag == isto.Tok.Semi) {
             isto.avancar()
@@ -1092,13 +1255,14 @@ classe ParserDCC {
         }
         enquanto (verdadeiro) {
             const decl: (qualquer, texto) = isto.lerDeclarador(baseInfo[0])
-            var tipoV: qualquer = decl[0]
-            const attrL: (logico, inteiro) = isto.lerAtributosGNU()
+            var tipoV: qualquer = decl[0].clonar()
+            const attrL: (logico, inteiro, logico) = isto.lerAtributosGNU()
             se (attrL[1] > 0) tipoV.alinhamentoExplicito = attrL[1]
             const no: NoAST = NoAST(isto.Kind.VarDecl, lin, col)
             no.nome = decl[1]
             no.ehStatic = baseInfo[2]
             no.ehExtern = baseInfo[1]
+            isto.sombrearNomeNoEscopo(decl[1])
             se (isto.atual().tag == isto.Tok.Igual) {
                 isto.avancar()
                 const inic: NoAST = isto.parseInicializador()
@@ -1114,6 +1278,13 @@ classe ParserDCC {
     }
 
     parseStmt(): NoAST {
+        isto.entrarProfundidade()
+        const res: NoAST = isto.parseStmtInterno()
+        isto.sairProfundidade()
+        retorna res
+    }
+
+    parseStmtInterno(): NoAST {
         const tag: qualquer = isto.atual().tag
         const lin: inteiro = isto.atual().linha
         const col: inteiro = isto.atual().coluna
@@ -1124,7 +1295,8 @@ classe ParserDCC {
             retorna NoAST(isto.Kind.StmtVazio, lin, col)
         }
         se (tag == isto.Tok.KwAsm) {
-            isto.diag.erroEm(lin, col, "inline assembly (__asm__) dentro de funcoes nao e suportado (Categoria C)")
+            isto.diag.erroEm(lin, col, "inline assembly (__asm__) dentro de funcoes nao e suportado (Categoria C)",
+                "", "E2103", 7)
         }
         se (isto.iniciaTipo()) {
             const blocoTemp: NoAST = NoAST(isto.Kind.Bloco, lin, col)
@@ -1183,6 +1355,7 @@ classe ParserDCC {
             caso isto.Tok.KwFor:
             isto.avancar()
             isto.consumir(isto.Tok.LParen, "'(' esperado")
+            isto.entrarEscopoTypedef()
             var inicF: NoAST = NoAST(isto.Kind.StmtVazio, lin, col)
             se (isto.atual().tag != isto.Tok.Semi) {
                 se (isto.iniciaTipo()) {
@@ -1208,6 +1381,7 @@ classe ParserDCC {
             }
             isto.consumir(isto.Tok.RParen, "')' esperado no for")
             const corpoF: NoAST = isto.parseStmt()
+            isto.sairEscopoTypedef()
             const noF: NoAST = NoAST(isto.Kind.StmtFor, lin, col)
             noF.filhos.empilhar(inicF)
             noF.filhos.empilhar(condF)
@@ -1228,14 +1402,20 @@ classe ParserDCC {
                 const ramoCaso: NoAST = NoAST(isto.Kind.StmtCase, cLin, cCol)
                 se (isto.atual().tag == isto.Tok.KwCase) {
                     isto.avancar()
-                    ramoCaso.filhos.empilhar(isto.parseExpr())
+                    const exprCaso: NoAST = isto.parseTernario()
+                    ramoCaso.filhos.empilhar(exprCaso)
+                    se (isto.ehConstSimples(exprCaso)) {
+                        ramoCaso.valor = isto.avaliarConstSimples(exprCaso)
+                        ramoCaso.ehLongo = verdadeiro // marca que valor constante foi avaliado
+                    }
                     isto.consumir(isto.Tok.Colon, "':' esperado em case")
                 } senao se (isto.atual().tag == isto.Tok.KwDefault) {
                     isto.avancar()
                     ramoCaso.ehSeta = verdadeiro
                     isto.consumir(isto.Tok.Colon, "':' esperado em default")
                 } senao {
-                    isto.diag.erroEm(cLin, cCol, "'case' ou 'default' esperado em switch")
+                    isto.diag.erroEm(cLin, cCol, "'case' ou 'default' esperado em switch",
+                        "", "E2013", 1)
                 }
                 const corpoCaso: NoAST = NoAST(isto.Kind.Bloco, cLin, cCol)
                 enquanto (isto.atual().tag != isto.Tok.KwCase e isto.atual().tag != isto.Tok.KwDefault e isto.atual().tag != isto.Tok.RBrace e isto.atual().tag != isto.Tok.Fim) {
@@ -1256,6 +1436,10 @@ classe ParserDCC {
             retorna NoAST(isto.Kind.StmtContinue, lin, col)
             caso isto.Tok.KwGoto:
             isto.avancar()
+            se (isto.atual().tag == isto.Tok.Vezes) {
+                isto.diag.erroEm(lin, col, "goto computado GNU ('goto *expr') nao e suportado (Categoria C)",
+                    "", "E2102", 4)
+            }
             const alvoLbl: texto = isto.consumir(isto.Tok.Ident, "label esperado apos goto").lexema
             isto.consumir(isto.Tok.Semi, "';' esperado apos goto")
             const noG: NoAST = NoAST(isto.Kind.StmtGoto, lin, col)
@@ -1279,6 +1463,7 @@ classe ParserDCC {
     }
 
     parseExpr(): NoAST {
+        isto.entrarProfundidade()
         var esq: NoAST = isto.parseAtrib()
         enquanto (isto.atual().tag == isto.Tok.Comma) {
             const lin: inteiro = isto.atual().linha
@@ -1289,6 +1474,7 @@ classe ParserDCC {
             no.filhos.empilhar(isto.parseAtrib())
             esq = no
         }
+        isto.sairProfundidade()
         retorna esq
     }
 
@@ -1312,7 +1498,7 @@ classe ParserDCC {
     }
 
     parseTernario(): NoAST {
-        const cond: NoAST = isto.parseOrLog()
+        const cond: NoAST = isto.parseBinaria(1)
         se (isto.atual().tag == isto.Tok.Interrog) {
             isto.avancar()
             const sim: NoAST = isto.parseExpr()
@@ -1327,131 +1513,20 @@ classe ParserDCC {
         retorna cond
     }
 
-    parseOrLog(): NoAST {
-        var esq: NoAST = isto.parseAndLog()
-        enquanto (isto.atual().tag == isto.Tok.OrLog) {
-            const t: qualquer = isto.avancar()
-            const no: NoAST = NoAST(isto.Kind.ExprBinaria, t.linha, t.coluna)
-            no.opBin = isto.OpB.LogOr
-            no.filhos.empilhar(esq)
-            no.filhos.empilhar(isto.parseAndLog())
-            esq = no
-        }
-        retorna esq
-    }
-
-    parseAndLog(): NoAST {
-        var esq: NoAST = isto.parseBitOr()
-        enquanto (isto.atual().tag == isto.Tok.AndLog) {
-            const t: qualquer = isto.avancar()
-            const no: NoAST = NoAST(isto.Kind.ExprBinaria, t.linha, t.coluna)
-            no.opBin = isto.OpB.LogAnd
-            no.filhos.empilhar(esq)
-            no.filhos.empilhar(isto.parseBitOr())
-            esq = no
-        }
-        retorna esq
-    }
-
-    parseBitOr(): NoAST {
-        var esq: NoAST = isto.parseBitXor()
-        enquanto (isto.atual().tag == isto.Tok.BitOr) {
-            const t: qualquer = isto.avancar()
-            const no: NoAST = NoAST(isto.Kind.ExprBinaria, t.linha, t.coluna)
-            no.opBin = isto.OpB.BitOr
-            no.filhos.empilhar(esq)
-            no.filhos.empilhar(isto.parseBitXor())
-            esq = no
-        }
-        retorna esq
-    }
-
-    parseBitXor(): NoAST {
-        var esq: NoAST = isto.parseBitAnd()
-        enquanto (isto.atual().tag == isto.Tok.BitXor) {
-            const t: qualquer = isto.avancar()
-            const no: NoAST = NoAST(isto.Kind.ExprBinaria, t.linha, t.coluna)
-            no.opBin = isto.OpB.BitXor
-            no.filhos.empilhar(esq)
-            no.filhos.empilhar(isto.parseBitAnd())
-            esq = no
-        }
-        retorna esq
-    }
-
-    parseBitAnd(): NoAST {
-        var esq: NoAST = isto.parseIgualdade()
-        enquanto (isto.atual().tag == isto.Tok.BitAnd) {
-            const t: qualquer = isto.avancar()
-            const no: NoAST = NoAST(isto.Kind.ExprBinaria, t.linha, t.coluna)
-            no.opBin = isto.OpB.BitAnd
-            no.filhos.empilhar(esq)
-            no.filhos.empilhar(isto.parseIgualdade())
-            esq = no
-        }
-        retorna esq
-    }
-
-    parseIgualdade(): NoAST {
-        var esq: NoAST = isto.parseRelacional()
-        enquanto (isto.atual().tag == isto.Tok.Eq ou isto.atual().tag == isto.Tok.Neq) {
-            const t: qualquer = isto.avancar()
-            const no: NoAST = NoAST(isto.Kind.ExprBinaria, t.linha, t.coluna)
-            no.opBin = t.tag == isto.Tok.Eq ? isto.OpB.Eq : isto.OpB.Neq
-            no.filhos.empilhar(esq)
-            no.filhos.empilhar(isto.parseRelacional())
-            esq = no
-        }
-        retorna esq
-    }
-
-    parseRelacional(): NoAST {
-        var esq: NoAST = isto.parseShift()
-        enquanto (isto.mapaRel.contem(isto.atual().lexema)) {
-            const t: qualquer = isto.avancar()
-            const no: NoAST = NoAST(isto.Kind.ExprBinaria, t.linha, t.coluna)
-            no.opBin = isto.mapaRel[t.lexema]
-            no.filhos.empilhar(esq)
-            no.filhos.empilhar(isto.parseShift())
-            esq = no
-        }
-        retorna esq
-    }
-
-    parseShift(): NoAST {
-        var esq: NoAST = isto.parseAdicao()
-        enquanto (isto.atual().tag == isto.Tok.Shl ou isto.atual().tag == isto.Tok.Shr) {
-            const t: qualquer = isto.avancar()
-            const no: NoAST = NoAST(isto.Kind.ExprBinaria, t.linha, t.coluna)
-            no.opBin = t.tag == isto.Tok.Shl ? isto.OpB.Shl : isto.OpB.Shr
-            no.filhos.empilhar(esq)
-            no.filhos.empilhar(isto.parseAdicao())
-            esq = no
-        }
-        retorna esq
-    }
-
-    parseAdicao(): NoAST {
-        var esq: NoAST = isto.parseFator()
-        enquanto (isto.atual().tag == isto.Tok.Mais ou isto.atual().tag == isto.Tok.Menos) {
-            const t: qualquer = isto.avancar()
-            const no: NoAST = NoAST(isto.Kind.ExprBinaria, t.linha, t.coluna)
-            no.opBin = t.tag == isto.Tok.Mais ? isto.OpB.Add : isto.OpB.Sub
-            no.filhos.empilhar(esq)
-            no.filhos.empilhar(isto.parseFator())
-            esq = no
-        }
-        retorna esq
-    }
-
-    parseFator(): NoAST {
+    // Precedence Climbing O(1) em profundidade de pilha para todos os 10 niveis binarios C99
+    parseBinaria(minPrec: inteiro): NoAST {
         var esq: NoAST = isto.parseCast()
-        enquanto (isto.mapaFator.contem(isto.atual().lexema)) {
+        enquanto (verdadeiro) {
+            const lex: texto = isto.atual().lexema
+            se (!isto.mapaBinPrec.contem(lex)) sustar
+            const prec: inteiro = inteiro(isto.mapaBinPrec[lex])
+            se (prec < minPrec) sustar
             const t: qualquer = isto.avancar()
+            const dir: NoAST = isto.parseBinaria(prec + 1)
             const no: NoAST = NoAST(isto.Kind.ExprBinaria, t.linha, t.coluna)
-            no.opBin = isto.mapaFator[t.lexema]
+            no.opBin = isto.mapaBinOp[lex]
             no.filhos.empilhar(esq)
-            no.filhos.empilhar(isto.parseCast())
+            no.filhos.empilhar(dir)
             esq = no
         }
         retorna esq
@@ -1487,12 +1562,24 @@ classe ParserDCC {
             isto.avancar()
             retorna isto.parseUnario()
         }
+        // GNU Category C: label computado &&label
+        se (t.tag == isto.Tok.AndLog) {
+            isto.diag.erroEm(t.linha, t.coluna, "label computado GNU ('&&label') nao e suportado (Categoria C)",
+                "", "E2102", 2)
+        }
         se (t.tag == isto.Tok.KwSizeof) {
             isto.avancar()
             se (isto.atual().tag == isto.Tok.LParen e isto.iniciaTipoEm(1)) {
+                const posSalvaS: inteiro = isto.pos
                 isto.avancar()
                 const tAlvo: qualquer = isto.lerTipoAbstrato()
                 isto.consumir(isto.Tok.RParen, "')' esperado em sizeof")
+                se (isto.atual().tag == isto.Tok.LBrace) {
+                    isto.pos = posSalvaS
+                    const noES: NoAST = NoAST(isto.Kind.ExprSizeofExpr, t.linha, t.coluna)
+                    noES.filhos.empilhar(isto.parseUnario())
+                    retorna noES
+                }
                 const no: NoAST = NoAST(isto.Kind.ExprSizeofTipo, t.linha, t.coluna)
                 no.tipoC = tAlvo
                 retorna no
@@ -1508,7 +1595,7 @@ classe ParserDCC {
             isto.consumir(isto.Tok.RParen, "')' esperado em _Alignof")
             const noAl: NoAST = NoAST(isto.Kind.ExprSizeofTipo, t.linha, t.coluna)
             noAl.tipoC = tAl
-            noAl.ehSeta = verdadeiro // indica _Alignof em vez de sizeof
+            noAl.ehSeta = verdadeiro
             retorna noAl
         }
         se (isto.mapaUnario.contem(t.lexema)) {
@@ -1595,25 +1682,36 @@ classe ParserDCC {
             isto.avancar()
             const noF: NoAST = NoAST(isto.Kind.ExprFloat, t.linha, t.coluna)
             noF.valorReal = t.valorReal
+            noF.ehFloat32 = t.ehFloat32
             retorna noF
             caso isto.Tok.StrLit:
             isto.avancar()
             const noS: NoAST = NoAST(isto.Kind.ExprStr, t.linha, t.coluna)
             noS.textoLit = t.lexema
+            noS.bytesLit = t.bytesStr
             retorna noS
             caso isto.Tok.LParen:
+            // GNU Category C: statement expression ({ ... })
+            se (isto.espiar(1).tag == isto.Tok.LBrace) {
+                isto.diag.erroEm(t.linha, t.coluna, "statement expression GNU ('({...})') nao e suportada (Categoria C)",
+                    "", "E2101", 2)
+            }
             se (isto.iniciaTipoEm(1)) {
+                const posSalvaP: inteiro = isto.pos
                 const linCL: inteiro = t.linha
                 const colCL: inteiro = t.coluna
                 isto.avancar()
                 var tCL: qualquer = isto.lerTipoAbstrato()
-                isto.consumir(isto.Tok.RParen, "')' esperado em literal composto")
-                const inicCL: NoAST = isto.parseInicializador()
-                tCL = isto.inferirTamanhoArrayDeInic(tCL, inicCL)
-                const noCL: NoAST = NoAST(isto.Kind.ExprLiteralComposto, linCL, colCL)
-                noCL.tipoC = tCL
-                noCL.filhos.empilhar(inicCL)
-                retorna noCL
+                se (isto.atual().tag == isto.Tok.RParen e isto.espiar(1).tag == isto.Tok.LBrace) {
+                    isto.avancar()
+                    const inicCL: NoAST = isto.parseInicializador()
+                    tCL = isto.inferirTamanhoArrayDeInic(tCL, inicCL)
+                    const noCL: NoAST = NoAST(isto.Kind.ExprLiteralComposto, linCL, colCL)
+                    noCL.tipoC = tCL
+                    noCL.filhos.empilhar(inicCL)
+                    retorna noCL
+                }
+                isto.pos = posSalvaP
             }
             isto.avancar()
             const interna: NoAST = isto.parseExpr()
@@ -1670,11 +1768,16 @@ classe ParserDCC {
                 isto.avancar()
                 const tOff: qualquer = isto.lerTipoAbstrato()
                 isto.consumir(isto.Tok.Comma, "',' esperado em __builtin_offsetof")
-                const mOff: texto = isto.consumir(isto.Tok.Ident, "campo esperado em __builtin_offsetof").lexema
+                var caminhoOff: texto = isto.consumir(isto.Tok.Ident, "campo esperado em __builtin_offsetof").lexema
+                enquanto (isto.atual().tag == isto.Tok.Dot) {
+                    isto.avancar()
+                    const subC: texto = isto.consumir(isto.Tok.Ident, "subcampo esperado em __builtin_offsetof").lexema
+                    caminhoOff = caminhoOff + "." + subC
+                }
                 isto.consumir(isto.Tok.RParen, "')' esperado em __builtin_offsetof")
                 const noOf: NoAST = NoAST(isto.Kind.ExprOffsetof, t.linha, t.coluna)
                 noOf.tipoC = tOff
-                noOf.nome = mOff
+                noOf.nome = caminhoOff
                 retorna noOf
             }
             isto.avancar()
@@ -1682,7 +1785,8 @@ classe ParserDCC {
             v.nome = t.lexema
             retorna v
             padrao:
-            isto.diag.erroEm(t.linha, t.coluna, "expressao C99 invalida '${t.lexema}'")
+            isto.diag.erroEm(t.linha, t.coluna, "expressao C99 invalida '${t.lexema}'", "",
+                "E2014", t.lexema.tamanho())
         }
         retorna NoAST(isto.Kind.ExprInt, t.linha, t.coluna)
     }

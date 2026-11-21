@@ -1,0 +1,277 @@
+// Utilitarios compartilhados para classificacao de caracteres, escapes C99 e literais numericos.
+// Utilizados pelo pre-processador e pelo lexer sem duplicacao de logica.
+
+// Classificador com tabelas ASCII em memoria e cache de cgd:nativo.Primitivas
+// para evitar FFI e importar() por caractere em loops quentes do pre-processador e lexer.
+classe ClassificadorChar {
+    prim: qualquer
+    mapaDig: dicionario
+    mapaOct: dicionario
+    mapaHex: dicionario
+    mapaIdIni: dicionario
+    mapaIdCont: dicionario
+
+    construtor() {
+        isto.prim = importar("cgd:nativo").Primitivas
+        isto.mapaDig = {
+            "0": verdadeiro, "1": verdadeiro, "2": verdadeiro, "3": verdadeiro, "4": verdadeiro,
+            "5": verdadeiro, "6": verdadeiro, "7": verdadeiro, "8": verdadeiro, "9": verdadeiro
+        }
+        isto.mapaOct = {
+            "0": verdadeiro, "1": verdadeiro, "2": verdadeiro, "3": verdadeiro,
+            "4": verdadeiro, "5": verdadeiro, "6": verdadeiro, "7": verdadeiro
+        }
+        isto.mapaHex = {
+            "0": 0, "1": 1, "2": 2, "3": 3, "4": 4, "5": 5, "6": 6, "7": 7, "8": 8, "9": 9,
+            "a": 10, "b": 11, "c": 12, "d": 13, "e": 14, "f": 15,
+            "A": 10, "B": 11, "C": 12, "D": 13, "E": 14, "F": 15
+        }
+        isto.mapaIdIni = {}
+        isto.mapaIdCont = {}
+        const letras: texto = "abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ_$"
+        para (var i: inteiro = 0; i < letras.tamanho(); i++) {
+            const ch: texto = letras[i]
+            isto.mapaIdIni[ch] = verdadeiro
+            isto.mapaIdCont[ch] = verdadeiro
+        }
+        const digs: texto = "0123456789"
+        para (var i: inteiro = 0; i < digs.tamanho(); i++) {
+            isto.mapaIdCont[digs[i]] = verdadeiro
+        }
+    }
+
+    codigo(c: texto): inteiro {
+        se (c.tamanho() == 0) retorna 0
+        retorna isto.prim.codigoUnicode(c)
+    }
+
+    ehDigitoDec(c: texto): logico {
+        retorna isto.mapaDig.contem(c)
+    }
+
+    ehDigitoOct(c: texto): logico {
+        retorna isto.mapaOct.contem(c)
+    }
+
+    hexDigitoValor(c: texto): inteiro {
+        se (isto.mapaHex.contem(c)) retorna inteiro(isto.mapaHex[c])
+        retorna -1
+    }
+
+    ehInicioIdent(c: texto): logico {
+        retorna isto.mapaIdIni.contem(c)
+    }
+
+    ehContIdent(c: texto): logico {
+        retorna isto.mapaIdCont.contem(c)
+    }
+}
+
+funcao codigoChar(c: texto): inteiro {
+    se (c.tamanho() == 0) retorna 0
+    const prim: qualquer = importar("cgd:nativo").Primitivas
+    retorna prim.codigoUnicode(c)
+}
+
+funcao ehDigitoDec(c: texto): logico {
+    const cd: inteiro = codigoChar(c)
+    retorna cd >= 48 e cd <= 57
+}
+
+funcao ehDigitoOct(c: texto): logico {
+    const cd: inteiro = codigoChar(c)
+    retorna cd >= 48 e cd <= 55
+}
+
+funcao hexDigitoValor(c: texto): inteiro {
+    const cd: inteiro = codigoChar(c)
+    se (cd >= 48 e cd <= 57) retorna cd - 48
+    se (cd >= 65 e cd <= 70) retorna cd - 55
+    se (cd >= 97 e cd <= 102) retorna cd - 87
+    retorna -1
+}
+
+funcao ehInicioIdent(c: texto): logico {
+    const cd: inteiro = codigoChar(c)
+    retorna (cd >= 65 e cd <= 90) ou (cd >= 97 e cd <= 122) ou cd == 95 ou cd == 36
+}
+
+funcao ehContIdent(c: texto): logico {
+    const cd: inteiro = codigoChar(c)
+    retorna (cd >= 65 e cd <= 90) ou (cd >= 97 e cd <= 122) ou (cd >= 48 e cd <= 57) ou cd == 95 ou cd == 36
+}
+
+// Decodifica sequencia de escape C99 a partir do caractere logo apos '\'.
+// Retorna (valorByte, quantidadeDeCaracteresConsumidosAposBarra).
+funcao decodificarEscapeC99(fonte: texto, posEsc: inteiro, n: inteiro): (inteiro, inteiro) {
+    se (posEsc >= n) retorna tupla([0, 0])
+    const esc: texto = fonte[posEsc]
+    se (esc == "n") retorna tupla([10, 1])
+    se (esc == "t") retorna tupla([9, 1])
+    se (esc == "r") retorna tupla([13, 1])
+    se (esc == "a") retorna tupla([7, 1])
+    se (esc == "b") retorna tupla([8, 1])
+    se (esc == "f") retorna tupla([12, 1])
+    se (esc == "v") retorna tupla([11, 1])
+    se (esc == "\\") retorna tupla([92, 1])
+    se (esc == "'") retorna tupla([39, 1])
+    se (esc == "\"") retorna tupla([34, 1])
+    se (esc == "?") retorna tupla([63, 1])
+
+    // Hexadecimal: \xHH...
+    se (esc == "x") {
+        var valH: inteiro = 0
+        var p: inteiro = posEsc + 1
+        enquanto (p < n) {
+            const d: inteiro = hexDigitoValor(fonte[p])
+            se (d < 0) sustar
+            valH = ((valH << 4) | d) & 255
+            p++
+        }
+        retorna tupla([valH, p - posEsc])
+    }
+
+    // Octal: \0 .. \377 (ate 3 digitos octais conforme C99 6.4.4.4)
+    se (ehDigitoOct(esc)) {
+        var valO: inteiro = codigoChar(esc) - 48
+        var p: inteiro = posEsc + 1
+        var cnt: inteiro = 1
+        enquanto (p < n e cnt < 3 e ehDigitoOct(fonte[p])) {
+            valO = (valO << 3) | (codigoChar(fonte[p]) - 48)
+            p++
+            cnt++
+        }
+        retorna tupla([valO & 255, cnt])
+    }
+
+    retorna tupla([codigoChar(esc) & 255, 1])
+}
+
+// Faz parse de literal inteiro C99 (dec, hex, oct, bin) com sufixos u/U/l/L.
+// Retorna (valor64, ehSemSinal, ehLongo).
+funcao parseInteiroC99(lex: texto): (inteiro, logico, logico) {
+    var semSinal: logico = falso
+    var longo: logico = falso
+    var fim: inteiro = lex.tamanho()
+    enquanto (fim > 0) {
+        const ch: texto = lex[fim - 1]
+        se (ch == "u" ou ch == "U") {
+            semSinal = verdadeiro
+            fim--
+        } senao se (ch == "l" ou ch == "L") {
+            longo = verdadeiro
+            fim--
+        } senao {
+            sustar
+        }
+    }
+
+    const s: texto = lex.fatiar(0, fim)
+    se (s.tamanho() == 0) retorna tupla([0, semSinal, longo])
+
+    var lo: inteiro = 0
+    var hi: inteiro = 0
+    var base: inteiro = 10
+    var inicio: inteiro = 0
+    se (s.tamanho() >= 2 e s[0] == "0" e (s[1] == "x" ou s[1] == "X")) {
+        base = 16
+        inicio = 2
+    } senao se (s.tamanho() >= 2 e s[0] == "0" e (s[1] == "b" ou s[1] == "B")) {
+        base = 2
+        inicio = 2
+    } senao se (s.tamanho() >= 2 e s[0] == "0") {
+        base = 8
+        inicio = 1
+    }
+
+    // Aritmetica em duas metades de 32 bits evita overflow de inteiro 64-bit com sinal
+    // em Delegua ao ler literais ate UINT64_MAX (18446744073709551615ULL).
+    para (var i: inteiro = inicio; i < s.tamanho(); i++) {
+        const d: inteiro = hexDigitoValor(s[i])
+        se (d < 0 ou d >= base) {
+            se (base == 10) sustar
+            continua
+        }
+        const loNovo: inteiro = lo * base + d
+        const carry: inteiro = loNovo >> 32
+        lo = loNovo & 4294967295
+        hi = (hi * base + carry) & 4294967295
+    }
+
+    const bit63: inteiro = -9223372036854775807 - 1
+    var val: inteiro = ((hi & 2147483647) << 32) | lo
+    se ((hi & 2147483648) != 0) {
+        val = val | bit63
+        semSinal = verdadeiro
+        longo = verdadeiro
+    }
+
+    se (hi != 0 ou (!semSinal e lo > 2147483647)) longo = verdadeiro
+    retorna tupla([val, semSinal, longo])
+}
+
+// Parse de literal hexadecimal de ponto flutuante ISO C99 (ex: 0x1.fp+3, 0x1p-2f)
+funcao parseHexFloatC99(lex: texto): (real, logico) {
+    var fim: inteiro = lex.tamanho()
+    enquanto (fim > 0 e (lex[fim - 1] == "f" ou lex[fim - 1] == "F" ou lex[fim - 1] == "l" ou lex[fim - 1] == "L")) {
+        fim--
+    }
+
+    const s: texto = lex.fatiar(0, fim)
+    se (s.tamanho() < 4) retorna tupla([0.0, falso])
+    var pos: inteiro = 2 // pula "0x"
+    var mantissa: real = 0.0
+    var viuDigito: logico = falso
+    enquanto (pos < s.tamanho()) {
+        const d: inteiro = hexDigitoValor(s[pos])
+        se (d < 0) sustar
+        mantissa = mantissa * 16.0 + real(d)
+        viuDigito = verdadeiro
+        pos++
+    }
+
+    se (pos < s.tamanho() e s[pos] == ".") {
+        pos++
+        var peso: real = 1.0 / 16.0
+        enquanto (pos < s.tamanho()) {
+            const d: inteiro = hexDigitoValor(s[pos])
+            se (d < 0) sustar
+            mantissa = mantissa + real(d) * peso
+            peso = peso / 16.0
+            viuDigito = verdadeiro
+            pos++
+        }
+    }
+
+    se (!viuDigito ou pos >= s.tamanho() ou (s[pos] != "p" e s[pos] != "P")) {
+        retorna tupla([0.0, falso])
+    }
+
+    pos++
+    var negExp: logico = falso
+    se (pos < s.tamanho() e (s[pos] == "+" ou s[pos] == "-")) {
+        negExp = s[pos] == "-"
+        pos++
+    }
+
+    se (pos >= s.tamanho() ou !ehDigitoDec(s[pos])) {
+        retorna tupla([0.0, falso])
+    }
+
+    var expVal: inteiro = 0
+    enquanto (pos < s.tamanho() e ehDigitoDec(s[pos])) {
+        se (expVal < 10000) expVal = expVal * 10 + (codigoChar(s[pos]) - 48)
+        pos++
+    }
+
+    se (pos != s.tamanho()) retorna tupla([0.0, falso])
+
+    var res: real = mantissa
+    se (negExp) {
+        para (var k: inteiro = 0; k < expVal e res != 0.0; k++) res = res / 2.0
+    } senao {
+        para (var k: inteiro = 0; k < expVal; k++) res = res * 2.0
+    }
+
+    retorna tupla([res, verdadeiro])
+}

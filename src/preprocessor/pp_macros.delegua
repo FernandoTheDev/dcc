@@ -1,0 +1,253 @@
+// Tokenizacao e expansao de macros do pre-processador ISO C99 / GNU99 do DCC.
+// Implementa hide-set (Prosser), stringificacao (#), token pasting (##), macros variadicas
+// (__VA_ARGS__ e , ##__VA_ARGS__) e limites anti-DoS contra expansao exponencial.
+
+enum PPTokKind {
+    Ident,
+    Num,
+    Str,
+    Char,
+    Punct,
+    Hash,
+    HashHash,
+    Fim
+}
+
+classe PPToken {
+    kind: PPTokKind
+    val: texto
+    espaco: logico
+    linha: inteiro
+    hideSet: dicionario
+
+    construtor(kind: PPTokKind, val: texto, espaco: logico = falso, linha: inteiro = 1) {
+        isto.kind = kind
+        isto.val = val
+        isto.espaco = espaco
+        isto.linha = linha
+        isto.hideSet = {}
+    }
+
+    clonarComHide(extraHide: dicionario): PPToken {
+        const novo: PPToken = PPToken(isto.kind, isto.val, isto.espaco, isto.linha)
+        const chaves1: texto[] = isto.hideSet.chaves()
+        para (var i: inteiro = 0; i < chaves1.tamanho(); i++) {
+            novo.hideSet[chaves1[i]] = verdadeiro
+        }
+        const chaves2: texto[] = extraHide.chaves()
+        para (var i: inteiro = 0; i < chaves2.tamanho(); i++) {
+            novo.hideSet[chaves2[i]] = verdadeiro
+        }
+        retorna novo
+    }
+}
+
+classe MacroDef {
+    nome: texto
+    ehFuncao: logico
+    ehVariadica: logico
+    params: texto[]
+    corpo: PPToken[]
+
+    construtor(nome: texto, ehFuncao: logico, ehVariadica: logico, params: texto[], corpo: PPToken[]) {
+        isto.nome = nome
+        isto.ehFuncao = ehFuncao
+        isto.ehVariadica = ehVariadica
+        isto.params = params
+        isto.corpo = corpo
+    }
+}
+
+funcao tokenizarLinhaPP(linhaStr: texto, numLinha: inteiro, clsArg: qualquer = nulo): PPToken[] {
+    var cls: qualquer = clsArg
+    se (cls == nulo) {
+        const litMod: qualquer = importar("../lexer/literais.delegua")
+        cls = litMod.ClassificadorChar()
+    }
+
+    var out: PPToken[] = []
+    var i: inteiro = 0
+    const n: inteiro = linhaStr.tamanho()
+    var viuEspaco: logico = falso
+
+    enquanto (i < n) {
+        const c: texto = linhaStr[i]
+        se (c == " " ou c == "\t" ou c == "\r") {
+            viuEspaco = verdadeiro
+            i++
+            continua
+        }
+        se ((c == "L" ou c == "u" ou c == "U") e i + 1 < n e (linhaStr[i + 1] == "\"" ou linhaStr[i + 1] == "'")) {
+            const iniW: inteiro = i
+            const delim: texto = linhaStr[i + 1]
+            i = i + 2
+            enquanto (i < n) {
+                const ch: texto = linhaStr[i]
+                i++
+                se (ch == "\\" e i < n) {
+                    i++
+                } senao se (ch == delim) {
+                    sustar
+                }
+            }
+            const kTok: PPTokKind = delim == "\"" ? PPTokKind.Str : PPTokKind.Char
+            out.empilhar(PPToken(kTok, linhaStr.fatiar(iniW, i), viuEspaco, numLinha))
+            viuEspaco = falso
+            continua
+        }
+        se (c == "\"") {
+            const iniS: inteiro = i
+            i++
+            enquanto (i < n) {
+                const ch: texto = linhaStr[i]
+                i++
+                se (ch == "\\" e i < n) {
+                    i++
+                } senao se (ch == "\"") {
+                    sustar
+                }
+            }
+            out.empilhar(PPToken(PPTokKind.Str, linhaStr.fatiar(iniS, i), viuEspaco, numLinha))
+            viuEspaco = falso
+            continua
+        }
+        se (c == "'") {
+            const iniC: inteiro = i
+            i++
+            enquanto (i < n) {
+                const ch: texto = linhaStr[i]
+                i++
+                se (ch == "\\" e i < n) {
+                    i++
+                } senao se (ch == "'") {
+                    sustar
+                }
+            }
+            out.empilhar(PPToken(PPTokKind.Char, linhaStr.fatiar(iniC, i), viuEspaco, numLinha))
+            viuEspaco = falso
+            continua
+        }
+        se (cls.ehInicioIdent(c)) {
+            const iniId: inteiro = i
+            i++
+            enquanto (i < n e cls.ehContIdent(linhaStr[i])) i++
+            out.empilhar(PPToken(PPTokKind.Ident, linhaStr.fatiar(iniId, i), viuEspaco, numLinha))
+            viuEspaco = falso
+            continua
+        }
+        se (cls.ehDigitoDec(c) ou (c == "." e i + 1 < n e cls.ehDigitoDec(linhaStr[i + 1]))) {
+            const iniNum: inteiro = i
+            enquanto (i < n) {
+                const ch: texto = linhaStr[i]
+                se (cls.ehContIdent(ch) ou ch == ".") {
+                    i++
+                    se ((ch == "e" ou ch == "E" ou ch == "p" ou ch == "P") e i < n e (linhaStr[i] == "+" ou linhaStr[i] == "-")) {
+                        i++
+                    }
+                } senao {
+                    sustar
+                }
+            }
+            out.empilhar(PPToken(PPTokKind.Num, linhaStr.fatiar(iniNum, i), viuEspaco, numLinha))
+            viuEspaco = falso
+            continua
+        }
+        se (c == "#" e i + 1 < n e linhaStr[i + 1] == "#") {
+            out.empilhar(PPToken(PPTokKind.HashHash, "##", viuEspaco, numLinha))
+            i = i + 2
+            viuEspaco = falso
+            continua
+        }
+        se (c == "#") {
+            out.empilhar(PPToken(PPTokKind.Hash, "#", viuEspaco, numLinha))
+            i++
+            viuEspaco = falso
+            continua
+        }
+        se (i + 2 < n) {
+            const tri: texto = linhaStr.fatiar(i, i + 3)
+            se (tri == "..." ou tri == "<<=" ou tri == ">>=") {
+                out.empilhar(PPToken(PPTokKind.Punct, tri, viuEspaco, numLinha))
+                i = i + 3
+                viuEspaco = falso
+                continua
+            }
+        }
+        se (i + 1 < n) {
+            const par: texto = c + linhaStr[i + 1]
+            se (par == "->" ou par == "++" ou par == "--" ou par == "<<" ou par == ">>" ou par == "<=" ou par == ">=" ou par == "==" ou par == "!=" ou par == "&&" ou par == "||" ou par == "+=" ou par == "-=" ou par == "*=" ou par == "/=" ou par == "%=" ou par == "&=" ou par == "|=" ou par == "^=") {
+                out.empilhar(PPToken(PPTokKind.Punct, par, viuEspaco, numLinha))
+                i = i + 2
+                viuEspaco = falso
+                continua
+            }
+        }
+        out.empilhar(PPToken(PPTokKind.Punct, c, viuEspaco, numLinha))
+        i++
+        viuEspaco = falso
+    }
+
+    retorna out
+}
+
+funcao renderizarTokensPP(toks: PPToken[]): texto {
+    var partes: texto[] = []
+    para (var i: inteiro = 0; i < toks.tamanho(); i++) {
+        se (i > 0) {
+            se (toks[i].espaco) {
+                partes.empilhar(" ")
+            } senao {
+                const ant: PPToken = toks[i - 1]
+                const atu: PPToken = toks[i]
+                const antIdNum: logico = ant.kind == PPTokKind.Ident ou ant.kind == PPTokKind.Num
+                const atuIdNum: logico = atu.kind == PPTokKind.Ident ou atu.kind == PPTokKind.Num
+                se (antIdNum e atuIdNum) partes.empilhar(" ")
+            }
+        }
+        partes.empilhar(toks[i].val)
+    }
+
+    retorna partes.juntar("")
+}
+
+funcao stringificarTokensPP(toks: PPToken[]): texto {
+    const bruto: texto = renderizarTokensPP(toks).aparar()
+    var out: texto[] = ["\""]
+    para (var i: inteiro = 0; i < bruto.tamanho(); i++) {
+        const c: texto = bruto[i]
+        se (c == "\\") out.empilhar("\\\\")
+        senao se (c == "\"") out.empilhar("\\\"")
+        senao out.empilhar(c)
+    }
+
+    out.empilhar("\"")
+    retorna out.juntar("")
+}
+
+funcao aplicarTokenPastingPP(toks: PPToken[], numLinha: inteiro): PPToken[] {
+    var out: PPToken[] = []
+    var i: inteiro = 0
+    enquanto (i < toks.tamanho()) {
+        se (toks[i].kind == PPTokKind.HashHash) {
+            se (out.tamanho() > 0 e i + 1 < toks.tamanho()) {
+                const esq: PPToken = out.removerUltimo()
+                const dir: PPToken = toks[i + 1]
+                const combinado: texto = esq.val + dir.val
+                const novos: PPToken[] = tokenizarLinhaPP(combinado, numLinha)
+                para (var k: inteiro = 0; k < novos.tamanho(); k++) {
+                    const nt: PPToken = novos[k].clonarComHide(esq.hideSet)
+                    se (k == 0) nt.espaco = esq.espaco
+                    out.empilhar(nt)
+                }
+                i = i + 2
+                continua
+            }
+            i++
+            continua
+        }
+        out.empilhar(toks[i])
+        i++
+    }
+
+    retorna out
+}

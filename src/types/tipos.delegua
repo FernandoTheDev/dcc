@@ -255,7 +255,9 @@ enum OpIR {
     FGt,
     FGe,
     ItoF,
+    UItoF,
     FtoI,
+    FtoUI,
     TruncSext,
     TruncZext,
     ToBool,
@@ -265,6 +267,7 @@ enum OpIR {
     Br,
     BrCond,
     Ret,
+    RetPair,
     FRet
 }
 
@@ -296,6 +299,9 @@ classe TipoC {
     ehVariadica: logico
     ehLongDouble: logico
     alinhamentoExplicito: inteiro
+    ehConst: logico
+    ehVolatile: logico
+    ehRestrict: logico
 
     construtor(base: TipoBase, ehSemSinal: logico = falso, nomeAgregado: texto = "", alvo: qualquer = nulo,
         tamArray: inteiro = 0) {
@@ -310,6 +316,24 @@ classe TipoC {
         isto.ehVariadica = falso
         isto.ehLongDouble = falso
         isto.alinhamentoExplicito = 0
+        isto.ehConst = falso
+        isto.ehVolatile = falso
+        isto.ehRestrict = falso
+    }
+
+    clonar(): TipoC {
+        const c: TipoC = TipoC(isto.base, isto.ehSemSinal, isto.nomeAgregado, isto.alvo,
+            isto.tamArray)
+        c.ehVLA = isto.ehVLA
+        c.exprTamVLA = isto.exprTamVLA
+        c.paramsFn = isto.paramsFn
+        c.ehVariadica = isto.ehVariadica
+        c.ehLongDouble = isto.ehLongDouble
+        c.alinhamentoExplicito = isto.alinhamentoExplicito
+        c.ehConst = isto.ehConst
+        c.ehVolatile = isto.ehVolatile
+        c.ehRestrict = isto.ehRestrict
+        retorna c
     }
 
     estatico tipoVoid(): TipoC {
@@ -419,6 +443,31 @@ classe TipoC {
         }
         retorna 0
     }
+}
+
+funcao formatarTipoC(t: qualquer): texto {
+    se (t == nulo) retorna "<desconhecido>"
+    var pref: texto = ""
+    se (t.ehConst) pref = pref + "const "
+    se (t.ehVolatile) pref = pref + "volatile "
+    escolha (t.base) {
+        caso TipoBase.Void: retorna pref + "void"
+        caso TipoBase.Bool: retorna pref + "_Bool"
+        caso TipoBase.Char: retorna pref + (t.ehSemSinal ? "unsigned char" : "char")
+        caso TipoBase.Short: retorna pref + (t.ehSemSinal ? "unsigned short" : "short")
+        caso TipoBase.Int: retorna pref + (t.ehSemSinal ? "unsigned int" : "int")
+        caso TipoBase.Long: retorna pref + (t.ehSemSinal ? "unsigned long" : "long")
+        caso TipoBase.Float: retorna pref + "float"
+        caso TipoBase.Double: retorna pref + (t.ehLongDouble ? "long double" : "double")
+        caso TipoBase.Struct: retorna pref + "struct " + t.nomeAgregado
+        caso TipoBase.Union: retorna pref + "union " + t.nomeAgregado
+        caso TipoBase.Ponteiro: retorna formatarTipoC(t.alvo) + " *"
+        caso TipoBase.Array: retorna formatarTipoC(t.alvo) + "[${t.tamArray}]"
+        caso TipoBase.Funcao: retorna formatarTipoC(t.alvo) + "(...)"
+        padrao: retorna "<tipo>"
+    }
+
+    retorna "<tipo>"
 }
 
 funcao alinharOffset(off: inteiro, alinh: inteiro): inteiro {
@@ -586,8 +635,12 @@ classe TabelaTipos {
             caso TipoBase.Funcao:
             retorna 8
             caso TipoBase.Array:
+            const maxObjBytes: inteiro = 1073741824
             const elem: TipoC = t.alvo
-            retorna isto.tamanhoDe(elem) * t.tamArray
+            const tamElem: inteiro = isto.tamanhoDe(elem)
+            se (t.tamArray <= 0 ou tamElem <= 0) retorna 0
+            se (t.tamArray > maxObjBytes \ tamElem) retorna -1 // sinaliza overflow
+            retorna tamElem * t.tamArray
             caso TipoBase.Struct:
             se (!isto.structs.contem(t.nomeAgregado)) {
                 retorna 0
@@ -610,30 +663,56 @@ classe TabelaTipos {
         se (t.base == TipoBase.Void) retorna verdadeiro
         se (t.base == TipoBase.Struct) retorna !isto.structs.contem(t.nomeAgregado)
         se (t.base == TipoBase.Union) retorna !isto.unions.contem(t.nomeAgregado)
+        se (t.base == TipoBase.Array) retorna !t.ehVLA e (t.tamArray <= 0 ou isto.ehIncompleto(t.alvo))
         retorna falso
     }
 
-    buscarCampo(t: TipoC, nomeCampo: texto): CampoLayout {
-        const diag: qualquer = importar("../diagnostics/diag.delegua")
+    tentarBuscarCampo(t: TipoC, nomeCampo: texto): qualquer {
         var layout: qualquer = nulo
         se (t.base == TipoBase.Struct e isto.structs.contem(t.nomeAgregado)) {
             layout = isto.structs[t.nomeAgregado]
         } senao se (t.base == TipoBase.Union e isto.unions.contem(t.nomeAgregado)) {
             layout = isto.unions[t.nomeAgregado]
         } senao {
-            falhar diag.ErroDCC("acesso ao campo '${nomeCampo}' em tipo nao-agregado ou incompleto")
+            retorna nulo
         }
         const ag: AgregadoLayout = layout
-        se (!ag.campos.contem(nomeCampo)) {
-            falhar diag.ErroDCC("campo '${nomeCampo}' nao existe em '${ag.nome}'")
-        }
+        se (!ag.campos.contem(nomeCampo)) retorna nulo
         retorna ag.campos[nomeCampo]
+    }
+
+    buscarCampo(t: TipoC, nomeCampo: texto): CampoLayout {
+        const res: qualquer = isto.tentarBuscarCampo(t, nomeCampo)
+        se (res != nulo) retorna res
+        const diag: qualquer = importar("../diagnostics/diag.delegua")
+        se (t.base != TipoBase.Struct e t.base != TipoBase.Union) {
+            falhar diag.ErroDCC("acesso ao campo '${nomeCampo}' em tipo nao-agregado '${formatarTipoC(t)}'")
+        }
+        falhar diag.ErroDCC("campo '${nomeCampo}' nao existe em '${t.nomeAgregado}'")
     }
 }
 
 // Conversao IEEE-754 pura em Delegua: double (real) -> 64 bits (inteiro)
+// Trata corretamente NaN, +Inf, -Inf, +0.0, -0.0, subnormais e arredondamento.
 funcao doubleParaBitsIEEE754(val: real): inteiro {
-    se (val == 0.0) retorna 0
+    const prim: qualquer = importar("cgd:nativo").Primitivas
+    const bitSinal64: inteiro = -9223372036854775807 - 1
+    // NaN: val != val
+    se (val != val) retorna 9221120237041090560 // 0x7FF8000000000000 (qNaN)
+    // +0.0 e -0.0 (evita divisao por zero em Delegua)
+    se (val == 0.0) {
+        const txtZ: texto = prim.numeroTexto(val)
+        se (txtZ.tamanho() > 0 e txtZ[0] == "-") retorna bitSinal64
+        retorna 0
+    }
+
+    // +Inf e -Inf
+    se (!prim.numeroFinito(val)) {
+        const infBits: inteiro = 9218868437227405312 // 0x7FF0000000000000
+        se (val < 0.0) retorna infBits | bitSinal64
+        retorna infBits
+    }
+
     var sinal: inteiro = 0
     var x: real = val
     se (x < 0.0) {
@@ -653,6 +732,7 @@ funcao doubleParaBitsIEEE754(val: real): inteiro {
     }
 
     var frac: real = x - 1.0
+    se (exp == 0) frac = x / 2.0
     var mantissa: inteiro = 0
     para (var i: inteiro = 0; i < 52; i++) {
         frac = frac * 2.0
@@ -663,9 +743,16 @@ funcao doubleParaBitsIEEE754(val: real): inteiro {
         }
     }
 
+    se (frac > 0.5 ou (frac == 0.5 e (mantissa & 1) == 1)) {
+        mantissa++
+        se (mantissa >= 4503599627370496) {
+            mantissa = 0
+            exp++
+        }
+    }
+
     var bits: inteiro = (exp << 52) | mantissa
     se (sinal == 1) {
-        const bitSinal64: inteiro = -9223372036854775807 - 1
         bits = bits | bitSinal64
     }
 
@@ -674,7 +761,18 @@ funcao doubleParaBitsIEEE754(val: real): inteiro {
 
 // Conversao IEEE-754 pura em Delegua: float (binary32) -> 32 bits (inteiro)
 funcao floatParaBitsIEEE754(val: real): inteiro {
-    se (val == 0.0) retorna 0
+    const prim: qualquer = importar("cgd:nativo").Primitivas
+    se (val != val) retorna 2143289344 // 0x7FC00000 (qNaN)
+    se (val == 0.0) {
+        const txtZ32: texto = prim.numeroTexto(val)
+        se (txtZ32.tamanho() > 0 e txtZ32[0] == "-") retorna 2147483648 // 0x80000000
+        retorna 0
+    }
+
+    se (!prim.numeroFinito(val)) {
+        retorna val < 0.0 ? 4286578688 : 2139095040 // 0xFF800000 / 0x7F800000
+    }
+
     var sinal: inteiro = 0
     var x: real = val
     se (x < 0.0) {
@@ -693,7 +791,12 @@ funcao floatParaBitsIEEE754(val: real): inteiro {
         exp--
     }
 
+    se (exp >= 255) {
+        retorna (sinal * 2147483648) | 2139095040
+    }
+
     var frac: real = x - 1.0
+    se (exp == 0) frac = x / 2.0
     var mantissa: inteiro = 0
     para (var i: inteiro = 0; i < 23; i++) {
         frac = frac * 2.0
@@ -704,7 +807,7 @@ funcao floatParaBitsIEEE754(val: real): inteiro {
         }
     }
 
-    se (frac >= 0.5) {
+    se (frac > 0.5 ou (frac == 0.5 e (mantissa & 1) == 1)) {
         mantissa++
         se (mantissa >= 8388608) {
             mantissa = 0

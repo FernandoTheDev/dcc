@@ -1,0 +1,196 @@
+// Constantes e utilitarios compartilhados de leitura/escrita binaria ELF64 (Little-Endian).
+// Elimina duplicacao entre emissor de objetos (.o / ET_REL) e linker nativo (ET_EXEC).
+
+const ELF_MAGIC_0: inteiro = 127 // 0x7F
+const ELF_MAGIC_1: inteiro = 69 // 'E'
+const ELF_MAGIC_2: inteiro = 76 // 'L'
+const ELF_MAGIC_3: inteiro = 70 // 'F'
+const ELFCLASS64: inteiro = 2
+const ELFDATA2LSB: inteiro = 1
+const EV_CURRENT: inteiro = 1
+const ET_REL: inteiro = 1
+const ET_EXEC: inteiro = 2
+const EM_X86_64: inteiro = 62
+
+// Section Header Types (SHT_*)
+const SHT_NULL: inteiro = 0
+const SHT_PROGBITS: inteiro = 1
+const SHT_SYMTAB: inteiro = 2
+const SHT_STRTAB: inteiro = 3
+const SHT_RELA: inteiro = 4
+const SHT_HASH: inteiro = 5
+const SHT_DYNAMIC: inteiro = 6
+const SHT_NOBITS: inteiro = 8
+const SHT_DYNSYM: inteiro = 11
+
+// Section Header Flags (SHF_*)
+const SHF_WRITE: inteiro = 1
+const SHF_ALLOC: inteiro = 2
+const SHF_EXECINSTR: inteiro = 4
+const SHF_INFO_LINK: inteiro = 64
+
+// Program Header Types (PT_*) e Flags (PF_*)
+const PT_LOAD: inteiro = 1
+const PT_DYNAMIC: inteiro = 2
+const PT_INTERP: inteiro = 3
+const PT_PHDR: inteiro = 6
+const PF_X: inteiro = 1
+const PF_W: inteiro = 2
+const PF_R: inteiro = 4
+
+// Symbol Bindings (STB_*) e Types (STT_*)
+const STB_LOCAL: inteiro = 0
+const STB_GLOBAL: inteiro = 1
+const STB_WEAK: inteiro = 2
+const STT_NOTYPE: inteiro = 0
+const STT_OBJECT: inteiro = 1
+const STT_FUNC: inteiro = 2
+const STT_SECTION: inteiro = 3
+
+// Special Section Indices (SHN_*)
+const SHN_UNDEF: inteiro = 0
+const SHN_ABS: inteiro = 65521 // 0xFFF1
+const SHN_COMMON: inteiro = 65522 // 0xFFF2
+
+// Dynamic Tags (DT_*)
+const DT_NULL: inteiro = 0
+const DT_NEEDED: inteiro = 1
+const DT_HASH: inteiro = 4
+const DT_STRTAB: inteiro = 5
+const DT_SYMTAB: inteiro = 6
+const DT_RELA: inteiro = 7
+const DT_RELASZ: inteiro = 8
+const DT_RELAENT: inteiro = 9
+const DT_STRSZ: inteiro = 10
+const DT_SYMENT: inteiro = 11
+
+// Relocations x86-64 (R_X86_64_*)
+const R_X86_64_64: inteiro = 1
+const R_X86_64_PC32: inteiro = 2
+const R_X86_64_PLT32: inteiro = 4
+const R_X86_64_GLOB_DAT: inteiro = 6
+const R_X86_64_GOTPCREL: inteiro = 9
+const R_X86_64_32: inteiro = 10
+const R_X86_64_32S: inteiro = 11
+const R_X86_64_GOTPCRELX: inteiro = 41
+const R_X86_64_REX_GOTPCRELX: inteiro = 42
+
+funcao lerU16LE(buf: inteiro[], off: inteiro): inteiro {
+    retorna (buf[off] & 255) | ((buf[off + 1] & 255) << 8)
+}
+
+funcao lerU32LE(buf: inteiro[], off: inteiro): inteiro {
+    retorna (buf[off] & 255) | ((buf[off + 1] & 255) << 8) | ((buf[off + 2] & 255) << 16) | ((buf[off + 3] & 255) << 24)
+}
+
+funcao lerU64LE(buf: inteiro[], off: inteiro): inteiro {
+    const lo: inteiro = lerU32LE(buf, off)
+    const hi: inteiro = lerU32LE(buf, off + 4)
+    retorna lo | (hi << 32)
+}
+
+funcao lerCStringLim(buf: inteiro[], off: inteiro, limite: inteiro, bytesMod: qualquer): texto {
+    se (off < 0 ou off >= limite ou off >= buf.tamanho()) retorna ""
+    const teto: inteiro = limite < buf.tamanho() ? limite : buf.tamanho()
+    var bs: inteiro[] = []
+    var i: inteiro = off
+    var maxLen: inteiro = 65536
+    enquanto (i < teto e buf[i] != 0 e bs.tamanho() < maxLen) {
+        bs.empilhar(buf[i] & 255)
+        i++
+    }
+
+    se (bs.tamanho() == 0) retorna ""
+    retorna bytesMod.Bytes.deVetor(bs).paraTexto()
+}
+
+funcao anexarU16(buf: inteiro[], v: inteiro): vazio {
+    buf.empilhar(v & 255)
+    buf.empilhar((v >> 8) & 255)
+}
+
+funcao anexarU32(buf: inteiro[], v: inteiro): vazio {
+    buf.empilhar(v & 255)
+    buf.empilhar((v >> 8) & 255)
+    buf.empilhar((v >> 16) & 255)
+    buf.empilhar((v >> 24) & 255)
+}
+
+funcao anexarU64(buf: inteiro[], v: inteiro): vazio {
+    anexarU32(buf, v)
+    anexarU32(buf, v >> 32)
+}
+
+funcao gravarU32(buf: inteiro[], pos: inteiro, v: inteiro): vazio {
+    buf[pos] = v & 255
+    buf[pos + 1] = (v >> 8) & 255
+    buf[pos + 2] = (v >> 16) & 255
+    buf[pos + 3] = (v >> 24) & 255
+}
+
+funcao gravarU64(buf: inteiro[], pos: inteiro, v: inteiro): vazio {
+    gravarU32(buf, pos, v)
+    gravarU32(buf, pos + 4, v >> 32)
+}
+
+funcao alinharValor(n: inteiro, modAlinh: inteiro): inteiro {
+    se (modAlinh <= 1) retorna n
+    const r: inteiro = n % modAlinh
+    se (r == 0) retorna n
+    retorna n + (modAlinh - r)
+}
+
+funcao preencherAlinh(buf: inteiro[], modAlinh: inteiro, bytePad: inteiro = 0): vazio {
+    se (modAlinh <= 1) retorna
+    enquanto (buf.tamanho() % modAlinh != 0) buf.empilhar(bytePad & 255)
+}
+
+funcao ehPotenciaDeDois(v: inteiro): logico {
+    se (v <= 0) retorna falso
+    retorna (v & (v - 1)) == 0
+}
+
+funcao anexarCString(buf: inteiro[], s: texto, bytesMod: qualquer): inteiro {
+    const ini: inteiro = buf.tamanho()
+    const dados: inteiro[] = bytesMod.Bytes.deTexto(s).paraVetor()
+    para (var i: inteiro = 0; i < dados.tamanho(); i++) buf.empilhar(dados[i])
+    buf.empilhar(0)
+    retorna ini
+}
+
+funcao anexarPhdr(buf: inteiro[], pType: inteiro, pFlags: inteiro, pOff: inteiro, pVaddr: inteiro,
+    pFilesz: inteiro, pMemsz: inteiro, pAlign: inteiro): vazio {
+    anexarU32(buf, pType)
+    anexarU32(buf, pFlags)
+    anexarU64(buf, pOff)
+    anexarU64(buf, pVaddr)
+    anexarU64(buf, pVaddr)
+    anexarU64(buf, pFilesz)
+    anexarU64(buf, pMemsz)
+    anexarU64(buf, pAlign)
+}
+
+funcao anexarShdr(buf: inteiro[], shName: inteiro, shType: inteiro, shFlags: inteiro, shAddr: inteiro,
+    shOffset: inteiro, shSize: inteiro, shLink: inteiro, shInfo: inteiro, shAddrAlign: inteiro,
+    shEntSize: inteiro): vazio {
+    anexarU32(buf, shName)
+    anexarU32(buf, shType)
+    anexarU64(buf, shFlags)
+    anexarU64(buf, shAddr)
+    anexarU64(buf, shOffset)
+    anexarU64(buf, shSize)
+    anexarU32(buf, shLink)
+    anexarU32(buf, shInfo)
+    anexarU64(buf, shAddrAlign)
+    anexarU64(buf, shEntSize)
+}
+
+funcao anexarSym64(buf: inteiro[], stName: inteiro, stInfo: inteiro, stShndx: inteiro, stValue: inteiro,
+    stSize: inteiro): vazio {
+    anexarU32(buf, stName)
+    buf.empilhar(stInfo & 255)
+    buf.empilhar(0) // st_other = STV_DEFAULT
+    anexarU16(buf, stShndx)
+    anexarU64(buf, stValue)
+    anexarU64(buf, stSize)
+}

@@ -1,0 +1,243 @@
+// Estruturas de dados da IR SSA tipada (CFG + instrucoes + globais + relocacoes de dados) do DCC.
+
+classe InstSSA {
+    op: qualquer
+    dst: inteiro
+    dst2: inteiro
+    a: inteiro
+    b: inteiro
+    fval: real
+    largura: inteiro
+    ehSemSinal: logico
+    ehFloatDst: logico
+    ehVolatile: logico
+    alvo1: texto
+    alvo2: texto
+    callArgs: inteiro[]
+    callArgFloats: logico[]
+    callArgLarguras: inteiro[]
+    callArgEhStruct: logico[]
+    callEhVariadica: logico
+    callRetStructModo: inteiro // 0=escalar, 1=<=8B(rax), 2=9..16B(rax:rdx), 3=>16B(sret)
+    callSretReg: inteiro
+
+    construtor(op: qualquer, dst: inteiro = -1, a: inteiro = 0, b: inteiro = 0, alvo1: texto = "",
+        alvo2: texto = "") {
+        isto.op = op
+        isto.dst = dst
+        isto.dst2 = -1
+        isto.a = a
+        isto.b = b
+        isto.fval = 0.0
+        isto.largura = 8
+        isto.ehSemSinal = falso
+        isto.ehFloatDst = falso
+        isto.ehVolatile = falso
+        isto.alvo1 = alvo1
+        isto.alvo2 = alvo2
+        isto.callArgs = []
+        isto.callArgFloats = []
+        isto.callArgLarguras = []
+        isto.callArgEhStruct = []
+        isto.callEhVariadica = falso
+        isto.callRetStructModo = 0
+        isto.callSretReg = -1
+    }
+}
+
+classe BlocoSSA {
+    nome: texto
+    insts: InstSSA[]
+    terminado: logico
+
+    construtor(nome: texto) {
+        isto.nome = nome
+        isto.insts = []
+        isto.terminado = falso
+    }
+}
+
+classe FuncaoSSA {
+    nome: texto
+    aridade: inteiro
+    tipoRet: qualquer
+    retornaFloat: logico
+    larguraRetFloat: inteiro
+    retStructModo: inteiro // 0=escalar, 1=<=8B, 2=9..16B, 3=>16B(sret)
+    sretPtrOffset: inteiro
+    ehVariadica: logico
+    ehStatic: logico
+    ehWeak: logico
+    regSaveOffset: inteiro
+    numFixedIntParams: inteiro
+    numFixedFltParams: inteiro
+    numFixedStkParams: inteiro
+    paramOffsets: inteiro[]
+    paramLarguras: inteiro[]
+    paramEhFloat: logico[]
+    paramEhStruct: logico[]
+    tamanhoLocaisBytes: inteiro
+    numRegs: inteiro
+    blocos: BlocoSSA[]
+
+    construtor(nome: texto, aridade: inteiro, retornaFloat: logico = falso, ehVariadica: logico = falso,
+        ehStatic: logico = falso, tipoRet: qualquer = nulo, larguraRetFloat: inteiro = 8, retStructModo: inteiro = 0,
+        ehWeak: logico = falso) {
+        isto.nome = nome
+        isto.aridade = aridade
+        isto.tipoRet = tipoRet
+        isto.retornaFloat = retornaFloat
+        isto.larguraRetFloat = larguraRetFloat
+        isto.retStructModo = retStructModo
+        isto.sretPtrOffset = 0
+        isto.ehVariadica = ehVariadica
+        isto.ehStatic = ehStatic
+        isto.ehWeak = ehWeak
+        isto.regSaveOffset = 0
+        isto.numFixedIntParams = 0
+        isto.numFixedFltParams = 0
+        isto.numFixedStkParams = 0
+        isto.paramOffsets = []
+        isto.paramLarguras = []
+        isto.paramEhFloat = []
+        isto.paramEhStruct = []
+        isto.tamanhoLocaisBytes = 0
+        isto.numRegs = 0
+        isto.blocos = []
+    }
+}
+
+classe RelocGlobalSSA {
+    offsetGlobal: inteiro
+    simbolo: texto
+    addend: inteiro
+    ehStr: logico
+    idxStr: inteiro
+
+    construtor(offsetGlobal: inteiro, simbolo: texto, addend: inteiro = 0, ehStr: logico = falso,
+        idxStr: inteiro = -1) {
+        isto.offsetGlobal = offsetGlobal
+        isto.simbolo = simbolo
+        isto.addend = addend
+        isto.ehStr = ehStr
+        isto.idxStr = idxStr
+    }
+}
+
+classe GlobalSSA {
+    nome: texto
+    tamanhoBytes: inteiro
+    alinhamento: inteiro
+    temInit: logico
+    ehStatic: logico
+    ehWeak: logico
+    bytesInit: inteiro[]
+    relocs: RelocGlobalSSA[]
+
+    construtor(nome: texto, tamanhoBytes: inteiro, alinhamento: inteiro, temInit: logico,
+        ehStatic: logico = falso, ehWeak: logico = falso) {
+        isto.nome = nome
+        isto.tamanhoBytes = tamanhoBytes
+        isto.alinhamento = alinhamento
+        isto.temInit = temInit
+        isto.ehStatic = ehStatic
+        isto.ehWeak = ehWeak
+        isto.bytesInit = []
+        isto.relocs = []
+    }
+}
+
+classe ModuloSSA {
+    funcoes: FuncaoSSA[]
+    globais: GlobalSSA[]
+    mapaGlobais: dicionario
+    strings: texto[]
+    stringsBytes: qualquer[]
+    mapaStrings: dicionario
+    externos: texto[]
+    mapaExternos: dicionario
+    externosDados: texto[]
+    mapaExternosDados: dicionario
+    libsExternas: texto[]
+    mapaLibs: dicionario
+
+    construtor() {
+        isto.funcoes = []
+        isto.globais = []
+        isto.mapaGlobais = {}
+        isto.strings = []
+        isto.stringsBytes = []
+        isto.mapaStrings = {}
+        isto.externos = []
+        isto.mapaExternos = {}
+        isto.externosDados = []
+        isto.mapaExternosDados = {}
+        isto.libsExternas = []
+        isto.mapaLibs = {}
+        isto.registrarBiblioteca("libc.so.6")
+    }
+
+    registrarBiblioteca(nomeLib: texto): vazio {
+        se (!isto.mapaLibs.contem(nomeLib)) {
+            isto.mapaLibs[nomeLib] = verdadeiro
+            isto.libsExternas.empilhar(nomeLib)
+        }
+    }
+
+    internarStringBytes(dados: inteiro[]): inteiro {
+        var chavePartes: texto[] = []
+        para (var i: inteiro = 0; i < dados.tamanho(); i++) {
+            chavePartes.empilhar(texto(dados[i] & 255))
+        }
+        const chave: texto = "B:" + chavePartes.juntar(",")
+        se (isto.mapaStrings.contem(chave)) {
+            retorna inteiro(isto.mapaStrings[chave])
+        }
+        const idx: inteiro = isto.stringsBytes.tamanho()
+        isto.stringsBytes.empilhar(dados)
+        isto.strings.empilhar("")
+        isto.mapaStrings[chave] = idx
+        retorna idx
+    }
+
+    internarString(valor: texto): inteiro {
+        const bytesMod: qualquer = importar("cgd:bytes")
+        const dados: inteiro[] = bytesMod.Bytes.deTexto(valor).paraVetor()
+        retorna isto.internarStringBytes(dados)
+    }
+
+    registrarExterno(nome: texto): vazio {
+        se (!isto.mapaExternos.contem(nome)) {
+            isto.mapaExternos[nome] = isto.externos.tamanho()
+            isto.externos.empilhar(nome)
+        }
+    }
+
+    registrarExternoDado(nome: texto): vazio {
+        se (!isto.mapaExternosDados.contem(nome)) {
+            isto.mapaExternosDados[nome] = isto.externosDados.tamanho()
+            isto.externosDados.empilhar(nome)
+        }
+    }
+
+    registrarGlobal(g: GlobalSSA): vazio {
+        isto.mapaGlobais[g.nome] = isto.globais.tamanho()
+        isto.globais.empilhar(g)
+    }
+}
+
+classe StatsSSA {
+    dobras: inteiro = 0
+    simplificacoes: inteiro = 0
+    copiasPropagadas: inteiro = 0
+    blocosMortos: inteiro = 0
+    dceRemovidas: inteiro = 0
+}
+
+funcao gravarIntLE(buf: inteiro[], pos: inteiro, val: inteiro, largura: inteiro): vazio {
+    para (var i: inteiro = 0; i < largura; i++) {
+        se (pos + i >= 0 e pos + i < buf.tamanho()) {
+            buf[pos + i] = (val >> (i * 8)) & 255
+        }
+    }
+}

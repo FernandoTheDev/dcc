@@ -1,0 +1,891 @@
+// Emissor de codigo de maquina x86-64 (System V AMD64 ABI, PIC-compativel) para o DCC.
+// Inclui constantes de opcodes, instrucoes 32/64-bit, comparacoes IEEE-754 seguras para NaN,
+// conversoes UItoF/FtoUI, suporte a float 32-bit, RetPair (rax:rdx) e verificacao de limites rel32.
+
+classe PatchRel32 {
+    pos: inteiro
+    alvo: texto
+
+    construtor(pos: inteiro, alvo: texto) {
+        isto.pos = pos
+        isto.alvo = alvo
+    }
+}
+
+classe SimboloObj {
+    nome: texto
+    secao: texto // "TEXT", "RODATA", "DATA", "BSS", "UNDEF"
+    offset: inteiro
+    tamanho: inteiro
+    ehGlobal: logico
+    ehWeak: logico
+    tipoSym: inteiro // 0=NOTYPE, 1=OBJECT, 2=FUNC, 3=SECTION
+
+    construtor(nome: texto, secao: texto, offset: inteiro, tamanho: inteiro, ehGlobal: logico,
+        tipoSym: inteiro, ehWeak: logico = falso) {
+        isto.nome = nome
+        isto.secao = secao
+        isto.offset = offset
+        isto.tamanho = tamanho
+        isto.ehGlobal = ehGlobal
+        isto.ehWeak = ehWeak
+        isto.tipoSym = tipoSym
+    }
+}
+
+classe RelocObj {
+    offset: inteiro
+    simbolo: texto
+    tipoReloc: inteiro // 1=R_X86_64_64, 2=R_X86_64_PC32, 4=R_X86_64_PLT32, 9=R_X86_64_GOTPCREL
+    addend: inteiro
+
+    construtor(offset: inteiro, simbolo: texto, tipoReloc: inteiro, addend: inteiro) {
+        isto.offset = offset
+        isto.simbolo = simbolo
+        isto.tipoReloc = tipoReloc
+        isto.addend = addend
+    }
+}
+
+classe CodigoObjeto {
+    textBytes: inteiro[]
+    rodataBytes: inteiro[]
+    dataBytes: inteiro[]
+    bssSize: inteiro
+    simbolos: SimboloObj[]
+    relocsText: RelocObj[]
+    relocsData: RelocObj[]
+    libsExternas: texto[]
+
+    construtor() {
+        isto.textBytes = []
+        isto.rodataBytes = []
+        isto.dataBytes = []
+        isto.bssSize = 0
+        isto.simbolos = []
+        isto.relocsText = []
+        isto.relocsData = []
+        isto.libsExternas = []
+    }
+}
+
+classe EmissorX86_64 {
+    code: inteiro[]
+    labels: dicionario
+    patchesRel32: PatchRel32[]
+    relocs: RelocObj[]
+    contAux: inteiro
+
+    construtor() {
+        isto.code = []
+        isto.labels = {}
+        isto.patchesRel32 = []
+        isto.relocs = []
+        isto.contAux = 0
+    }
+
+    novoLabelAux(pref: texto): texto {
+        isto.contAux++
+        retorna "__aux_${pref}_${isto.contAux}"
+    }
+
+    u8(b: inteiro): vazio {
+        isto.code.empilhar(b & 255)
+    }
+
+    u32(v: inteiro): vazio {
+        isto.u8(v)
+        isto.u8(v >> 8)
+        isto.u8(v >> 16)
+        isto.u8(v >> 24)
+    }
+
+    u64(v: inteiro): vazio {
+        isto.u32(v)
+        isto.u32(v >> 32)
+    }
+
+    marcarLabel(nome: texto): vazio {
+        isto.labels[nome] = isto.code.tamanho()
+    }
+
+    pushRbp(): vazio {
+        isto.u8(85) // 0x55
+    }
+
+    popRbp(): vazio {
+        isto.u8(93) // 0x5D
+    }
+
+    pushRax(): vazio {
+        isto.u8(80) // 0x50
+    }
+
+    pushR11(): vazio {
+        isto.u8(65) // 0x41
+        isto.u8(83) // 0x53
+    }
+
+    retInst(): vazio {
+        isto.u8(195) // 0xC3
+    }
+
+    movRbpRsp(): vazio {
+        isto.u8(72)
+        isto.u8(137)
+        isto.u8(229)
+    }
+
+    movRspRbp(): vazio {
+        isto.u8(72)
+        isto.u8(137)
+        isto.u8(236)
+    }
+
+    subRspImm32(n: inteiro): vazio {
+        isto.u8(72)
+        isto.u8(129)
+        isto.u8(236)
+        isto.u32(n)
+    }
+
+    addRspImm32(n: inteiro): vazio {
+        isto.u8(72)
+        isto.u8(129)
+        isto.u8(196)
+        isto.u32(n)
+    }
+
+    movRaxImm64(v: inteiro): vazio {
+        isto.u8(72)
+        isto.u8(184)
+        isto.u64(v)
+    }
+
+    movRcxImm64(v: inteiro): vazio {
+        isto.u8(72)
+        isto.u8(185)
+        isto.u64(v)
+    }
+
+    movEaxImm32(v: inteiro): vazio {
+        isto.u8(184)
+        isto.u32(v)
+    }
+
+    // lea rax, [rip + disp32] -> 48 8D 05 disp32 (R_X86_64_PC32 = 2)
+    leaRaxRipReloc(simbolo: texto, addend: inteiro): vazio {
+        isto.u8(72)
+        isto.u8(141)
+        isto.u8(5)
+        isto.relocs.empilhar(RelocObj(isto.code.tamanho(), simbolo, 2, addend))
+        isto.u32(0)
+    }
+
+    leaRaxRipLabel(labelInterno: texto): vazio {
+        isto.u8(72)
+        isto.u8(141)
+        isto.u8(5)
+        isto.patchesRel32.empilhar(PatchRel32(isto.code.tamanho(), labelInterno))
+        isto.u32(0)
+    }
+
+    // mov rax, [rip + disp32] -> 48 8B 05 disp32 (R_X86_64_GOTPCREL = 9)
+    movRaxGotReloc(simbolo: texto): vazio {
+        isto.u8(72)
+        isto.u8(139)
+        isto.u8(5)
+        isto.relocs.empilhar(RelocObj(isto.code.tamanho(), simbolo, 9, -4))
+        isto.u32(0)
+    }
+
+    // call sym@PLT -> E8 disp32 (R_X86_64_PLT32 = 4)
+    callExternReloc(simbolo: texto, numXmm: inteiro): vazio {
+        isto.movEaxImm32(numXmm)
+        isto.u8(232)
+        isto.relocs.empilhar(RelocObj(isto.code.tamanho(), simbolo, 4, -4))
+        isto.u32(0)
+    }
+
+    // call r10 via slot [rbp - off]
+    callIndirectRbp(offsetPositivo: inteiro, numXmm: inteiro): vazio {
+        isto.u8(76)
+        isto.u8(139)
+        isto.u8(149)
+        isto.u32(-offsetPositivo)
+        isto.movEaxImm32(numXmm)
+        isto.u8(65)
+        isto.u8(255)
+        isto.u8(210)
+    }
+
+    leaRaxRbpDisp(disp: inteiro): vazio {
+        isto.u8(72)
+        isto.u8(141)
+        isto.u8(133)
+        isto.u32(disp)
+    }
+
+    leaRaxRbp(offsetPositivo: inteiro): vazio {
+        isto.leaRaxRbpDisp(-offsetPositivo)
+    }
+
+    // mov r11, [rax + disp32] -> 4C 8B 98 disp32
+    loadR11FromRaxDisp(disp: inteiro): vazio {
+        isto.u8(76)
+        isto.u8(139)
+        isto.u8(152)
+        isto.u32(disp)
+    }
+
+    // mov regAbi[idx], [rax + disp32]
+    loadArgAbiFromRaxDisp(idx: inteiro, disp: inteiro): vazio {
+        escolha (idx) {
+            caso 0: // rdi: 48 8B B8 disp32
+            isto.u8(72)
+            isto.u8(139)
+            isto.u8(184)
+            isto.u32(disp)
+            caso 1: // rsi: 48 8B B0 disp32
+            isto.u8(72)
+            isto.u8(139)
+            isto.u8(176)
+            isto.u32(disp)
+            caso 2: // rdx: 48 8B 90 disp32
+            isto.u8(72)
+            isto.u8(139)
+            isto.u8(144)
+            isto.u32(disp)
+            caso 3: // rcx: 48 8B 88 disp32
+            isto.u8(72)
+            isto.u8(139)
+            isto.u8(136)
+            isto.u32(disp)
+            caso 4: // r8: 4C 8B 80 disp32
+            isto.u8(76)
+            isto.u8(139)
+            isto.u8(128)
+            isto.u32(disp)
+            padrao: // r9: 4C 8B 88 disp32
+            isto.u8(76)
+            isto.u8(139)
+            isto.u8(136)
+            isto.u32(disp)
+        }
+    }
+
+    loadSizedFromPtrRax(largura: inteiro, ehSemSinal: logico): vazio {
+        se (largura == 1) {
+            isto.u8(72)
+            isto.u8(15)
+            isto.u8(ehSemSinal ? 182 : 190)
+            isto.u8(0)
+            retorna
+        }
+        se (largura == 2) {
+            isto.u8(72)
+            isto.u8(15)
+            isto.u8(ehSemSinal ? 183 : 191)
+            isto.u8(0)
+            retorna
+        }
+        se (largura == 4) {
+            se (ehSemSinal) {
+                isto.u8(139)
+                isto.u8(0)
+            } senao {
+                isto.u8(72)
+                isto.u8(99)
+                isto.u8(0)
+            }
+            retorna
+        }
+        isto.u8(72)
+        isto.u8(139)
+        isto.u8(0)
+    }
+
+    storeSizedRcxToPtrRax(largura: inteiro): vazio {
+        se (largura == 1) {
+            isto.u8(136)
+            isto.u8(8)
+            retorna
+        }
+        se (largura == 2) {
+            isto.u8(102)
+            isto.u8(137)
+            isto.u8(8)
+            retorna
+        }
+        se (largura == 4) {
+            isto.u8(137)
+            isto.u8(8)
+            retorna
+        }
+        isto.u8(72)
+        isto.u8(137)
+        isto.u8(8)
+    }
+
+    truncRax(largura: inteiro, ehZeroExt: logico): vazio {
+        se (largura == 1) {
+            isto.u8(72)
+            isto.u8(15)
+            isto.u8(ehZeroExt ? 182 : 190)
+            isto.u8(192)
+            retorna
+        }
+        se (largura == 2) {
+            isto.u8(72)
+            isto.u8(15)
+            isto.u8(ehZeroExt ? 183 : 191)
+            isto.u8(192)
+            retorna
+        }
+        se (largura == 4) {
+            se (ehZeroExt) {
+                isto.u8(137)
+                isto.u8(192)
+            } senao {
+                isto.u8(72)
+                isto.u8(99)
+                isto.u8(192)
+            }
+        }
+    }
+
+    loadRaxRbpDisp(disp: inteiro): vazio {
+        isto.u8(72)
+        isto.u8(139)
+        isto.u8(133)
+        isto.u32(disp)
+    }
+
+    loadRaxRbp(offsetPositivo: inteiro): vazio {
+        isto.loadRaxRbpDisp(-offsetPositivo)
+    }
+
+    loadRcxRbp(offsetPositivo: inteiro): vazio {
+        isto.u8(72)
+        isto.u8(139)
+        isto.u8(141)
+        isto.u32(-offsetPositivo)
+    }
+
+    loadRdxRbp(offsetPositivo: inteiro): vazio {
+        isto.u8(72)
+        isto.u8(139)
+        isto.u8(149)
+        isto.u32(-offsetPositivo)
+    }
+
+    storeRaxRbpDisp(disp: inteiro): vazio {
+        isto.u8(72)
+        isto.u8(137)
+        isto.u8(133)
+        isto.u32(disp)
+    }
+
+    storeRaxRbp(offsetPositivo: inteiro): vazio {
+        isto.storeRaxRbpDisp(-offsetPositivo)
+    }
+
+    storeRdxRbp(offsetPositivo: inteiro): vazio {
+        isto.u8(72)
+        isto.u8(137)
+        isto.u8(149)
+        isto.u32(-offsetPositivo)
+    }
+
+    loadXmmRbpDisp(xmmIdx: inteiro, disp: inteiro): vazio {
+        isto.u8(242)
+        isto.u8(15)
+        isto.u8(16)
+        isto.u8(133 + xmmIdx * 8)
+        isto.u32(disp)
+    }
+
+    storeXmmRbpDisp(xmmIdx: inteiro, disp: inteiro): vazio {
+        isto.u8(242)
+        isto.u8(15)
+        isto.u8(17)
+        isto.u8(133 + xmmIdx * 8)
+        isto.u32(disp)
+    }
+
+    // movss xmmIdx, [rbp + disp32] -> F3 0F 10 (0x85 + xmm*8) disp32
+    loadXmmFloatRbpDisp(xmmIdx: inteiro, disp: inteiro): vazio {
+        isto.u8(243)
+        isto.u8(15)
+        isto.u8(16)
+        isto.u8(133 + xmmIdx * 8)
+        isto.u32(disp)
+    }
+
+    // movss [rbp + disp32], xmmIdx -> F3 0F 11 (0x85 + xmm*8) disp32
+    storeXmmFloatRbpDisp(xmmIdx: inteiro, disp: inteiro): vazio {
+        isto.u8(243)
+        isto.u8(15)
+        isto.u8(17)
+        isto.u8(133 + xmmIdx * 8)
+        isto.u32(disp)
+    }
+
+    // cvtsd2ss xmmIdx, [rbp + disp32] -> F2 0F 5A (0x85 + xmm*8) disp32
+    cvtsd2ssXmmFromRbpDisp(xmmIdx: inteiro, disp: inteiro): vazio {
+        isto.u8(242)
+        isto.u8(15)
+        isto.u8(90)
+        isto.u8(133 + xmmIdx * 8)
+        isto.u32(disp)
+    }
+
+    cvtsd2ssXmm0(srcXmm: inteiro): vazio {
+        isto.u8(242)
+        isto.u8(15)
+        isto.u8(90)
+        isto.u8(192 + srcXmm)
+    }
+
+    cvtss2sdXmm0(): vazio {
+        isto.u8(243)
+        isto.u8(15)
+        isto.u8(90)
+        isto.u8(192)
+    }
+
+    storeXmm0FloatRbpDisp(disp: inteiro): vazio {
+        isto.storeXmmFloatRbpDisp(0, disp)
+    }
+
+    floadFromPtrRax(largura: inteiro): vazio {
+        se (largura == 4) {
+            isto.u8(243)
+            isto.u8(15)
+            isto.u8(16)
+            isto.u8(0)
+            isto.cvtss2sdXmm0()
+        } senao {
+            isto.u8(242)
+            isto.u8(15)
+            isto.u8(16)
+            isto.u8(0)
+        }
+    }
+
+    fstoreToPtrRax(largura: inteiro): vazio {
+        se (largura == 4) {
+            isto.cvtsd2ssXmm0(0)
+            isto.u8(243)
+            isto.u8(15)
+            isto.u8(17)
+            isto.u8(0)
+        } senao {
+            isto.u8(242)
+            isto.u8(15)
+            isto.u8(17)
+            isto.u8(0)
+        }
+    }
+
+    storeArgAbiRbp(idx: inteiro, offsetPositivo: inteiro): vazio {
+        escolha (idx) {
+            caso 0:
+            isto.u8(72)
+            isto.u8(137)
+            isto.u8(189)
+            isto.u32(-offsetPositivo)
+            caso 1:
+            isto.u8(72)
+            isto.u8(137)
+            isto.u8(181)
+            isto.u32(-offsetPositivo)
+            caso 2:
+            isto.u8(72)
+            isto.u8(137)
+            isto.u8(149)
+            isto.u32(-offsetPositivo)
+            caso 3:
+            isto.u8(72)
+            isto.u8(137)
+            isto.u8(141)
+            isto.u32(-offsetPositivo)
+            caso 4:
+            isto.u8(76)
+            isto.u8(137)
+            isto.u8(133)
+            isto.u32(-offsetPositivo)
+            padrao:
+            isto.u8(76)
+            isto.u8(137)
+            isto.u8(141)
+            isto.u32(-offsetPositivo)
+        }
+    }
+
+    loadArgAbiRbp(idx: inteiro, offsetPositivo: inteiro): vazio {
+        escolha (idx) {
+            caso 0:
+            isto.u8(72)
+            isto.u8(139)
+            isto.u8(189)
+            isto.u32(-offsetPositivo)
+            caso 1:
+            isto.u8(72)
+            isto.u8(139)
+            isto.u8(181)
+            isto.u32(-offsetPositivo)
+            caso 2:
+            isto.u8(72)
+            isto.u8(139)
+            isto.u8(149)
+            isto.u32(-offsetPositivo)
+            caso 3:
+            isto.u8(72)
+            isto.u8(139)
+            isto.u8(141)
+            isto.u32(-offsetPositivo)
+            caso 4:
+            isto.u8(76)
+            isto.u8(139)
+            isto.u8(133)
+            isto.u32(-offsetPositivo)
+            padrao:
+            isto.u8(76)
+            isto.u8(139)
+            isto.u8(141)
+            isto.u32(-offsetPositivo)
+        }
+    }
+
+    callLabel(nome: texto): vazio {
+        isto.u8(232)
+        isto.patchesRel32.empilhar(PatchRel32(isto.code.tamanho(), nome))
+        isto.u32(0)
+    }
+
+    jmpLabel(nome: texto): vazio {
+        isto.u8(233)
+        isto.patchesRel32.empilhar(PatchRel32(isto.code.tamanho(), nome))
+        isto.u32(0)
+    }
+
+    testRaxRax(): vazio {
+        isto.u8(72)
+        isto.u8(133)
+        isto.u8(192)
+    }
+
+    jzLabel(nome: texto): vazio {
+        isto.u8(15)
+        isto.u8(132)
+        isto.patchesRel32.empilhar(PatchRel32(isto.code.tamanho(), nome))
+        isto.u32(0)
+    }
+
+    jsLabel(nome: texto): vazio {
+        isto.u8(15)
+        isto.u8(136)
+        isto.patchesRel32.empilhar(PatchRel32(isto.code.tamanho(), nome))
+        isto.u32(0)
+    }
+
+    jaeLabel(nome: texto): vazio {
+        isto.u8(15)
+        isto.u8(131)
+        isto.patchesRel32.empilhar(PatchRel32(isto.code.tamanho(), nome))
+        isto.u32(0)
+    }
+
+    movzxRaxAl(): vazio {
+        isto.u8(72)
+        isto.u8(15)
+        isto.u8(182)
+        isto.u8(192)
+    }
+
+    // Conversao unsigned int64 (rax) -> double (xmm0)
+    emitirUItoF(): vazio {
+        const lblAlta: texto = isto.novoLabelAux("uitof_hi")
+        const lblFim: texto = isto.novoLabelAux("uitof_end")
+        isto.testRaxRax()
+        isto.jsLabel(lblAlta)
+        // cvtsi2sd xmm0, rax -> F2 48 0F 2A C0
+        isto.u8(242)
+        isto.u8(72)
+        isto.u8(15)
+        isto.u8(42)
+        isto.u8(192)
+        isto.jmpLabel(lblFim)
+        isto.marcarLabel(lblAlta)
+        // mov rdx, rax -> 48 89 C2
+        isto.u8(72)
+        isto.u8(137)
+        isto.u8(194)
+        // shr rax, 1 -> 48 D1 E8
+        isto.u8(72)
+        isto.u8(209)
+        isto.u8(232)
+        // and edx, 1 -> 83 E2 01
+        isto.u8(131)
+        isto.u8(226)
+        isto.u8(1)
+        // or rax, rdx -> 48 09 D0
+        isto.u8(72)
+        isto.u8(9)
+        isto.u8(208)
+        // cvtsi2sd xmm0, rax
+        isto.u8(242)
+        isto.u8(72)
+        isto.u8(15)
+        isto.u8(42)
+        isto.u8(192)
+        // addsd xmm0, xmm0 -> F2 0F 58 C0
+        isto.u8(242)
+        isto.u8(15)
+        isto.u8(88)
+        isto.u8(192)
+        isto.marcarLabel(lblFim)
+    }
+
+    // Conversao double (xmm0) -> unsigned int64 (rax)
+    emitirFtoUI(): vazio {
+        const lblAlta: texto = isto.novoLabelAux("ftoui_hi")
+        const lblFim: texto = isto.novoLabelAux("ftoui_end")
+        // 2^63 em IEEE-754 double = 0x43E0000000000000 = 4890909195324358656
+        isto.movRaxImm64(4890909195324358656)
+        // movq xmm1, rax -> 66 48 0F 6E C8
+        isto.u8(102)
+        isto.u8(72)
+        isto.u8(15)
+        isto.u8(110)
+        isto.u8(200)
+        // ucomisd xmm0, xmm1 -> 66 0F 2E C1
+        isto.u8(102)
+        isto.u8(15)
+        isto.u8(46)
+        isto.u8(193)
+        isto.jaeLabel(lblAlta)
+        // cvttsd2si rax, xmm0 -> F2 48 0F 2C C0
+        isto.u8(242)
+        isto.u8(72)
+        isto.u8(15)
+        isto.u8(44)
+        isto.u8(192)
+        isto.jmpLabel(lblFim)
+        isto.marcarLabel(lblAlta)
+        // subsd xmm0, xmm1 -> F2 0F 5C C1
+        isto.u8(242)
+        isto.u8(15)
+        isto.u8(92)
+        isto.u8(193)
+        // cvttsd2si rax, xmm0
+        isto.u8(242)
+        isto.u8(72)
+        isto.u8(15)
+        isto.u8(44)
+        isto.u8(192)
+        // mov rcx, 0x8000000000000000; xor rax, rcx
+        isto.movRcxImm64(-9223372036854775807 - 1)
+        isto.u8(72)
+        isto.u8(49)
+        isto.u8(200)
+        isto.marcarLabel(lblFim)
+    }
+
+    // Comparacoes IEEE-754 seguras para NaN (xmm0 vs xmm1 -> rax = 0 ou 1)
+    emitirCompFloat(op: qualquer, OpI: qualquer): vazio {
+        se (op == OpI.FEq) {
+            // ucomisd xmm0, xmm1; sete al; setnp dl; and al, dl; movzx rax, al
+            isto.u8(102)
+            isto.u8(15)
+            isto.u8(46)
+            isto.u8(193)
+            isto.u8(15)
+            isto.u8(148)
+            isto.u8(192) // sete al
+            isto.u8(15)
+            isto.u8(155)
+            isto.u8(194) // setnp dl
+            isto.u8(32)
+            isto.u8(208) // and al, dl
+            isto.movzxRaxAl()
+            retorna
+        }
+        se (op == OpI.FNeq) {
+            // ucomisd xmm0, xmm1; setne al; setp dl; or al, dl; movzx rax, al
+            isto.u8(102)
+            isto.u8(15)
+            isto.u8(46)
+            isto.u8(193)
+            isto.u8(15)
+            isto.u8(149)
+            isto.u8(192) // setne al
+            isto.u8(15)
+            isto.u8(154)
+            isto.u8(194) // setp dl
+            isto.u8(8)
+            isto.u8(208) // or al, dl
+            isto.movzxRaxAl()
+            retorna
+        }
+        se (op == OpI.FLt ou op == OpI.FLe) {
+            // ucomisd xmm1, xmm0 (invertido: seta / setae retornam 0 se NaN!)
+            // 66 0F 2E C8
+            isto.u8(102)
+            isto.u8(15)
+            isto.u8(46)
+            isto.u8(200)
+            isto.u8(15)
+            isto.u8(op == OpI.FLt ? 151 : 147) // seta / setae
+            isto.u8(192)
+            isto.movzxRaxAl()
+            retorna
+        }
+        // FGt / FGe: ucomisd xmm0, xmm1; seta / setae (ja retornam 0 para NaN)
+        isto.u8(102)
+        isto.u8(15)
+        isto.u8(46)
+        isto.u8(193)
+        isto.u8(15)
+        isto.u8(op == OpI.FGt ? 151 : 147)
+        isto.u8(192)
+        isto.movzxRaxAl()
+    }
+
+    emitirBinariaInt(op: qualquer, OpI: qualquer, largura: inteiro = 8, ehSemSinal: logico = falso): vazio {
+        const eh32: logico = largura == 4
+        escolha (op) {
+            caso OpI.Add:
+            se (!eh32) isto.u8(72)
+            isto.u8(1)
+            isto.u8(200)
+            se (eh32 e !ehSemSinal) isto.truncRax(4, falso)
+            retorna
+            caso OpI.Sub:
+            se (!eh32) isto.u8(72)
+            isto.u8(41)
+            isto.u8(200)
+            se (eh32 e !ehSemSinal) isto.truncRax(4, falso)
+            retorna
+            caso OpI.Mul:
+            se (!eh32) isto.u8(72)
+            isto.u8(15)
+            isto.u8(175)
+            isto.u8(193)
+            se (eh32 e !ehSemSinal) isto.truncRax(4, falso)
+            retorna
+            caso OpI.SDiv:
+            se (!eh32) isto.u8(72)
+            isto.u8(153) // cqo / cdq
+            se (!eh32) isto.u8(72)
+            isto.u8(247)
+            isto.u8(249) // idiv rcx / ecx
+            se (eh32) isto.truncRax(4, falso)
+            retorna
+            caso OpI.UDiv:
+            se (!eh32) isto.u8(72)
+            isto.u8(49)
+            isto.u8(210) // xor rdx,rdx / edx,edx
+            se (!eh32) isto.u8(72)
+            isto.u8(247)
+            isto.u8(241) // div rcx / ecx
+            retorna
+            caso OpI.SMod:
+            se (!eh32) isto.u8(72)
+            isto.u8(153)
+            se (!eh32) isto.u8(72)
+            isto.u8(247)
+            isto.u8(249)
+            se (!eh32) isto.u8(72)
+            isto.u8(137)
+            isto.u8(208) // mov rax, rdx / eax, edx
+            se (eh32) isto.truncRax(4, falso)
+            retorna
+            caso OpI.UMod:
+            se (!eh32) isto.u8(72)
+            isto.u8(49)
+            isto.u8(210)
+            se (!eh32) isto.u8(72)
+            isto.u8(247)
+            isto.u8(241)
+            se (!eh32) isto.u8(72)
+            isto.u8(137)
+            isto.u8(208)
+            retorna
+            caso OpI.BitAnd:
+            se (!eh32) isto.u8(72)
+            isto.u8(33)
+            isto.u8(200)
+            se (eh32 e !ehSemSinal) isto.truncRax(4, falso)
+            retorna
+            caso OpI.BitOr:
+            se (!eh32) isto.u8(72)
+            isto.u8(9)
+            isto.u8(200)
+            se (eh32 e !ehSemSinal) isto.truncRax(4, falso)
+            retorna
+            caso OpI.BitXor:
+            se (!eh32) isto.u8(72)
+            isto.u8(49)
+            isto.u8(200)
+            se (eh32 e !ehSemSinal) isto.truncRax(4, falso)
+            retorna
+            caso OpI.Shl:
+            se (!eh32) isto.u8(72)
+            isto.u8(211)
+            isto.u8(224)
+            se (eh32 e !ehSemSinal) isto.truncRax(4, falso)
+            retorna
+            caso OpI.AShr:
+            se (!eh32) isto.u8(72)
+            isto.u8(211)
+            isto.u8(248)
+            se (eh32) isto.truncRax(4, falso)
+            retorna
+            caso OpI.LShr:
+            se (!eh32) isto.u8(72)
+            isto.u8(211)
+            isto.u8(232)
+            retorna
+            padrao:
+            se (!eh32) isto.u8(72)
+            isto.u8(57)
+            isto.u8(200) // cmp rax, rcx / eax, ecx
+            isto.u8(15)
+            escolha (op) {
+                caso OpI.Eq: isto.u8(148)
+                caso OpI.Neq: isto.u8(149)
+                caso OpI.SLt: isto.u8(156)
+                caso OpI.SLe: isto.u8(158)
+                caso OpI.SGt: isto.u8(159)
+                caso OpI.SGe: isto.u8(157)
+                caso OpI.ULt: isto.u8(146)
+                caso OpI.ULe: isto.u8(150)
+                caso OpI.UGt: isto.u8(151)
+                padrao: isto.u8(147)
+            }
+            isto.u8(192)
+            isto.movzxRaxAl()
+        }
+    }
+
+    resolverPatchesInternos(): vazio {
+        const elfComum: qualquer = importar("../../object/elf/elf_comum.delegua")
+        const diagMod: qualquer = importar("../../diagnostics/diag.delegua")
+        para (var i: inteiro = 0; i < isto.patchesRel32.tamanho(); i++) {
+            const p: PatchRel32 = isto.patchesRel32[i]
+            se (!isto.labels.contem(p.alvo)) {
+                falhar diagMod.ErroDCC("Backend x86-64 (ICE): label interno inexistente '${p.alvo}'",
+                    "", 0, 0, "E9010", verdadeiro)
+            }
+            const alvoAddr: inteiro = inteiro(isto.labels[p.alvo])
+            const rel32: inteiro = alvoAddr - (p.pos + 4)
+            se (rel32 < -2147483648 ou rel32 > 2147483647) {
+                falhar diagMod.ErroDCC("Backend x86-64: deslocamento relativo rel32 fora de alcance (${rel32}) para '${p.alvo}'",
+                    "", 0, 0, "E4002", falso)
+            }
+            elfComum.gravarU32(isto.code, p.pos, rel32)
+        }
+    }
+}
