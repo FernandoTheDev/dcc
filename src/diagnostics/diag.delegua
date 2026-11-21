@@ -1,0 +1,125 @@
+// Sistema de diagnosticos profissionais do DCC (Delégua C Compiler).
+// Formata erros, avisos e notas com arquivo, linha, coluna, trecho de codigo e marcador '^'.
+
+classe ErroDCC herda Excecao {
+    arquivo: texto
+    linha: inteiro
+    coluna: inteiro
+
+    construtor(mensagem: texto, arquivo: texto = "", linha: inteiro = 0, coluna: inteiro = 0) {
+        super(mensagem)
+        isto.arquivo = arquivo
+        isto.linha = linha
+        isto.coluna = coluna
+    }
+}
+
+classe OrigemLinha {
+    arquivo: texto
+    linha: inteiro
+    textoLinha: texto
+
+    construtor(arquivo: texto, linha: inteiro, textoLinha: texto) {
+        isto.arquivo = arquivo
+        isto.linha = linha
+        isto.textoLinha = textoLinha
+    }
+}
+
+classe MapaFonte {
+    linhas: OrigemLinha[]
+
+    construtor() {
+        isto.linhas = []
+    }
+
+    registrar(arquivo: texto, linha: inteiro, textoLinha: texto): vazio {
+        isto.linhas.empilhar(OrigemLinha(arquivo, linha, textoLinha))
+    }
+
+    consultar(linhaExpandida: inteiro): OrigemLinha {
+        const idx: inteiro = linhaExpandida - 1
+        se (idx >= 0 e idx < isto.linhas.tamanho()) {
+            retorna isto.linhas[idx]
+        }
+        retorna OrigemLinha("<entrada>", linhaExpandida, "")
+    }
+}
+
+funcao repetirEspacos(qtd: inteiro): texto {
+    var out: texto[] = []
+    para (var i: inteiro = 0; i < qtd; i++) out.empilhar(" ")
+    retorna out.juntar("")
+}
+
+funcao formatarDiagnostico(severidade: texto, arquivo: texto, linha: inteiro, coluna: inteiro,
+    mensagem: texto, trecho: texto = "", nota: texto = ""): texto {
+    var cab: texto = ""
+    se (arquivo.tamanho() > 0 e linha > 0 e coluna > 0) {
+        cab = "${arquivo}:${linha}:${coluna}: ${severidade}: ${mensagem}"
+    } senao se (arquivo.tamanho() > 0 e linha > 0) {
+        cab = "${arquivo}:${linha}: ${severidade}: ${mensagem}"
+    } senao se (linha > 0) {
+        cab = "<entrada>:${linha}: ${severidade}: ${mensagem}"
+    } senao {
+        cab = "dcc: ${severidade}: ${mensagem}"
+    }
+
+    var linhasOut: texto[] = [cab]
+    se (trecho.tamanho() > 0 e linha > 0) {
+        const numStr: texto = texto(linha)
+        const padNum: texto = repetirEspacos(numStr.tamanho() < 5 ? 5 - numStr.tamanho() : 0)
+        linhasOut.empilhar("${padNum}${numStr} | ${trecho}")
+        const colCaret: inteiro = coluna > 1 ? coluna - 1 : 0
+        const espPrefixo: texto = repetirEspacos(padNum.tamanho() + numStr.tamanho())
+        linhasOut.empilhar("${espPrefixo} | " + repetirEspacos(colCaret) + "^")
+    }
+
+    se (nota.tamanho() > 0) {
+        linhasOut.empilhar("note: ${nota}")
+    }
+
+    retorna linhasOut.juntar("\n")
+}
+
+classe ContextoDiag {
+    mapaFonte: MapaFonte
+    avisos: texto[]
+    wall: logico
+    wextra: logico
+    werror: logico
+
+    construtor(wall: logico = falso, wextra: logico = falso, werror: logico = falso) {
+        isto.mapaFonte = MapaFonte()
+        isto.avisos = []
+        isto.wall = wall
+        isto.wextra = wextra
+        isto.werror = werror
+    }
+
+    erroEm(linhaExp: inteiro, coluna: inteiro, mensagem: texto, nota: texto = ""): vazio {
+        const orig: OrigemLinha = isto.mapaFonte.consultar(linhaExp)
+        const fmt: texto = formatarDiagnostico("error", orig.arquivo, orig.linha, coluna,
+            mensagem, orig.textoLinha, nota)
+        falhar ErroDCC(fmt, orig.arquivo, orig.linha, coluna)
+    }
+
+    erroDireto(arquivo: texto, linha: inteiro, coluna: inteiro, mensagem: texto, trecho: texto = "",
+        nota: texto = ""): vazio {
+        const fmt: texto = formatarDiagnostico("error", arquivo, linha, coluna, mensagem,
+            trecho, nota)
+        falhar ErroDCC(fmt, arquivo, linha, coluna)
+    }
+
+    avisoEm(linhaExp: inteiro, coluna: inteiro, mensagem: texto, nota: texto = ""): vazio {
+        const orig: OrigemLinha = isto.mapaFonte.consultar(linhaExp)
+        se (isto.werror) {
+            const fmtE: texto = formatarDiagnostico("error", orig.arquivo, orig.linha, coluna,
+                mensagem + " [-Werror]", orig.textoLinha, nota)
+            falhar ErroDCC(fmtE, orig.arquivo, orig.linha, coluna)
+        }
+        const fmtW: texto = formatarDiagnostico("warning", orig.arquivo, orig.linha, coluna,
+            mensagem, orig.textoLinha, nota)
+        isto.avisos.empilhar(fmtW)
+    }
+}

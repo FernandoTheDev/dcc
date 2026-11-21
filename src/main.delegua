@@ -1,0 +1,16 @@
+// Ponto de entrada do DCC (Delegua C Compiler).
+// Compilado pelo CGD em binario nativo independente (`dcc`).
+
+@definicao(biblioteca = "c", abi = "c")
+classe estrangeira LibCExit {
+    @definicao(simbolo = "_exit")
+    estatico sair(codigo: inteiro): vazio;
+}
+
+const procMod: qualquer = importar("cgd:processo")
+const cliMod: qualquer = importar("driver/cli.delegua")
+
+const codigo: inteiro = cliMod.executarDriverDCC(procMod.Processo.argumentos())
+se (codigo != 0) {
+    LibCExit.sair(codigo)
+}

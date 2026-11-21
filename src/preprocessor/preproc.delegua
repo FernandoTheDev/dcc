@@ -1,0 +1,1403 @@
+// Fase 0 (ISO C99 Fases 1-4 + compatibilidade com headers reais do sistema):
+// Pre-processador C99/GNU99 real orientado a tokens para o DCC (Delegua C Compiler).
+// Resolve diretamente /usr/include, diretorios freestanding do sistema e -I,
+// sem tabelas fixas de headers ou registro artificial de simbolos da libc.
+
+enum PPTokKind {
+    Ident,
+    Num,
+    Str,
+    Char,
+    Punct,
+    Hash,
+    HashHash,
+    Fim
+}
+
+classe PPToken {
+    kind: PPTokKind
+    val: texto
+    espaco: logico
+    linha: inteiro
+    hideSet: dicionario
+
+    construtor(kind: PPTokKind, val: texto, espaco: logico = falso, linha: inteiro = 1) {
+        isto.kind = kind
+        isto.val = val
+        isto.espaco = espaco
+        isto.linha = linha
+        isto.hideSet = {}
+    }
+
+    clonarComHide(extraHide: dicionario): PPToken {
+        const novo: PPToken = PPToken(isto.kind, isto.val, isto.espaco, isto.linha)
+        const chaves1: texto[] = isto.hideSet.chaves()
+        para (var i: inteiro = 0; i < chaves1.tamanho(); i++) {
+            novo.hideSet[chaves1[i]] = verdadeiro
+        }
+        const chaves2: texto[] = extraHide.chaves()
+        para (var i: inteiro = 0; i < chaves2.tamanho(); i++) {
+            novo.hideSet[chaves2[i]] = verdadeiro
+        }
+        retorna novo
+    }
+}
+
+classe MacroDef {
+    nome: texto
+    ehFuncao: logico
+    ehVariadica: logico
+    params: texto[]
+    corpo: PPToken[]
+
+    construtor(nome: texto, ehFuncao: logico, ehVariadica: logico, params: texto[], corpo: PPToken[]) {
+        isto.nome = nome
+        isto.ehFuncao = ehFuncao
+        isto.ehVariadica = ehVariadica
+        isto.params = params
+        isto.corpo = corpo
+    }
+}
+
+classe QuadroIf {
+    paiAtivo: logico
+    esteAtivo: logico
+    jaTomouRamo: logico
+    viuElse: logico
+
+    construtor(paiAtivo: logico, esteAtivo: logico) {
+        isto.paiAtivo = paiAtivo
+        isto.esteAtivo = esteAtivo
+        isto.jaTomouRamo = esteAtivo
+        isto.viuElse = falso
+    }
+}
+
+funcao subtextoPP(s: texto, ini: inteiro, fim: inteiro): texto {
+    var out: texto[] = []
+    para (var i: inteiro = ini; i < fim e i < s.tamanho(); i++) {
+        out.empilhar(s[i])
+    }
+
+    retorna out.juntar("")
+}
+
+funcao diretorioDe(caminho: texto): texto {
+    var ultimaBarra: inteiro = -1
+    para (var i: inteiro = 0; i < caminho.tamanho(); i++) {
+        se (caminho[i] == "/") ultimaBarra = i
+    }
+
+    se (ultimaBarra < 0) retorna "."
+    se (ultimaBarra == 0) retorna "/"
+    retorna subtextoPP(caminho, 0, ultimaBarra)
+}
+
+funcao juntarCaminho(dir: texto, rel: texto): texto {
+    se (rel.tamanho() > 0 e rel[0] == "/") retorna rel
+    se (dir == "." ou dir == "") retorna rel
+    se (dir[dir.tamanho() - 1] == "/") retorna dir + rel
+    retorna dir + "/" + rel
+}
+
+funcao ehDigitoPP(c: texto): logico {
+    retorna "0123456789".contem(c)
+}
+
+funcao ehInicioIdentPP(c: texto): logico {
+    retorna "abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ_$".contem(c)
+}
+
+funcao ehContIdentPP(c: texto): logico {
+    retorna "abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ_$0123456789".contem(c)
+}
+
+funcao digitoValorPP(c: texto): inteiro {
+    const mapa: texto = "0123456789abcdef"
+    const cl: texto = c.minusculo()
+    para (var i: inteiro = 0; i < 16; i++) {
+        se (mapa[i] == cl) retorna i
+    }
+
+    retorna 0
+}
+
+funcao parseInteiroPP(lex: texto): inteiro {
+    var fim: inteiro = lex.tamanho()
+    enquanto (fim > 0 e "uUlL".contem(lex[fim - 1])) fim--
+    const limpo: texto = subtextoPP(lex, 0, fim)
+    se (limpo.tamanho() == 0) retorna 0
+
+    // Hexadecimal 0x...
+    se (limpo.tamanho() >= 2 e limpo[0] == "0" e (limpo[1] == "x" ou limpo[1] == "X")) {
+        var acc: inteiro = 0
+        para (var i: inteiro = 2; i < limpo.tamanho(); i++) {
+            acc = (acc << 4) | digitoValorPP(limpo[i])
+        }
+        retorna acc
+    }
+
+    // Binario 0b... (extensao GNU)
+    se (limpo.tamanho() >= 2 e limpo[0] == "0" e (limpo[1] == "b" ou limpo[1] == "B")) {
+        var acc: inteiro = 0
+        para (var i: inteiro = 2; i < limpo.tamanho(); i++) {
+            acc = (acc << 1) | (limpo[i] == "1" ? 1 : 0)
+        }
+        retorna acc
+    }
+
+    // Octal 0...
+    se (limpo.tamanho() >= 2 e limpo[0] == "0") {
+        var acc: inteiro = 0
+        para (var i: inteiro = 1; i < limpo.tamanho(); i++) {
+            acc = (acc << 3) | digitoValorPP(limpo[i])
+        }
+        retorna acc
+    }
+
+    // Decimal seguro contra overflow de 64 bits com sinal (ex: 18446744073709551615UL)
+    var acc: inteiro = 0
+    para (var i: inteiro = 0; i < limpo.tamanho(); i++) {
+        se (!ehDigitoPP(limpo[i])) sustar
+        acc = acc * 10 + digitoValorPP(limpo[i])
+    }
+
+    retorna acc
+}
+
+funcao codigoCharPP(lit: texto): inteiro {
+    se (lit.tamanho() < 3) retorna 0
+    const tabela: texto = " !\"#$%&'()*+,-./0123456789:;<=>?@ABCDEFGHIJKLMNOPQRSTUVWXYZ[\\]^_`abcdefghijklmnopqrstuvwxyz{|}~"
+    se (lit[1] == "\\" e lit.tamanho() >= 4) {
+        const esc: texto = lit[2]
+        se (esc == "n") retorna 10
+        se (esc == "t") retorna 9
+        se (esc == "r") retorna 13
+        se (esc == "0") retorna 0
+        se (esc == "\\") retorna 92
+        se (esc == "'") retorna 39
+        se (esc == "\"") retorna 34
+    }
+
+    const ch: texto = lit[1]
+    para (var i: inteiro = 0; i < tabela.tamanho(); i++) {
+        se (tabela[i] == ch) retorna 32 + i
+    }
+
+    retorna 0
+}
+
+// Fase 1 + Fase 2 + Fase 3 em O(N) sobre vetor de bytes (evita O(N^2) em indexacao UTF-8 de arquivos grandes)
+funcao trigraphByte(b: inteiro): inteiro {
+    escolha (b) {
+        caso 61: retorna 35 // '=' -> '#'
+        caso 47: retorna 92 // '/' -> '\'
+        caso 39: retorna 94 // ''' -> '^'
+        caso 40: retorna 91 // '(' -> '['
+        caso 41: retorna 93 // ')' -> ']'
+        caso 33: retorna 124 // '!' -> '|'
+        caso 60: retorna 123 // '<' -> '{'
+        caso 62: retorna 125 // '>' -> '}'
+        caso 45: retorna 126 // '-' -> '~'
+        padrao: retorna -1
+    }
+
+    retorna -1
+}
+
+funcao fasesIniciaisELimpezaPP(fonte: texto): texto {
+    const bytesMod: qualquer = importar("cgd:bytes")
+    const raw: inteiro[] = bytesMod.Bytes.deTexto(fonte).paraVetor()
+    const n: inteiro = raw.tamanho()
+
+    // Fase 1: trigraphs + normalizacao CRLF
+    var t1: inteiro[] = []
+    var i: inteiro = 0
+    enquanto (i < n) {
+        const b: inteiro = raw[i]
+        se (b == 13) {
+            // '\r'
+            se (i + 1 < n e raw[i + 1] == 10) i++
+            t1.empilhar(10)
+            i++
+            continua
+        }
+        se (b == 63 e i + 2 < n e raw[i + 1] == 63) {
+            // "??"
+            const rep: inteiro = trigraphByte(raw[i + 2])
+            se (rep >= 0) {
+                t1.empilhar(rep)
+                i = i + 3
+                continua
+            }
+        }
+        t1.empilhar(b)
+        i++
+    }
+
+    // Fase 2: line splicing ('\' seguido de '\n')
+    var t2: inteiro[] = []
+    var j: inteiro = 0
+    const m: inteiro = t1.tamanho()
+    enquanto (j < m) {
+        se (t1[j] == 92 e j + 1 < m e t1[j + 1] == 10) {
+            j = j + 2
+            continua
+        }
+        t2.empilhar(t1[j])
+        j++
+    }
+
+    // Fase 3: remove comentarios mantendo quebras de linha
+    var out: inteiro[] = []
+    var k: inteiro = 0
+    const p: inteiro = t2.tamanho()
+    var emStr: logico = falso
+    var emChr: logico = falso
+    enquanto (k < p) {
+        const b: inteiro = t2[k]
+        se (emStr) {
+            out.empilhar(b)
+            se (b == 92 e k + 1 < p) {
+                k++
+                out.empilhar(t2[k])
+            } senao se (b == 34) {
+                emStr = falso
+            }
+            k++
+            continua
+        }
+        se (emChr) {
+            out.empilhar(b)
+            se (b == 92 e k + 1 < p) {
+                k++
+                out.empilhar(t2[k])
+            } senao se (b == 39) {
+                emChr = falso
+            }
+            k++
+            continua
+        }
+        se (b == 34) {
+            emStr = verdadeiro
+            out.empilhar(b)
+            k++
+            continua
+        }
+        se (b == 39) {
+            emChr = verdadeiro
+            out.empilhar(b)
+            k++
+            continua
+        }
+        se (b == 47 e k + 1 < p e t2[k + 1] == 47) {
+            // "//"
+            out.empilhar(32)
+            enquanto (k < p e t2[k] != 10) k++
+            continua
+        }
+        se (b == 47 e k + 1 < p e t2[k + 1] == 42) {
+            // "/*"
+            out.empilhar(32)
+            k = k + 2
+            enquanto (k + 1 < p) {
+                se (t2[k] == 42 e t2[k + 1] == 47) {
+                    k = k + 2
+                    sustar
+                }
+                se (t2[k] == 10) out.empilhar(10)
+                k++
+            }
+            continua
+        }
+        out.empilhar(b)
+        k++
+    }
+
+    retorna bytesMod.Bytes.deVetor(out).paraTexto()
+}
+
+funcao tokenizarLinhaPP(linhaStr: texto, numLinha: inteiro): PPToken[] {
+    var out: PPToken[] = []
+    var i: inteiro = 0
+    const n: inteiro = linhaStr.tamanho()
+    var viuEspaco: logico = falso
+
+    enquanto (i < n) {
+        const c: texto = linhaStr[i]
+        se (c == " " ou c == "\t" ou c == "\r") {
+            viuEspaco = verdadeiro
+            i++
+            continua
+        }
+        se (c == "\"") {
+            var buf: texto[] = ["\""]
+            i++
+            enquanto (i < n) {
+                const ch: texto = linhaStr[i]
+                buf.empilhar(ch)
+                i++
+                se (ch == "\\" e i < n) {
+                    buf.empilhar(linhaStr[i])
+                    i++
+                } senao se (ch == "\"") {
+                    sustar
+                }
+            }
+            out.empilhar(PPToken(PPTokKind.Str, buf.juntar(""), viuEspaco, numLinha))
+            viuEspaco = falso
+            continua
+        }
+        se (c == "'") {
+            var buf: texto[] = ["'"]
+            i++
+            enquanto (i < n) {
+                const ch: texto = linhaStr[i]
+                buf.empilhar(ch)
+                i++
+                se (ch == "\\" e i < n) {
+                    buf.empilhar(linhaStr[i])
+                    i++
+                } senao se (ch == "'") {
+                    sustar
+                }
+            }
+            out.empilhar(PPToken(PPTokKind.Char, buf.juntar(""), viuEspaco, numLinha))
+            viuEspaco = falso
+            continua
+        }
+        se (ehInicioIdentPP(c)) {
+            var buf: texto[] = []
+            enquanto (i < n e ehContIdentPP(linhaStr[i])) {
+                buf.empilhar(linhaStr[i])
+                i++
+            }
+            out.empilhar(PPToken(PPTokKind.Ident, buf.juntar(""), viuEspaco, numLinha))
+            viuEspaco = falso
+            continua
+        }
+        se (ehDigitoPP(c) ou (c == "." e i + 1 < n e ehDigitoPP(linhaStr[i + 1]))) {
+            var buf: texto[] = []
+            enquanto (i < n) {
+                const ch: texto = linhaStr[i]
+                se (ehContIdentPP(ch) ou ch == ".") {
+                    buf.empilhar(ch)
+                    i++
+                    se ((ch == "e" ou ch == "E" ou ch == "p" ou ch == "P") e i < n e (linhaStr[i] == "+" ou linhaStr[i] == "-")) {
+                        buf.empilhar(linhaStr[i])
+                        i++
+                    }
+                } senao {
+                    sustar
+                }
+            }
+            out.empilhar(PPToken(PPTokKind.Num, buf.juntar(""), viuEspaco, numLinha))
+            viuEspaco = falso
+            continua
+        }
+        se (c == "#" e i + 1 < n e linhaStr[i + 1] == "#") {
+            out.empilhar(PPToken(PPTokKind.HashHash, "##", viuEspaco, numLinha))
+            i = i + 2
+            viuEspaco = falso
+            continua
+        }
+        se (c == "#") {
+            out.empilhar(PPToken(PPTokKind.Hash, "#", viuEspaco, numLinha))
+            i++
+            viuEspaco = falso
+            continua
+        }
+        se (i + 2 < n) {
+            const tri: texto = subtextoPP(linhaStr, i, i + 3)
+            se (tri == "..." ou tri == "<<=" ou tri == ">>=") {
+                out.empilhar(PPToken(PPTokKind.Punct, tri, viuEspaco, numLinha))
+                i = i + 3
+                viuEspaco = falso
+                continua
+            }
+        }
+        se (i + 1 < n) {
+            const par: texto = c + linhaStr[i + 1]
+            se (par == "->" ou par == "++" ou par == "--" ou par == "<<" ou par == ">>" ou par == "<=" ou par == ">=" ou par == "==" ou par == "!=" ou par == "&&" ou par == "||" ou par == "+=" ou par == "-=" ou par == "*=" ou par == "/=" ou par == "%=" ou par == "&=" ou par == "|=" ou par == "^=") {
+                out.empilhar(PPToken(PPTokKind.Punct, par, viuEspaco, numLinha))
+                i = i + 2
+                viuEspaco = falso
+                continua
+            }
+        }
+        out.empilhar(PPToken(PPTokKind.Punct, c, viuEspaco, numLinha))
+        i++
+        viuEspaco = falso
+    }
+
+    retorna out
+}
+
+funcao renderizarTokensPP(toks: PPToken[]): texto {
+    var partes: texto[] = []
+    para (var i: inteiro = 0; i < toks.tamanho(); i++) {
+        se (i > 0) {
+            se (toks[i].espaco) {
+                partes.empilhar(" ")
+            } senao {
+                const ant: PPToken = toks[i - 1]
+                const atu: PPToken = toks[i]
+                const antIdNum: logico = ant.kind == PPTokKind.Ident ou ant.kind == PPTokKind.Num
+                const atuIdNum: logico = atu.kind == PPTokKind.Ident ou atu.kind == PPTokKind.Num
+                se (antIdNum e atuIdNum) partes.empilhar(" ")
+            }
+        }
+        partes.empilhar(toks[i].val)
+    }
+
+    retorna partes.juntar("")
+}
+
+funcao stringificarTokensPP(toks: PPToken[]): texto {
+    const bruto: texto = renderizarTokensPP(toks).aparar()
+    var out: texto[] = ["\""]
+    para (var i: inteiro = 0; i < bruto.tamanho(); i++) {
+        const c: texto = bruto[i]
+        se (c == "\\") out.empilhar("\\\\")
+        senao se (c == "\"") out.empilhar("\\\"")
+        senao out.empilhar(c)
+    }
+
+    out.empilhar("\"")
+    retorna out.juntar("")
+}
+
+// Avaliador de expressoes constantes para #if e #elif (ISO C99 6.10.1) com curto-circuito seguro
+classe AvaliadorExprPP {
+    toks: PPToken[]
+    pos: inteiro
+    diag: qualquer
+    arquivo: texto
+    linha: inteiro
+
+    construtor(toks: PPToken[], diag: qualquer, arquivo: texto, linha: inteiro) {
+        isto.toks = toks
+        isto.pos = 0
+        isto.diag = diag
+        isto.arquivo = arquivo
+        isto.linha = linha
+    }
+
+    atual(): PPToken {
+        se (isto.pos >= isto.toks.tamanho()) retorna PPToken(PPTokKind.Fim, "")
+        retorna isto.toks[isto.pos]
+    }
+
+    avancar(): PPToken {
+        const t: PPToken = isto.atual()
+        isto.pos++
+        retorna t
+    }
+
+    avaliar(): inteiro {
+        se (isto.toks.tamanho() == 0) retorna 0
+        retorna isto.parseVirgula(verdadeiro)
+    }
+
+    parseVirgula(ativo: logico): inteiro {
+        var esq: inteiro = isto.parseTernario(ativo)
+        enquanto (isto.atual().val == ",") {
+            isto.avancar()
+            esq = isto.parseTernario(ativo)
+        }
+        retorna esq
+    }
+
+    parseTernario(ativo: logico): inteiro {
+        const cond: inteiro = isto.parseOrLog(ativo)
+        se (isto.atual().val == "?") {
+            isto.avancar()
+            const sim: inteiro = isto.parseTernario(ativo e cond != 0)
+            se (isto.atual().val != ":") {
+                isto.diag.erroDireto(isto.arquivo, isto.linha, 1, "':' esperado em expressao #if")
+            }
+            isto.avancar()
+            const naoVal: inteiro = isto.parseTernario(ativo e cond == 0)
+            retorna cond != 0 ? sim : naoVal
+        }
+        retorna cond
+    }
+
+    parseOrLog(ativo: logico): inteiro {
+        var esq: inteiro = isto.parseAndLog(ativo)
+        enquanto (isto.atual().val == "||") {
+            isto.avancar()
+            const dir: inteiro = isto.parseAndLog(ativo e esq == 0)
+            esq = (esq != 0 ou dir != 0) ? 1 : 0
+        }
+        retorna esq
+    }
+
+    parseAndLog(ativo: logico): inteiro {
+        var esq: inteiro = isto.parseBitOr(ativo)
+        enquanto (isto.atual().val == "&&") {
+            isto.avancar()
+            const dir: inteiro = isto.parseBitOr(ativo e esq != 0)
+            esq = (esq != 0 e dir != 0) ? 1 : 0
+        }
+        retorna esq
+    }
+
+    parseBitOr(ativo: logico): inteiro {
+        var esq: inteiro = isto.parseBitXor(ativo)
+        enquanto (isto.atual().val == "|") {
+            isto.avancar()
+            esq = esq | isto.parseBitXor(ativo)
+        }
+        retorna esq
+    }
+
+    parseBitXor(ativo: logico): inteiro {
+        var esq: inteiro = isto.parseBitAnd(ativo)
+        enquanto (isto.atual().val == "^") {
+            isto.avancar()
+            esq = esq ^ isto.parseBitAnd(ativo)
+        }
+        retorna esq
+    }
+
+    parseBitAnd(ativo: logico): inteiro {
+        var esq: inteiro = isto.parseIgualdade(ativo)
+        enquanto (isto.atual().val == "&") {
+            isto.avancar()
+            esq = esq & isto.parseIgualdade(ativo)
+        }
+        retorna esq
+    }
+
+    parseIgualdade(ativo: logico): inteiro {
+        var esq: inteiro = isto.parseRel(ativo)
+        enquanto (isto.atual().val == "==" ou isto.atual().val == "!=") {
+            const op: texto = isto.avancar().val
+            const dir: inteiro = isto.parseRel(ativo)
+            se (op == "==") esq = esq == dir ? 1 : 0
+            senao esq = esq != dir ? 1 : 0
+        }
+        retorna esq
+    }
+
+    parseRel(ativo: logico): inteiro {
+        var esq: inteiro = isto.parseShift(ativo)
+        enquanto (isto.atual().val == "<" ou isto.atual().val == "<=" ou isto.atual().val == ">" ou isto.atual().val == ">=") {
+            const op: texto = isto.avancar().val
+            const dir: inteiro = isto.parseShift(ativo)
+            se (op == "<") esq = esq < dir ? 1 : 0
+            senao se (op == "<=") esq = esq <= dir ? 1 : 0
+            senao se (op == ">") esq = esq > dir ? 1 : 0
+            senao esq = esq >= dir ? 1 : 0
+        }
+        retorna esq
+    }
+
+    parseShift(ativo: logico): inteiro {
+        var esq: inteiro = isto.parseAdd(ativo)
+        enquanto (isto.atual().val == "<<" ou isto.atual().val == ">>") {
+            const op: texto = isto.avancar().val
+            const dir: inteiro = isto.parseAdd(ativo)
+            se (op == "<<") esq = esq << dir
+            senao esq = esq >> dir
+        }
+        retorna esq
+    }
+
+    parseAdd(ativo: logico): inteiro {
+        var esq: inteiro = isto.parseMul(ativo)
+        enquanto (isto.atual().val == "+" ou isto.atual().val == "-") {
+            const op: texto = isto.avancar().val
+            const dir: inteiro = isto.parseMul(ativo)
+            se (op == "+") esq = esq + dir
+            senao esq = esq - dir
+        }
+        retorna esq
+    }
+
+    parseMul(ativo: logico): inteiro {
+        var esq: inteiro = isto.parseUnario(ativo)
+        enquanto (isto.atual().val == "*" ou isto.atual().val == "/" ou isto.atual().val == "%") {
+            const op: texto = isto.avancar().val
+            const dir: inteiro = isto.parseUnario(ativo)
+            se (op == "*") {
+                esq = esq * dir
+            } senao se (dir == 0) {
+                se (ativo) isto.diag.erroDireto(isto.arquivo, isto.linha, 1, "divisao por zero em diretiva #if")
+                esq = 0
+            } senao se (op == "/") {
+                esq = inteiro(esq / dir)
+            } senao {
+                esq = esq % dir
+            }
+        }
+        retorna esq
+    }
+
+    parseUnario(ativo: logico): inteiro {
+        const v: texto = isto.atual().val
+        se (v == "+") {
+            isto.avancar()
+            retorna isto.parseUnario(ativo)
+        }
+        se (v == "-") {
+            isto.avancar()
+            retorna -isto.parseUnario(ativo)
+        }
+        se (v == "!") {
+            isto.avancar()
+            retorna isto.parseUnario(ativo) == 0 ? 1 : 0
+        }
+        se (v == "~") {
+            isto.avancar()
+            retorna ~isto.parseUnario(ativo)
+        }
+        retorna isto.parsePrimario(ativo)
+    }
+
+    parsePrimario(ativo: logico): inteiro {
+        const t: PPToken = isto.atual()
+        se (t.val == "(") {
+            isto.avancar()
+            const v: inteiro = isto.parseVirgula(ativo)
+            se (isto.atual().val != ")") {
+                isto.diag.erroDireto(isto.arquivo, isto.linha, 1, "')' esperado em diretiva #if")
+            }
+            isto.avancar()
+            retorna v
+        }
+        se (t.kind == PPTokKind.Num) {
+            isto.avancar()
+            retorna parseInteiroPP(t.val)
+        }
+        se (t.kind == PPTokKind.Char) {
+            isto.avancar()
+            retorna codigoCharPP(t.val)
+        }
+        se (t.kind == PPTokKind.Ident) {
+            isto.avancar()
+            // Em ramos mortos de #if (ex: 0 && macro_indef(x)), consome argumentos se houver '('
+            se (!ativo e isto.atual().val == "(") {
+                isto.avancar()
+                var d: inteiro = 1
+                enquanto (d > 0 e isto.atual().kind != PPTokKind.Fim) {
+                    se (isto.atual().val == "(") d++
+                    senao se (isto.atual().val == ")") d--
+                    isto.avancar()
+                }
+            }
+            retorna 0
+        }
+        se (!ativo) {
+            isto.avancar()
+            retorna 0
+        }
+        isto.diag.erroDireto(isto.arquivo, isto.linha, 1, "token inesperado em diretiva #if: '" + t.val + "'")
+        retorna 0
+    }
+}
+
+funcao descobrirDirsSistema(): texto[] {
+    const procMod: qualquer = importar("cgd:processo")
+    const cmd: texto = "for d in /usr/lib/gcc/x86_64-*/*/include /usr/lib/clang/*/include; do if [ -d \"$d\" ]; then echo \"$d\"; break; fi; done; for d in /usr/local/include /usr/include/x86_64-linux-gnu /usr/include; do [ -d \"$d\" ] && echo \"$d\"; done"
+    const res: qualquer = procMod.Processo.executar("/bin/sh", ["-c", cmd])
+    var dirs: texto[] = []
+    var vistos: dicionario = {}
+    se (res.codigoSaida() == 0) {
+        const linhas: texto[] = res.saidaPadrao().dividir("\n")
+        para (var i: inteiro = 0; i < linhas.tamanho(); i++) {
+            const d: texto = linhas[i].aparar()
+            se (d.tamanho() > 0 e !vistos.contem(d)) {
+                vistos[d] = verdadeiro
+                dirs.empilhar(d)
+            }
+        }
+    }
+
+    se (!vistos.contem("/usr/include")) {
+        dirs.empilhar("/usr/include")
+    }
+
+    retorna dirs
+}
+
+classe PreprocessadorDCC {
+    macros: dicionario
+    pragmaOnceVistos: dicionario
+    dirsBusca: texto[]
+    arquivos: qualquer
+    diag: qualquer
+    modoGnu: logico
+    includesResolvidos: inteiro
+    profundidadeInclude: inteiro
+
+    construtor(dirsInclude: texto[], diag: qualquer, modoGnu: logico = falso) {
+        isto.macros = {}
+        isto.pragmaOnceVistos = {}
+        isto.dirsBusca = []
+        para (var i: inteiro = 0; i < dirsInclude.tamanho(); i++) {
+            isto.dirsBusca.empilhar(dirsInclude[i])
+        }
+        isto.arquivos = importar("cgd:arquivos")
+        isto.diag = diag
+        isto.modoGnu = modoGnu
+        isto.includesResolvidos = 0
+        isto.profundidadeInclude = 0
+
+        // Macros padrao ISO C99 + ambiente Linux x86-64 LP64 (exigidas pelos headers reais do sistema)
+        isto.definirObjeto("__STDC__", "1")
+        isto.definirObjeto("__STDC_VERSION__", "199901L")
+        isto.definirObjeto("__STDC_HOSTED__", "1")
+        isto.definirObjeto("__DCC__", "1")
+        isto.definirObjeto("__DCC_VERSION__", "100")
+        isto.definirObjeto("__x86_64__", "1")
+        isto.definirObjeto("__x86_64", "1")
+        isto.definirObjeto("__amd64__", "1")
+        isto.definirObjeto("__amd64", "1")
+        isto.definirObjeto("__LP64__", "1")
+        isto.definirObjeto("_LP64", "1")
+        isto.definirObjeto("__linux__", "1")
+        isto.definirObjeto("__unix__", "1")
+        isto.definirObjeto("__ELF__", "1")
+        isto.definirObjeto("__BYTE_ORDER__", "1234")
+        isto.definirObjeto("__ORDER_LITTLE_ENDIAN__", "1234")
+        isto.definirObjeto("__ORDER_BIG_ENDIAN__", "4321")
+        isto.definirObjeto("__SIZE_TYPE__", "long unsigned int")
+        isto.definirObjeto("__PTRDIFF_TYPE__", "long int")
+        isto.definirObjeto("__WCHAR_TYPE__", "int")
+        isto.definirObjeto("__WINT_TYPE__", "unsigned int")
+        isto.definirObjeto("__INT8_TYPE__", "signed char")
+        isto.definirObjeto("__INT16_TYPE__", "short int")
+        isto.definirObjeto("__INT32_TYPE__", "int")
+        isto.definirObjeto("__INT64_TYPE__", "long int")
+        isto.definirObjeto("__UINT8_TYPE__", "unsigned char")
+        isto.definirObjeto("__UINT16_TYPE__", "short unsigned int")
+        isto.definirObjeto("__UINT32_TYPE__", "unsigned int")
+        isto.definirObjeto("__UINT64_TYPE__", "long unsigned int")
+        isto.definirObjeto("__INTMAX_TYPE__", "long int")
+        isto.definirObjeto("__UINTMAX_TYPE__", "long unsigned int")
+        isto.definirObjeto("__INTPTR_TYPE__", "long int")
+        isto.definirObjeto("__UINTPTR_TYPE__", "long unsigned int")
+        isto.definirObjeto("__CHAR_BIT__", "8")
+        isto.definirObjeto("__SCHAR_MAX__", "127")
+        isto.definirObjeto("__SHRT_MAX__", "32767")
+        isto.definirObjeto("__INT_MAX__", "2147483647")
+        isto.definirObjeto("__LONG_MAX__", "9223372036854775807L")
+        isto.definirObjeto("__LONG_LONG_MAX__", "9223372036854775807LL")
+        isto.definirObjeto("__SIZE_MAX__", "18446744073709551615UL")
+        isto.definirObjeto("__SIZEOF_SHORT__", "2")
+        isto.definirObjeto("__SIZEOF_INT__", "4")
+        isto.definirObjeto("__SIZEOF_LONG__", "8")
+        isto.definirObjeto("__SIZEOF_LONG_LONG__", "8")
+        isto.definirObjeto("__SIZEOF_POINTER__", "8")
+        isto.definirObjeto("__SIZEOF_SIZE_T__", "8")
+        isto.definirObjeto("__SIZEOF_FLOAT__", "4")
+        isto.definirObjeto("__SIZEOF_DOUBLE__", "8")
+        isto.definirObjeto("__SIZEOF_LONG_DOUBLE__", "8")
+        isto.definirObjeto("__FLT_RADIX__", "2")
+        isto.definirObjeto("__FLT_MANT_DIG__", "24")
+        isto.definirObjeto("__FLT_DIG__", "6")
+        isto.definirObjeto("__FLT_MIN_EXP__", "(-125)")
+        isto.definirObjeto("__FLT_MAX_EXP__", "128")
+        isto.definirObjeto("__FLT_MIN__", "1.17549435e-38F")
+        isto.definirObjeto("__FLT_MAX__", "3.40282347e+38F")
+        isto.definirObjeto("__FLT_EPSILON__", "1.19209290e-07F")
+        isto.definirObjeto("__DBL_MANT_DIG__", "53")
+        isto.definirObjeto("__DBL_DIG__", "15")
+        isto.definirObjeto("__DBL_MIN_EXP__", "(-1021)")
+        isto.definirObjeto("__DBL_MAX_EXP__", "1024")
+        isto.definirObjeto("__DBL_MIN__", "2.2250738585072014e-308")
+        isto.definirObjeto("__DBL_MAX__", "1.7976931348623157e+308")
+        isto.definirObjeto("__DBL_EPSILON__", "2.2204460492503131e-16")
+        isto.definirObjeto("__LDBL_MANT_DIG__", "53")
+        isto.definirObjeto("__LDBL_DIG__", "15")
+        isto.definirObjeto("__LDBL_MIN_EXP__", "(-1021)")
+        isto.definirObjeto("__LDBL_MAX_EXP__", "1024")
+        isto.definirObjeto("__LDBL_MIN__", "2.2250738585072014e-308")
+        isto.definirObjeto("__LDBL_MAX__", "1.7976931348623157e+308")
+        isto.definirObjeto("__LDBL_EPSILON__", "2.2204460492503131e-16")
+        isto.definirObjeto("__DECIMAL_DIG__", "17")
+        isto.definirObjeto("__DATE__", "\"Nov 21 2026\"")
+        isto.definirObjeto("__TIME__", "\"00:00:00\"")
+        se (!modoGnu) {
+            isto.definirObjeto("__STRICT_ANSI__", "1")
+        }
+    }
+
+    definirObjeto(nome: texto, valorTexto: texto): vazio {
+        const toks: PPToken[] = tokenizarLinhaPP(valorTexto, 0)
+        isto.macros[nome] = MacroDef(nome, falso, falso, [], toks)
+    }
+
+    buscarArquivoInclude(nomeInc: texto, ehSistema: logico, dirAtual: texto, indiceInicial: inteiro = 0)
+
+    : (texto, inteiro) {
+        se (!ehSistema e indiceInicial == 0) {
+            const local: texto = juntarCaminho(dirAtual, nomeInc)
+            se (isto.arquivos.Arquivo(local).existe()) retorna tupla([local, -1])
+        }
+        para (var i: inteiro = indiceInicial; i < isto.dirsBusca.tamanho(); i++) {
+            const cand: texto = juntarCaminho(isto.dirsBusca[i], nomeInc)
+            se (isto.arquivos.Arquivo(cand).existe()) retorna tupla([cand, i])
+        }
+        retorna tupla(["", -1])
+    }
+
+    expandirTokens(entrada: PPToken[], arquivoAtual: texto, linhaAtual: inteiro, modoIf: logico,
+        dirAtual: texto, idxDirAtual: inteiro): PPToken[] {
+        var out: PPToken[] = []
+        var i: inteiro = 0
+        const n: inteiro = entrada.tamanho()
+
+        enquanto (i < n) {
+            const tok: PPToken = entrada[i]
+
+            // Operador 'defined' em #if/#elif
+            se (modoIf e tok.kind == PPTokKind.Ident e tok.val == "defined") {
+                var nomeMacro: texto = ""
+                var avanco: inteiro = 1
+                se (i + 1 < n e entrada[i + 1].val == "(") {
+                    se (i + 3 < n e entrada[i + 2].kind == PPTokKind.Ident e entrada[i + 3].val == ")") {
+                        nomeMacro = entrada[i + 2].val
+                        avanco = 4
+                    } senao {
+                        isto.diag.erroDireto(arquivoAtual, linhaAtual, 1, "sintaxe invalida em defined(...)")
+                    }
+                } senao se (i + 1 < n e entrada[i + 1].kind == PPTokKind.Ident) {
+                    nomeMacro = entrada[i + 1].val
+                    avanco = 2
+                } senao {
+                    isto.diag.erroDireto(arquivoAtual, linhaAtual, 1, "identificador esperado apos 'defined'")
+                }
+                const existe: logico = isto.macros.contem(nomeMacro) ou nomeMacro == "__FILE__" ou nomeMacro == "__LINE__"
+                out.empilhar(PPToken(PPTokKind.Num, existe ? "1" : "0", tok.espaco, linhaAtual))
+                i = i + avanco
+                continua
+            }
+
+            // Predicados de pre-processamento modernos (__has_include, __has_attribute, __has_builtin, etc.)
+            se (modoIf e tok.kind == PPTokKind.Ident e (tok.val == "__has_include" ou tok.val == "__has_include_next" ou tok.val == "__has_attribute" ou tok.val == "__has_builtin" ou tok.val == "__has_extension" ou tok.val == "__has_feature" ou tok.val == "__glibc_has_attribute" ou tok.val == "__glibc_has_builtin" ou tok.val == "__glibc_has_extension")) {
+                se (i + 1 < n e entrada[i + 1].val == "(") {
+                    var j: inteiro = i + 2
+                    var depthP: inteiro = 1
+                    var argToks: PPToken[] = []
+                    enquanto (j < n e depthP > 0) {
+                        se (entrada[j].val == "(") depthP++
+                        senao se (entrada[j].val == ")") {
+                            depthP--
+                            se (depthP == 0) sustar
+                        }
+                        argToks.empilhar(entrada[j])
+                        j++
+                    }
+                    var resPred: texto = "0"
+                    se (tok.val == "__has_include" ou tok.val == "__has_include_next") {
+                        const alvoStr: texto = renderizarTokensPP(argToks).aparar()
+                        const ehSysH: logico = alvoStr.tamanho() >= 3 e alvoStr[0] == "<" e alvoStr[alvoStr.tamanho() - 1] == ">"
+                        const ehLocH: logico = alvoStr.tamanho() >= 3 e alvoStr[0] == "\"" e alvoStr[alvoStr.tamanho() - 1] == "\""
+                        se (ehSysH ou ehLocH) {
+                            const nomeH: texto = subtextoPP(alvoStr, 1, alvoStr.tamanho() - 1)
+                            const iniIdx: inteiro = tok.val == "__has_include_next" ? idxDirAtual + 1 : 0
+                            const achado: (texto, inteiro) = isto.buscarArquivoInclude(nomeH,
+                                ehSysH, dirAtual, iniIdx)
+                            se (achado[0].tamanho() > 0) resPred = "1"
+                        }
+                    } senao se (tok.val == "__has_builtin" ou tok.val == "__glibc_has_builtin") {
+                        const bNome: texto = renderizarTokensPP(argToks).aparar()
+                        se (bNome == "__builtin_offsetof" ou bNome == "__builtin_va_start" ou bNome == "__builtin_va_arg") {
+                            resPred = "1"
+                        }
+                    }
+                    out.empilhar(PPToken(PPTokKind.Num, resPred, tok.espaco, linhaAtual))
+                    i = j + 1
+                    continua
+                }
+            }
+
+            // Operador _Pragma("...") (ISO C99 6.10.9)
+            se (tok.kind == PPTokKind.Ident e tok.val == "_Pragma") {
+                se (i + 3 < n e entrada[i + 1].val == "(" e entrada[i + 2].kind == PPTokKind.Str e entrada[i + 3].val == ")") {
+                    i = i + 4
+                    continua
+                }
+            }
+
+            se (tok.kind != PPTokKind.Ident) {
+                out.empilhar(tok)
+                i++
+                continua
+            }
+
+            // Macros dinamicas predefinidas
+            se (tok.val == "__LINE__") {
+                out.empilhar(PPToken(PPTokKind.Num, texto(linhaAtual), tok.espaco, linhaAtual))
+                i++
+                continua
+            }
+            se (tok.val == "__FILE__") {
+                out.empilhar(PPToken(PPTokKind.Str, "\"" + arquivoAtual + "\"", tok.espaco,
+                    linhaAtual))
+                i++
+                continua
+            }
+
+            se (!isto.macros.contem(tok.val) ou tok.hideSet.contem(tok.val)) {
+                out.empilhar(tok)
+                i++
+                continua
+            }
+
+            const def: MacroDef = isto.macros[tok.val]
+
+            // Macro de objeto
+            se (!def.ehFuncao) {
+                var novoHide: dicionario = {}
+                const chavesH: texto[] = tok.hideSet.chaves()
+                para (var k: inteiro = 0; k < chavesH.tamanho(); k++) novoHide[chavesH[k]] = verdadeiro
+                novoHide[def.nome] = verdadeiro
+
+                var subst: PPToken[] = []
+                para (var k: inteiro = 0; k < def.corpo.tamanho(); k++) {
+                    const cp: PPToken = def.corpo[k].clonarComHide(novoHide)
+                    se (k == 0) cp.espaco = tok.espaco
+                    subst.empilhar(cp)
+                }
+                const colados: PPToken[] = isto.aplicarTokenPasting(subst, linhaAtual)
+                const reexpandidos: PPToken[] = isto.expandirTokens(colados, arquivoAtual,
+                    linhaAtual, modoIf, dirAtual, idxDirAtual)
+                para (var k: inteiro = 0; k < reexpandidos.tamanho(); k++) out.empilhar(reexpandidos[k])
+                i++
+                continua
+            }
+
+            // Macro funcional exige '(' imediatamente apos o nome
+            se (i + 1 >= n ou entrada[i + 1].val != "(") {
+                out.empilhar(tok)
+                i++
+                continua
+            }
+
+            var argsBrutos: qualquer[] = []
+            var argAtual: PPToken[] = []
+            var depth: inteiro = 1
+            var j: inteiro = i + 2
+            enquanto (j < n e depth > 0) {
+                const cur: PPToken = entrada[j]
+                se (cur.val == "(") {
+                    depth++
+                    argAtual.empilhar(cur)
+                } senao se (cur.val == ")") {
+                    depth--
+                    se (depth == 0) {
+                        se (argAtual.tamanho() > 0 ou argsBrutos.tamanho() > 0 ou def.params.tamanho() > 0 ou def.ehVariadica) {
+                            argsBrutos.empilhar(argAtual)
+                        }
+                    } senao {
+                        argAtual.empilhar(cur)
+                    }
+                } senao se (cur.val == "," e depth == 1) {
+                    argsBrutos.empilhar(argAtual)
+                    argAtual = []
+                } senao {
+                    argAtual.empilhar(cur)
+                }
+                j++
+            }
+            se (depth != 0) {
+                isto.diag.erroDireto(arquivoAtual, linhaAtual, 1, "invocacao de macro '${def.nome}' sem ')'")
+            }
+
+            var mapaBruto: dicionario = {}
+            var mapaExpandido: dicionario = {}
+            para (var p: inteiro = 0; p < def.params.tamanho(); p++) {
+                const rawArg: PPToken[] = p < argsBrutos.tamanho() ? argsBrutos[p] : []
+                mapaBruto[def.params[p]] = rawArg
+                mapaExpandido[def.params[p]] = isto.expandirTokens(rawArg, arquivoAtual,
+                    linhaAtual, modoIf, dirAtual, idxDirAtual)
+            }
+            se (def.ehVariadica) {
+                var vaRaw: PPToken[] = []
+                para (var p: inteiro = def.params.tamanho(); p < argsBrutos.tamanho(); p++) {
+                    se (p > def.params.tamanho()) {
+                        vaRaw.empilhar(PPToken(PPTokKind.Punct, ",", falso, linhaAtual))
+                    }
+                    const subA: PPToken[] = argsBrutos[p]
+                    para (var m: inteiro = 0; m < subA.tamanho(); m++) vaRaw.empilhar(subA[m])
+                }
+                mapaBruto["__VA_ARGS__"] = vaRaw
+                mapaExpandido["__VA_ARGS__"] = isto.expandirTokens(vaRaw, arquivoAtual, linhaAtual,
+                    modoIf, dirAtual, idxDirAtual)
+            }
+
+            var novoHide: dicionario = {}
+            const chavesH: texto[] = tok.hideSet.chaves()
+            para (var k: inteiro = 0; k < chavesH.tamanho(); k++) novoHide[chavesH[k]] = verdadeiro
+            novoHide[def.nome] = verdadeiro
+
+            var subst: PPToken[] = []
+            var cIdx: inteiro = 0
+            enquanto (cIdx < def.corpo.tamanho()) {
+                const ct: PPToken = def.corpo[cIdx]
+                // Extensao GNU: ', ##__VA_ARGS__' remove a virgula quando __VA_ARGS__ e vazio
+                se (ct.val == "," e cIdx + 2 < def.corpo.tamanho() e def.corpo[cIdx + 1].kind == PPTokKind.HashHash e def.corpo[cIdx + 2].val == "__VA_ARGS__" e mapaBruto.contem("__VA_ARGS__")) {
+                    const vaB: PPToken[] = mapaBruto["__VA_ARGS__"]
+                    se (vaB.tamanho() == 0) {
+                        cIdx = cIdx + 3
+                        continua
+                    }
+                    subst.empilhar(ct.clonarComHide(novoHide))
+                    const vaE: PPToken[] = mapaExpandido["__VA_ARGS__"]
+                    para (var m: inteiro = 0; m < vaE.tamanho(); m++) {
+                        subst.empilhar(vaE[m].clonarComHide(novoHide))
+                    }
+                    cIdx = cIdx + 3
+                    continua
+                }
+                // Stringification: #param
+                se (ct.kind == PPTokKind.Hash e cIdx + 1 < def.corpo.tamanho() e def.corpo[cIdx + 1].kind == PPTokKind.Ident) {
+                    const pNome: texto = def.corpo[cIdx + 1].val
+                    se (mapaBruto.contem(pNome)) {
+                        const sLit: texto = stringificarTokensPP(mapaBruto[pNome])
+                        subst.empilhar(PPToken(PPTokKind.Str, sLit, ct.espaco, linhaAtual).clonarComHide(novoHide))
+                        cIdx = cIdx + 2
+                        continua
+                    }
+                }
+                se (ct.kind == PPTokKind.Ident e mapaBruto.contem(ct.val)) {
+                    const antEhPaste: logico = cIdx > 0 e def.corpo[cIdx - 1].kind == PPTokKind.HashHash
+                    const proxEhPaste: logico = cIdx + 1 < def.corpo.tamanho() e def.corpo[cIdx + 1].kind == PPTokKind.HashHash
+                    const origem: PPToken[] = (antEhPaste ou proxEhPaste) ? mapaBruto[ct.val] : mapaExpandido[ct.val]
+                    para (var m: inteiro = 0; m < origem.tamanho(); m++) {
+                        const cp: PPToken = origem[m].clonarComHide(novoHide)
+                        se (m == 0) cp.espaco = ct.espaco
+                        subst.empilhar(cp)
+                    }
+                    cIdx++
+                    continua
+                }
+                subst.empilhar(ct.clonarComHide(novoHide))
+                cIdx++
+            }
+
+            const colados: PPToken[] = isto.aplicarTokenPasting(subst, linhaAtual)
+            se (colados.tamanho() > 0) colados[0].espaco = tok.espaco
+            const reexpandidos: PPToken[] = isto.expandirTokens(colados, arquivoAtual, linhaAtual,
+                modoIf, dirAtual, idxDirAtual)
+            para (var k: inteiro = 0; k < reexpandidos.tamanho(); k++) out.empilhar(reexpandidos[k])
+            i = j
+        }
+        retorna out
+    }
+
+    aplicarTokenPasting(toks: PPToken[], numLinha: inteiro): PPToken[] {
+        var out: PPToken[] = []
+        var i: inteiro = 0
+        enquanto (i < toks.tamanho()) {
+            se (toks[i].kind == PPTokKind.HashHash) {
+                se (out.tamanho() > 0 e i + 1 < toks.tamanho()) {
+                    const esq: PPToken = out.removerUltimo()
+                    const dir: PPToken = toks[i + 1]
+                    const combinado: texto = esq.val + dir.val
+                    const novos: PPToken[] = tokenizarLinhaPP(combinado, numLinha)
+                    para (var k: inteiro = 0; k < novos.tamanho(); k++) {
+                        const nt: PPToken = novos[k].clonarComHide(esq.hideSet)
+                        se (k == 0) nt.espaco = esq.espaco
+                        out.empilhar(nt)
+                    }
+                    i = i + 2
+                    continua
+                }
+                i++
+                continua
+            }
+            out.empilhar(toks[i])
+            i++
+        }
+        retorna out
+    }
+
+    definirMacroDaLinha(resto: texto, arquivoAtual: texto, numLinha: inteiro): vazio {
+        const aparado: texto = resto.aparar()
+        se (aparado.tamanho() == 0) {
+            isto.diag.erroDireto(arquivoAtual, numLinha, 1, "#define sem identificador")
+        }
+        var pos: inteiro = 0
+        enquanto (pos < aparado.tamanho() e ehContIdentPP(aparado[pos])) pos++
+        const nome: texto = subtextoPP(aparado, 0, pos)
+
+        // Em modo -std=gnu99, preserva __attribute__ como palavra-chave real da camada GNU (Cat A/B/C)
+        se (isto.modoGnu e nome == "__attribute__") retorna
+
+        se (pos < aparado.tamanho() e aparado[pos] == "(") {
+            var fimParen: inteiro = pos + 1
+            enquanto (fimParen < aparado.tamanho() e aparado[fimParen] != ")") fimParen++
+            se (fimParen >= aparado.tamanho()) {
+                isto.diag.erroDireto(arquivoAtual, numLinha, 1, "')' esperado em #define ${nome}")
+            }
+            const listaParamsStr: texto = subtextoPP(aparado, pos + 1, fimParen).aparar()
+            var params: texto[] = []
+            var ehVariadica: logico = falso
+            se (listaParamsStr.tamanho() > 0) {
+                const partes: texto[] = listaParamsStr.dividir(",")
+                para (var p: inteiro = 0; p < partes.tamanho(); p++) {
+                    const pm: texto = partes[p].aparar()
+                    se (pm == "...") {
+                        ehVariadica = verdadeiro
+                    } senao se (pm.tamanho() > 3 e subtextoPP(pm, pm.tamanho() - 3, pm.tamanho()) == "...") {
+                        // GNU variadic named parameter: args...
+                        ehVariadica = verdadeiro
+                        params.empilhar(subtextoPP(pm, 0, pm.tamanho() - 3).aparar())
+                    } senao {
+                        params.empilhar(pm)
+                    }
+                }
+            }
+            const corpoStr: texto = subtextoPP(aparado, fimParen + 1, aparado.tamanho())
+            const corpoToks: PPToken[] = tokenizarLinhaPP(corpoStr, numLinha)
+            isto.macros[nome] = MacroDef(nome, verdadeiro, ehVariadica, params, corpoToks)
+            retorna
+        }
+
+        const corpoStr: texto = subtextoPP(aparado, pos, aparado.tamanho())
+        const corpoToks: PPToken[] = tokenizarLinhaPP(corpoStr, numLinha)
+        isto.macros[nome] = MacroDef(nome, falso, falso, [], corpoToks)
+    }
+
+    // Verifica se uma sequencia de tokens termina no meio de uma chamada de macro funcional sem ')'
+    temMacroFuncionalAberta(toks: PPToken[]): logico {
+        var i: inteiro = 0
+        const n: inteiro = toks.tamanho()
+        enquanto (i < n) {
+            const t: PPToken = toks[i]
+            se (t.kind == PPTokKind.Ident e isto.macros.contem(t.val)) {
+                const def: MacroDef = isto.macros[t.val]
+                se (def.ehFuncao e i + 1 < n e toks[i + 1].val == "(") {
+                    var depth: inteiro = 1
+                    var j: inteiro = i + 2
+                    enquanto (j < n e depth > 0) {
+                        se (toks[j].val == "(") depth++
+                        senao se (toks[j].val == ")") depth--
+                        j++
+                    }
+                    se (depth > 0) retorna verdadeiro
+                    i = j
+                    continua
+                }
+            }
+            i++
+        }
+        retorna falso
+    }
+
+    processarFonte(fonteBruta: texto, nomeArquivo: texto, saidaGlobal: texto[], idxDirAtual: inteiro = -1): vazio {
+        isto.profundidadeInclude++
+        se (isto.profundidadeInclude > 64) {
+            isto.diag.erroDireto(nomeArquivo, 1, 1, "profundidade maxima de #include excedida")
+        }
+
+        const limpa: texto = fasesIniciaisELimpezaPP(fonteBruta)
+        const linhas: texto[] = limpa.dividir("\n")
+        var pilhaIf: QuadroIf[] = []
+        var arquivoLogico: texto = nomeArquivo
+        var deltaLinha: inteiro = 0
+        const dirAtual: texto = diretorioDe(nomeArquivo)
+
+        var idx: inteiro = 0
+        enquanto (idx < linhas.tamanho()) {
+            const numLinha: inteiro = idx + 1 + deltaLinha
+            const linhaRaw: texto = linhas[idx]
+            const aparada: texto = linhaRaw.aparar()
+            const ativoAtual: logico = pilhaIf.tamanho() == 0 ? verdadeiro : pilhaIf[pilhaIf.tamanho() - 1].esteAtivo
+
+            se (aparada.tamanho() > 0 e aparada[0] == "#") {
+                const semHash: texto = subtextoPP(aparada, 1, aparada.tamanho()).aparar()
+                var fimDir: inteiro = 0
+                enquanto (fimDir < semHash.tamanho() e ehContIdentPP(semHash[fimDir])) fimDir++
+                const dirNome: texto = subtextoPP(semHash, 0, fimDir)
+                const resto: texto = subtextoPP(semHash, fimDir, semHash.tamanho()).aparar()
+
+                se (dirNome == "ifdef" ou dirNome == "ifndef") {
+                    var fimId: inteiro = 0
+                    enquanto (fimId < resto.tamanho() e ehContIdentPP(resto[fimId])) fimId++
+                    const idMacro: texto = subtextoPP(resto, 0, fimId)
+                    const definido: logico = isto.macros.contem(idMacro)
+                    const cond: logico = dirNome == "ifdef" ? definido : !definido
+                    pilhaIf.empilhar(QuadroIf(ativoAtual, ativoAtual e cond))
+                    idx++
+                    continua
+                }
+                se (dirNome == "if") {
+                    var condVal: logico = falso
+                    se (ativoAtual) {
+                        const toksExpr: PPToken[] = tokenizarLinhaPP(resto, numLinha)
+                        const expandidos: PPToken[] = isto.expandirTokens(toksExpr, arquivoLogico,
+                            numLinha, verdadeiro, dirAtual, idxDirAtual)
+                        condVal = AvaliadorExprPP(expandidos, isto.diag, arquivoLogico, numLinha).avaliar() != 0
+                    }
+                    pilhaIf.empilhar(QuadroIf(ativoAtual, ativoAtual e condVal))
+                    idx++
+                    continua
+                }
+                se (dirNome == "elif") {
+                    se (pilhaIf.tamanho() == 0) isto.diag.erroDireto(arquivoLogico, numLinha,
+                        1, "#elif sem #if")
+                    const q: QuadroIf = pilhaIf[pilhaIf.tamanho() - 1]
+                    se (q.viuElse) isto.diag.erroDireto(arquivoLogico, numLinha, 1, "#elif apos #else")
+                    se (!q.paiAtivo ou q.jaTomouRamo) {
+                        q.esteAtivo = falso
+                    } senao {
+                        const toksExpr: PPToken[] = tokenizarLinhaPP(resto, numLinha)
+                        const expandidos: PPToken[] = isto.expandirTokens(toksExpr, arquivoLogico,
+                            numLinha, verdadeiro, dirAtual, idxDirAtual)
+                        const condVal: logico = AvaliadorExprPP(expandidos, isto.diag, arquivoLogico,
+                            numLinha).avaliar() != 0
+                        q.esteAtivo = condVal
+                        se (condVal) q.jaTomouRamo = verdadeiro
+                    }
+                    idx++
+                    continua
+                }
+                se (dirNome == "else") {
+                    se (pilhaIf.tamanho() == 0) isto.diag.erroDireto(arquivoLogico, numLinha,
+                        1, "#else sem #if")
+                    const q: QuadroIf = pilhaIf[pilhaIf.tamanho() - 1]
+                    se (q.viuElse) isto.diag.erroDireto(arquivoLogico, numLinha, 1, "#else duplicado")
+                    q.viuElse = verdadeiro
+                    q.esteAtivo = q.paiAtivo e !q.jaTomouRamo
+                    se (q.esteAtivo) q.jaTomouRamo = verdadeiro
+                    idx++
+                    continua
+                }
+                se (dirNome == "endif") {
+                    se (pilhaIf.tamanho() == 0) isto.diag.erroDireto(arquivoLogico, numLinha,
+                        1, "#endif sem #if")
+                    pilhaIf.removerUltimo()
+                    idx++
+                    continua
+                }
+
+                se (!ativoAtual) {
+                    idx++
+                    continua
+                }
+
+                se (dirNome == "define") {
+                    isto.definirMacroDaLinha(resto, arquivoLogico, numLinha)
+                } senao se (dirNome == "undef") {
+                    var fimIdU: inteiro = 0
+                    enquanto (fimIdU < resto.tamanho() e ehContIdentPP(resto[fimIdU])) fimIdU++
+                    const idUndef: texto = subtextoPP(resto, 0, fimIdU)
+                    se (isto.macros.contem(idUndef)) isto.macros.remover(idUndef)
+                } senao se (dirNome == "include" ou dirNome == "include_next") {
+                    var alvo: texto = resto
+                    se (alvo.tamanho() > 0 e alvo[0] != "<" e alvo[0] != "\"") {
+                        const expInc: PPToken[] = isto.expandirTokens(tokenizarLinhaPP(alvo,
+                            numLinha), arquivoLogico, numLinha, falso, dirAtual, idxDirAtual)
+                        alvo = renderizarTokensPP(expInc).aparar()
+                    }
+                    const ehSys: logico = alvo.tamanho() >= 3 e alvo[0] == "<" e alvo[alvo.tamanho() - 1] == ">"
+                    const ehLoc: logico = alvo.tamanho() >= 3 e alvo[0] == "\"" e alvo[alvo.tamanho() - 1] == "\""
+                    se (!ehSys e !ehLoc) {
+                        isto.diag.erroDireto(arquivoLogico, numLinha, 1, "sintaxe invalida em #${dirNome}: ${alvo}")
+                    }
+                    const nomeArqInc: texto = subtextoPP(alvo, 1, alvo.tamanho() - 1)
+                    const iniDir: inteiro = dirNome == "include_next" ? idxDirAtual + 1 : 0
+                    const achado: (texto, inteiro) = isto.buscarArquivoInclude(nomeArqInc,
+                        ehSys, dirAtual, iniDir)
+                    const caminhoResolvido: texto = achado[0]
+                    se (caminhoResolvido.tamanho() == 0) {
+                        isto.diag.erroDireto(arquivoLogico, numLinha, 1, "arquivo de cabecalho nao encontrado: '${nomeArqInc}'")
+                    }
+                    se (!isto.pragmaOnceVistos.contem(caminhoResolvido)) {
+                        isto.includesResolvidos++
+                        const conteudoInc: texto = isto.arquivos.Arquivo(caminhoResolvido).ler()
+                        isto.processarFonte(conteudoInc, caminhoResolvido, saidaGlobal, achado[1])
+                    }
+                } senao se (dirNome == "error") {
+                    isto.diag.erroDireto(arquivoLogico, numLinha, 1, "#error ${resto}")
+                } senao se (dirNome == "warning") {
+                    isto.diag.avisoEm(saidaGlobal.tamanho() + 1, 1, "#warning ${resto}")
+                } senao se (dirNome == "line") {
+                    const toksL: PPToken[] = isto.expandirTokens(tokenizarLinhaPP(resto,
+                        numLinha), arquivoLogico, numLinha, falso, dirAtual, idxDirAtual)
+                    se (toksL.tamanho() >= 1 e toksL[0].kind == PPTokKind.Num) {
+                        const novaLinha: inteiro = parseInteiroPP(toksL[0].val)
+                        deltaLinha = novaLinha - (idx + 2)
+                        se (toksL.tamanho() >= 2 e toksL[1].kind == PPTokKind.Str) {
+                            arquivoLogico = subtextoPP(toksL[1].val, 1, toksL[1].val.tamanho() - 1)
+                        }
+                    }
+                } senao se (dirNome == "pragma") {
+                    se (resto == "once") {
+                        isto.pragmaOnceVistos[nomeArquivo] = verdadeiro
+                    }
+                } senao se (dirNome.tamanho() > 0) {
+                    isto.diag.erroDireto(arquivoLogico, numLinha, 1, "diretiva desconhecida '#${dirNome}'")
+                }
+                idx++
+                continua
+            }
+
+            se (!ativoAtual ou aparada.tamanho() == 0) {
+                idx++
+                continua
+            }
+
+            // Acumula linhas subsequentes se houver invocacao de macro funcional multilinha (comum na glibc)
+            var toksLinha: PPToken[] = tokenizarLinhaPP(linhaRaw, numLinha)
+            enquanto (isto.temMacroFuncionalAberta(toksLinha) e idx + 1 < linhas.tamanho()) {
+                const proxAparada: texto = linhas[idx + 1].aparar()
+                se (proxAparada.tamanho() > 0 e proxAparada[0] == "#") sustar
+                idx++
+                const proxToks: PPToken[] = tokenizarLinhaPP(linhas[idx], idx + 1 + deltaLinha)
+                se (proxToks.tamanho() > 0) proxToks[0].espaco = verdadeiro
+                para (var m: inteiro = 0; m < proxToks.tamanho(); m++) toksLinha.empilhar(proxToks[m])
+            }
+
+            const expandidos: PPToken[] = isto.expandirTokens(toksLinha, arquivoLogico, numLinha,
+                falso, dirAtual, idxDirAtual)
+            const renderizada: texto = renderizarTokensPP(expandidos)
+            se (renderizada.aparar().tamanho() > 0) {
+                saidaGlobal.empilhar(renderizada)
+                isto.diag.mapaFonte.registrar(arquivoLogico, numLinha, linhaRaw)
+            }
+            idx++
+        }
+
+        se (pilhaIf.tamanho() > 0) {
+            isto.diag.erroDireto(arquivoLogico, linhas.tamanho(), 1, "diretiva #if/#ifdef/#ifndef sem #endif")
+        }
+        isto.profundidadeInclude--
+    }
+}
+
+funcao preprocessarDCC(fonte: texto, nomeArquivo: texto, dirsCli: texto[], defsCli: texto[],
+    undefsCli: texto[], diag: qualquer, modoGnu: logico = falso): (texto, inteiro) {
+    var dirsTodos: texto[] = []
+    para (var i: inteiro = 0; i < dirsCli.tamanho(); i++) dirsTodos.empilhar(dirsCli[i])
+    const dirsSys: texto[] = descobrirDirsSistema()
+    para (var i: inteiro = 0; i < dirsSys.tamanho(); i++) dirsTodos.empilhar(dirsSys[i])
+
+    const pp: PreprocessadorDCC = PreprocessadorDCC(dirsTodos, diag, modoGnu)
+    para (var i: inteiro = 0; i < defsCli.tamanho(); i++) {
+        const item: texto = defsCli[i]
+        var posEq: inteiro = -1
+        para (var k: inteiro = 0; k < item.tamanho(); k++) {
+            se (item[k] == "=") {
+                posEq = k
+                sustar
+            }
+        }
+        se (posEq < 0) pp.definirObjeto(item, "1")
+        senao pp.definirObjeto(subtextoPP(item, 0, posEq), subtextoPP(item, posEq + 1, item.tamanho()))
+    }
+
+    para (var i: inteiro = 0; i < undefsCli.tamanho(); i++) {
+        se (pp.macros.contem(undefsCli[i])) pp.macros.remover(undefsCli[i])
+    }
+
+    var saidaGlobal: texto[] = []
+    pp.processarFonte(fonte, nomeArquivo, saidaGlobal, -1)
+    retorna tupla([saidaGlobal.juntar("\n"), pp.includesResolvidos])
+}

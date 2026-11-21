@@ -1,0 +1,667 @@
+// Fase 3: Analisador Semantico ISO C99 / GNU99 / LP64 (System V AMD64 ABI) para o DCC.
+// Calcula layouts LP64 com alinhamento, padding, __attribute__((packed/aligned)), bit-fields,
+// campos struct/union anonimos, forward declarations, __asm__("sym"), globais externas (stdout/stderr)
+// e emite diagnosticos profissionais com arquivo, linha, coluna e trecho de codigo.
+
+classe InfoFuncao {
+    nome: texto
+    nomeSimboloLink: texto
+    tipoRet: qualquer
+    params: qualquer[]
+    aridade: inteiro
+    definida: logico
+    ehExtern: logico
+    ehStatic: logico
+    ehVariadica: logico
+
+    construtor(nome: texto, tipoRet: qualquer, params: qualquer[], definida: logico, ehExtern: logico,
+        ehStatic: logico, ehVariadica: logico, nomeSimboloLink: texto = "") {
+        isto.nome = nome
+        isto.nomeSimboloLink = nomeSimboloLink.tamanho() > 0 ? nomeSimboloLink : nome
+        isto.tipoRet = tipoRet
+        isto.params = params
+        isto.aridade = params.tamanho()
+        isto.definida = definida
+        isto.ehExtern = ehExtern
+        isto.ehStatic = ehStatic
+        isto.ehVariadica = ehVariadica
+    }
+}
+
+classe ResultadoSemantica {
+    tabela: qualquer
+    globais: dicionario
+    numFuncoes: inteiro
+    numStructs: inteiro
+    numUnions: inteiro
+
+    construtor(tabela: qualquer, globais: dicionario, numFuncoes: inteiro, numStructs: inteiro,
+        numUnions: inteiro) {
+        isto.tabela = tabela
+        isto.globais = globais
+        isto.numFuncoes = numFuncoes
+        isto.numStructs = numStructs
+        isto.numUnions = numUnions
+    }
+}
+
+classe AnalisadorSemanticoDCC {
+    tMod: qualquer
+    Kind: qualquer
+    OpB: qualquer
+    OpU: qualquer
+    TB: qualquer
+    diag: qualquer
+    tabela: qualquer
+    funcoes: dicionario
+    globais: dicionario
+
+    construtor(diag: qualquer) {
+        isto.tMod = importar("../types/tipos.delegua")
+        isto.Kind = isto.tMod.NoKind
+        isto.OpB = isto.tMod.OpBin
+        isto.OpU = isto.tMod.OpUn
+        isto.TB = isto.tMod.TipoBase
+        isto.diag = diag
+        isto.tabela = isto.tMod.TabelaTipos()
+        isto.funcoes = {}
+        isto.globais = {}
+    }
+
+    registrarAgregado(no: qualquer): vazio {
+        const ehUnion: logico = no.kind == isto.Kind.DeclUnion
+        const ag: qualquer = isto.tMod.AgregadoLayout(no.nome, ehUnion, no.ehPacked, no.alinhamentoExplicito)
+        var offsetAtual: inteiro = 0
+        var maxTam: inteiro = 0
+        var maxAlinh: inteiro = no.alinhamentoExplicito > 1 ? no.alinhamentoExplicito : 1
+        var bitUnitOff: inteiro = -1
+        var bitUnitSize: inteiro = 0
+        var bitCursor: inteiro = 0
+
+        para (var k: inteiro = 0; k < no.filhos.tamanho(); k++) {
+            const campo: qualquer = no.filhos[k]
+            const tamCampo: inteiro = isto.tabela.tamanhoDe(campo.tipoC)
+            const alinhBruto: inteiro = isto.tabela.alinhamentoDe(campo.tipoC)
+            const alinhCampo: inteiro = no.ehPacked ? 1 : alinhBruto
+            se (alinhCampo > maxAlinh) maxAlinh = alinhCampo
+
+            // Bit-field C99 em struct
+            se (!ehUnion e campo.ehBitField) {
+                const unitBytes: inteiro = tamCampo > 0 ? tamCampo : 4
+                const unitBits: inteiro = unitBytes * 8
+                se (campo.bitWidth == 0) {
+                    // : 0 forca alinhamento para a proxima unidade de armazenamento
+                    bitUnitOff = -1
+                    bitCursor = 0
+                    offsetAtual = isto.tMod.alinharOffset(offsetAtual, alinhCampo)
+                    continua
+                }
+                se (bitUnitOff < 0 ou bitUnitSize != unitBytes ou bitCursor + campo.bitWidth > unitBits) {
+                    offsetAtual = isto.tMod.alinharOffset(offsetAtual, alinhCampo)
+                    bitUnitOff = offsetAtual
+                    bitUnitSize = unitBytes
+                    bitCursor = 0
+                    offsetAtual = offsetAtual + unitBytes
+                }
+                se (campo.nome.tamanho() > 0) {
+                    ag.ordemCampos.empilhar(campo.nome)
+                    ag.campos[campo.nome] = isto.tMod.CampoLayout(campo.nome, campo.tipoC,
+                        bitUnitOff, verdadeiro, bitCursor, campo.bitWidth)
+                }
+                bitCursor = bitCursor + campo.bitWidth
+                continua
+            }
+
+            bitUnitOff = -1
+            bitCursor = 0
+
+            // Campo struct/union anonimo embutido (promove campos internos para o agregado pai)
+            se (campo.nome.tamanho() == 0 e campo.tipoC.ehAgregado()) {
+                const subAg: qualquer = campo.tipoC.base == isto.TB.Struct ? isto.tabela.structs[campo.tipoC.nomeAgregado] : isto.tabela.unions[campo.tipoC.nomeAgregado]
+                const baseOff: inteiro = ehUnion ? 0 : isto.tMod.alinharOffset(offsetAtual,
+                    alinhCampo)
+                para (var s: inteiro = 0; s < subAg.ordemCampos.tamanho(); s++) {
+                    const subN: texto = subAg.ordemCampos[s]
+                    const subC: qualquer = subAg.campos[subN]
+                    ag.ordemCampos.empilhar(subN)
+                    ag.campos[subN] = isto.tMod.CampoLayout(subN, subC.tipoCampo, baseOff + subC.offset,
+                        subC.ehBitField, subC.bitOffset, subC.bitWidth)
+                }
+                se (ehUnion) {
+                    se (tamCampo > maxTam) maxTam = tamCampo
+                } senao {
+                    offsetAtual = baseOff + tamCampo
+                }
+                continua
+            }
+
+            ag.ordemCampos.empilhar(campo.nome)
+            se (ehUnion) {
+                ag.campos[campo.nome] = isto.tMod.CampoLayout(campo.nome, campo.tipoC, 0)
+                se (tamCampo > maxTam) maxTam = tamCampo
+            } senao {
+                offsetAtual = isto.tMod.alinharOffset(offsetAtual, alinhCampo)
+                ag.campos[campo.nome] = isto.tMod.CampoLayout(campo.nome, campo.tipoC, offsetAtual)
+                offsetAtual = offsetAtual + tamCampo
+            }
+        }
+        ag.alinhamento = maxAlinh
+        ag.tamanhoBytes = ehUnion ? isto.tMod.alinharOffset(maxTam, maxAlinh) : isto.tMod.alinharOffset(offsetAtual,
+            maxAlinh)
+        se (ehUnion) isto.tabela.unions[no.nome] = ag
+        senao isto.tabela.structs[no.nome] = ag
+    }
+
+    verificarPrograma(prog: qualquer, exigirMain: logico = falso): ResultadoSemantica {
+        var numFuncoes: inteiro = 0
+        var numStructs: inteiro = 0
+        var numUnions: inteiro = 0
+
+        // Passe 1: tipos, globais, prototipos e assinaturas
+        para (var i: inteiro = 0; i < prog.filhos.tamanho(); i++) {
+            const no: qualquer = prog.filhos[i]
+            escolha (no.kind) {
+                caso isto.Kind.DeclEnum:
+                para (var k: inteiro = 0; k < no.filhos.tamanho(); k++) {
+                    const item: qualquer = no.filhos[k]
+                    isto.tabela.constantesEnum[item.nome] = item.valor
+                }
+                caso isto.Kind.DeclTypedef:
+                isto.tabela.typedefs[no.nome] = no.tipoC
+                caso isto.Kind.DeclStruct:
+                isto.registrarAgregado(no)
+                numStructs++
+                caso isto.Kind.DeclUnion:
+                isto.registrarAgregado(no)
+                numUnions++
+                caso isto.Kind.VarGlobal:
+                isto.globais[no.nome] = no.tipoC
+                se (no.nomeSimboloLink.tamanho() > 0) {
+                    isto.tabela.nomesSimboloLink[no.nome] = no.nomeSimboloLink
+                }
+                se (no.ehExtern e no.filhos.tamanho() == 0) {
+                    se (!isto.tabela.globaisExternas.contem(no.nome)) {
+                        isto.tabela.globaisExternas[no.nome] = verdadeiro
+                    }
+                } senao {
+                    se (isto.tabela.globaisExternas.contem(no.nome)) {
+                        isto.tabela.globaisExternas.remover(no.nome)
+                    }
+                }
+                se (no.filhos.tamanho() > 0) {
+                    var escGlob: dicionario[] = [isto.globais]
+                    isto.verificarInicializador(no.filhos[0], no.tipoC, escGlob)
+                }
+                caso isto.Kind.Prototipo:
+                caso isto.Kind.Funcao:
+                const ehDef: logico = no.kind == isto.Kind.Funcao
+                var pTipos: qualquer[] = []
+                const pLista: qualquer = no.filhos[0]
+                para (var p: inteiro = 0; p < pLista.filhos.tamanho(); p++) {
+                    pTipos.empilhar(pLista.filhos[p].tipoC)
+                }
+                se (no.nomeSimboloLink.tamanho() > 0) {
+                    isto.tabela.nomesSimboloLink[no.nome] = no.nomeSimboloLink
+                }
+                se (isto.funcoes.contem(no.nome)) {
+                    const existente: InfoFuncao = isto.funcoes[no.nome]
+                    se (ehDef e existente.definida) {
+                        isto.diag.erroEm(no.linha, no.coluna, "funcao redeclarada '${no.nome}'")
+                    }
+                    se (no.nomeSimboloLink.tamanho() > 0) {
+                        existente.nomeSimboloLink = no.nomeSimboloLink
+                    }
+                    se (ehDef) {
+                        existente.definida = verdadeiro
+                        existente.ehExtern = falso
+                        existente.ehStatic = no.ehStatic
+                        existente.params = pTipos
+                        existente.aridade = pTipos.tamanho()
+                        se (isto.tabela.funcoesExternas.contem(no.nome)) {
+                            isto.tabela.funcoesExternas.remover(no.nome)
+                        }
+                        numFuncoes++
+                    }
+                } senao {
+                    isto.funcoes[no.nome] = InfoFuncao(no.nome, no.tipoC, pTipos, ehDef,
+                        no.ehExtern, no.ehStatic, no.ehVariadica, no.nomeSimboloLink)
+                    se (ehDef) numFuncoes++
+                }
+                padrao:
+                var noop: inteiro = 0
+            }
+        }
+
+        se (exigirMain e !isto.funcoes.contem("main")) {
+            isto.diag.erroDireto("", 0, 0, "funcao 'main' nao encontrada")
+        }
+
+        const nomesFn: texto[] = isto.funcoes.chaves()
+        para (var f: inteiro = 0; f < nomesFn.tamanho(); f++) {
+            const nomeF: texto = nomesFn[f]
+            const infoF: InfoFuncao = isto.funcoes[nomeF]
+            isto.tabela.assinaturasFuncoes[nomeF] = infoF
+            se (!infoF.definida) {
+                isto.tabela.funcoesExternas[nomeF] = verdadeiro
+            }
+        }
+
+        // Passe 2: verifica corpos das funcoes
+        para (var i: inteiro = 0; i < prog.filhos.tamanho(); i++) {
+            const no: qualquer = prog.filhos[i]
+            se (no.kind != isto.Kind.Funcao) continua
+            var escopos: dicionario[] = [isto.globais, {}]
+            const pLista: qualquer = no.filhos[0]
+            para (var p: inteiro = 0; p < pLista.filhos.tamanho(); p++) {
+                const pNo: qualquer = pLista.filhos[p]
+                escopos[1][pNo.nome] = pNo.tipoC
+            }
+            var labels: dicionario = {}
+            isto.coletarLabels(no.filhos[1], labels)
+            isto.verificarStmt(no.filhos[1], escopos, no.tipoC, 0, 0, labels)
+        }
+
+        retorna ResultadoSemantica(isto.tabela, isto.globais, numFuncoes, numStructs, numUnions)
+    }
+
+    coletarLabels(stmt: qualquer, labels: dicionario): vazio {
+        se (stmt == nulo) retorna
+        se (stmt.kind == isto.Kind.StmtLabel) {
+            se (labels.contem(stmt.nome)) {
+                isto.diag.erroEm(stmt.linha, stmt.coluna, "label duplicado '${stmt.nome}'")
+            }
+            labels[stmt.nome] = verdadeiro
+        }
+        para (var i: inteiro = 0; i < stmt.filhos.tamanho(); i++) {
+            isto.coletarLabels(stmt.filhos[i], labels)
+        }
+    }
+
+    buscarVar(escopos: dicionario[], nome: texto): qualquer {
+        para (var i: inteiro = escopos.tamanho() - 1; i >= 0; i--) {
+            se (escopos[i].contem(nome)) retorna escopos[i][nome]
+        }
+        retorna nulo
+    }
+
+    verificarInicializador(inic: qualquer, tipoAlvo: qualquer, escopos: dicionario[]): vazio {
+        se (inic.kind == isto.Kind.ExprInitList) {
+            var idxSeq: inteiro = 0
+            para (var i: inteiro = 0; i < inic.filhos.tamanho(); i++) {
+                const item: qualquer = inic.filhos[i]
+                se (item.kind == isto.Kind.ExprInicDesignado) {
+                    se (item.ehSeta) {
+                        se (tipoAlvo.base != isto.TB.Array) {
+                            isto.diag.erroEm(item.linha, item.coluna, "inicializador designado '[idx]' exige array")
+                        }
+                        idxSeq = item.valor + 1
+                        isto.verificarInicializador(item.filhos[0], tipoAlvo.alvo, escopos)
+                    } senao {
+                        const campo: qualquer = isto.tabela.buscarCampo(tipoAlvo, item.nome)
+                        item.valor = campo.offset
+                        item.tipoC = campo.tipoCampo
+                        isto.verificarInicializador(item.filhos[0], campo.tipoCampo, escopos)
+                    }
+                    continua
+                }
+                se (tipoAlvo.base == isto.TB.Array) {
+                    isto.verificarInicializador(item, tipoAlvo.alvo, escopos)
+                    idxSeq++
+                } senao se (tipoAlvo.base == isto.TB.Struct ou tipoAlvo.base == isto.TB.Union) {
+                    const ag: qualquer = tipoAlvo.base == isto.TB.Struct ? isto.tabela.structs[tipoAlvo.nomeAgregado] : isto.tabela.unions[tipoAlvo.nomeAgregado]
+                    se (idxSeq >= ag.ordemCampos.tamanho()) {
+                        isto.diag.erroEm(item.linha, item.coluna, "excesso de elementos em inicializador de '${ag.nome}'")
+                    }
+                    const campoN: texto = ag.ordemCampos[idxSeq]
+                    const campoL: qualquer = ag.campos[campoN]
+                    isto.verificarInicializador(item, campoL.tipoCampo, escopos)
+                    idxSeq++
+                } senao {
+                    isto.verificarExpr(item, escopos)
+                }
+            }
+            retorna
+        }
+        isto.verificarExpr(inic, escopos)
+    }
+
+    verificarStmt(stmt: qualquer, escopos: dicionario[], tipoRet: qualquer, nivelLaco: inteiro,
+        nivelBreak: inteiro, labels: dicionario): vazio {
+        escolha (stmt.kind) {
+            caso isto.Kind.StmtVazio:
+            retorna
+            caso isto.Kind.DeclTypedef:
+            isto.tabela.typedefs[stmt.nome] = stmt.tipoC
+            retorna
+            caso isto.Kind.DeclStruct:
+            caso isto.Kind.DeclUnion:
+            isto.registrarAgregado(stmt)
+            retorna
+            caso isto.Kind.DeclEnum:
+            para (var k: inteiro = 0; k < stmt.filhos.tamanho(); k++) {
+                isto.tabela.constantesEnum[stmt.filhos[k].nome] = stmt.filhos[k].valor
+            }
+            retorna
+            caso isto.Kind.Bloco:
+            escopos.empilhar({})
+            para (var i: inteiro = 0; i < stmt.filhos.tamanho(); i++) {
+                isto.verificarStmt(stmt.filhos[i], escopos, tipoRet, nivelLaco, nivelBreak,
+                    labels)
+            }
+            escopos.removerUltimo()
+            retorna
+            caso isto.Kind.VarDecl:
+            se (stmt.tipoC.base == isto.TB.Array e stmt.tipoC.ehVLA) {
+                isto.verificarExpr(stmt.tipoC.exprTamVLA, escopos)
+            }
+            se (stmt.filhos.tamanho() > 0) {
+                isto.verificarInicializador(stmt.filhos[0], stmt.tipoC, escopos)
+            }
+            const topo: dicionario = escopos[escopos.tamanho() - 1]
+            se (topo.contem(stmt.nome)) {
+                isto.diag.erroEm(stmt.linha, stmt.coluna, "variavel redeclarada '${stmt.nome}'")
+            }
+            topo[stmt.nome] = stmt.tipoC
+            retorna
+            caso isto.Kind.StmtExpr:
+            isto.verificarExpr(stmt.filhos[0], escopos)
+            retorna
+            caso isto.Kind.StmtIf:
+            isto.verificarExpr(stmt.filhos[0], escopos)
+            isto.verificarStmt(stmt.filhos[1], escopos, tipoRet, nivelLaco, nivelBreak, labels)
+            se (stmt.filhos.tamanho() > 2) {
+                isto.verificarStmt(stmt.filhos[2], escopos, tipoRet, nivelLaco, nivelBreak,
+                    labels)
+            }
+            retorna
+            caso isto.Kind.StmtWhile:
+            isto.verificarExpr(stmt.filhos[0], escopos)
+            isto.verificarStmt(stmt.filhos[1], escopos, tipoRet, nivelLaco + 1, nivelBreak + 1,
+                labels)
+            retorna
+            caso isto.Kind.StmtDoWhile:
+            isto.verificarStmt(stmt.filhos[0], escopos, tipoRet, nivelLaco + 1, nivelBreak + 1,
+                labels)
+            isto.verificarExpr(stmt.filhos[1], escopos)
+            retorna
+            caso isto.Kind.StmtFor:
+            escopos.empilhar({})
+            isto.verificarStmt(stmt.filhos[0], escopos, tipoRet, nivelLaco, nivelBreak, labels)
+            isto.verificarExpr(stmt.filhos[1], escopos)
+            isto.verificarStmt(stmt.filhos[2], escopos, tipoRet, nivelLaco, nivelBreak, labels)
+            isto.verificarStmt(stmt.filhos[3], escopos, tipoRet, nivelLaco + 1, nivelBreak + 1,
+                labels)
+            escopos.removerUltimo()
+            retorna
+            caso isto.Kind.StmtSwitch:
+            isto.verificarExpr(stmt.filhos[0], escopos)
+            para (var i: inteiro = 1; i < stmt.filhos.tamanho(); i++) {
+                const ramoCaso: qualquer = stmt.filhos[i]
+                se (!ramoCaso.ehSeta) {
+                    isto.verificarExpr(ramoCaso.filhos[0], escopos)
+                    isto.verificarStmt(ramoCaso.filhos[1], escopos, tipoRet, nivelLaco, nivelBreak + 1,
+                        labels)
+                } senao {
+                    isto.verificarStmt(ramoCaso.filhos[0], escopos, tipoRet, nivelLaco, nivelBreak + 1,
+                        labels)
+                }
+            }
+            retorna
+            caso isto.Kind.StmtBreak:
+            se (nivelBreak <= 0) {
+                isto.diag.erroEm(stmt.linha, stmt.coluna, "'break' fora de laco ou switch")
+            }
+            retorna
+            caso isto.Kind.StmtContinue:
+            se (nivelLaco <= 0) {
+                isto.diag.erroEm(stmt.linha, stmt.coluna, "'continue' fora de laco")
+            }
+            retorna
+            caso isto.Kind.StmtGoto:
+            se (!labels.contem(stmt.nome)) {
+                isto.diag.erroEm(stmt.linha, stmt.coluna, "label indefinido '${stmt.nome}' em goto")
+            }
+            retorna
+            caso isto.Kind.StmtLabel:
+            se (stmt.filhos.tamanho() > 0) {
+                isto.verificarStmt(stmt.filhos[0], escopos, tipoRet, nivelLaco, nivelBreak,
+                    labels)
+            }
+            retorna
+            caso isto.Kind.StmtReturn:
+            se (stmt.filhos.tamanho() == 0) {
+                se (tipoRet.base != isto.TB.Void) {
+                    isto.diag.erroEm(stmt.linha, stmt.coluna, "retorno sem valor em funcao nao-void")
+                }
+            } senao {
+                se (tipoRet.base == isto.TB.Void) {
+                    isto.diag.erroEm(stmt.linha, stmt.coluna, "retorno com valor em funcao 'void'")
+                }
+                isto.verificarExpr(stmt.filhos[0], escopos)
+            }
+            retorna
+            padrao:
+            retorna
+        }
+    }
+
+    verificarExpr(expr: qualquer, escopos: dicionario[]): qualquer {
+        escolha (expr.kind) {
+            caso isto.Kind.ExprInt:
+            expr.tipoC = expr.ehLongo ? isto.tMod.TipoC.tipoLong(expr.ehSemSinal) : isto.tMod.TipoC.tipoInt(expr.ehSemSinal)
+            retorna expr.tipoC
+            caso isto.Kind.ExprFloat:
+            expr.tipoC = isto.tMod.TipoC.tipoDouble()
+            retorna expr.tipoC
+            caso isto.Kind.ExprStr:
+            expr.tipoC = isto.tMod.TipoC.ponteiroPara(isto.tMod.TipoC.tipoChar(falso))
+            retorna expr.tipoC
+            caso isto.Kind.ExprSizeofTipo:
+            se (expr.ehSeta) {
+                expr.valor = isto.tabela.alinhamentoDe(expr.tipoC)
+            } senao {
+                expr.valor = isto.tabela.tamanhoDe(expr.tipoC)
+            }
+            expr.tipoC = isto.tMod.TipoC.tipoLong(verdadeiro)
+            retorna expr.tipoC
+            caso isto.Kind.ExprSizeofExpr:
+            const tSub: qualquer = isto.verificarExpr(expr.filhos[0], escopos)
+            se (tSub.base == isto.TB.Array e tSub.ehVLA) {
+                expr.valor = -1
+            } senao {
+                expr.valor = isto.tabela.tamanhoDe(tSub)
+            }
+            expr.tipoC = isto.tMod.TipoC.tipoLong(verdadeiro)
+            retorna expr.tipoC
+            caso isto.Kind.ExprOffsetof:
+            const campoOf: qualquer = isto.tabela.buscarCampo(expr.tipoC, expr.nome)
+            expr.valor = campoOf.offset
+            expr.tipoC = isto.tMod.TipoC.tipoLong(verdadeiro)
+            retorna expr.tipoC
+            caso isto.Kind.ExprLiteralComposto:
+            isto.verificarInicializador(expr.filhos[0], expr.tipoC, escopos)
+            retorna expr.tipoC
+            caso isto.Kind.ExprVaStart:
+            isto.verificarExpr(expr.filhos[0], escopos)
+            isto.verificarExpr(expr.filhos[1], escopos)
+            expr.tipoC = isto.tMod.TipoC.tipoVoid()
+            retorna expr.tipoC
+            caso isto.Kind.ExprVaArg:
+            isto.verificarExpr(expr.filhos[0], escopos)
+            retorna expr.tipoC
+            caso isto.Kind.ExprVaEnd:
+            isto.verificarExpr(expr.filhos[0], escopos)
+            expr.tipoC = isto.tMod.TipoC.tipoVoid()
+            retorna expr.tipoC
+            caso isto.Kind.ExprVaCopy:
+            isto.verificarExpr(expr.filhos[0], escopos)
+            isto.verificarExpr(expr.filhos[1], escopos)
+            expr.tipoC = isto.tMod.TipoC.tipoVoid()
+            retorna expr.tipoC
+            caso isto.Kind.ExprCast:
+            isto.verificarExpr(expr.filhos[0], escopos)
+            retorna expr.tipoC
+            caso isto.Kind.ExprComma:
+            isto.verificarExpr(expr.filhos[0], escopos)
+            const tDirC: qualquer = isto.verificarExpr(expr.filhos[1], escopos)
+            expr.tipoC = tDirC
+            retorna tDirC
+            caso isto.Kind.ExprVar:
+            se (expr.nome == "__func__" ou expr.nome == "__FUNCTION__" ou expr.nome == "__PRETTY_FUNCTION__") {
+                expr.tipoC = isto.tMod.TipoC.ponteiroPara(isto.tMod.TipoC.tipoChar(falso))
+                retorna expr.tipoC
+            }
+            se (isto.tabela.constantesEnum.contem(expr.nome)) {
+                expr.tipoC = isto.tMod.TipoC.tipoInt(falso)
+                retorna expr.tipoC
+            }
+            const tVar: qualquer = isto.buscarVar(escopos, expr.nome)
+            se (tVar != nulo) {
+                expr.tipoC = tVar
+                retorna tVar
+            }
+            se (isto.funcoes.contem(expr.nome)) {
+                const infoFn: InfoFuncao = isto.funcoes[expr.nome]
+                expr.tipoC = isto.tMod.TipoC.ponteiroPara(isto.tMod.TipoC.funcaoTipo(infoFn.tipoRet,
+                    infoFn.params, infoFn.ehVariadica))
+                retorna expr.tipoC
+            }
+            isto.diag.erroEm(expr.linha, expr.coluna, "identificador nao declarado '${expr.nome}'")
+            caso isto.Kind.ExprPosfixo:
+            const tBaseP: qualquer = isto.verificarExpr(expr.filhos[0], escopos)
+            expr.tipoC = tBaseP
+            retorna tBaseP
+            caso isto.Kind.ExprAtrib:
+            const tEsqA: qualquer = isto.verificarExpr(expr.filhos[0], escopos)
+            isto.verificarExpr(expr.filhos[1], escopos)
+            expr.tipoC = tEsqA
+            retorna tEsqA
+            caso isto.Kind.ExprUnaria:
+            const tOp: qualquer = isto.verificarExpr(expr.filhos[0], escopos)
+            se (expr.opUn == isto.OpU.AddrOf) {
+                se (tOp.base == isto.TB.Ponteiro e tOp.alvo != nulo e tOp.alvo.base == isto.TB.Funcao e expr.filhos[0].kind == isto.Kind.ExprVar e isto.funcoes.contem(expr.filhos[0].nome)) {
+                    expr.tipoC = tOp
+                    retorna tOp
+                }
+                expr.tipoC = isto.tMod.TipoC.ponteiroPara(tOp)
+                retorna expr.tipoC
+            }
+            se (expr.opUn == isto.OpU.Deref) {
+                se (tOp.base != isto.TB.Ponteiro e tOp.base != isto.TB.Array) {
+                    isto.diag.erroEm(expr.linha, expr.coluna, "desreferencia '*' exige ponteiro ou array")
+                }
+                expr.tipoC = tOp.alvo
+                retorna expr.tipoC
+            }
+            se (expr.opUn == isto.OpU.PreInc ou expr.opUn == isto.OpU.PreDec) {
+                expr.tipoC = tOp
+                retorna tOp
+            }
+            se (expr.opUn == isto.OpU.LogNot) {
+                expr.tipoC = isto.tMod.TipoC.tipoInt(falso)
+                retorna expr.tipoC
+            }
+            expr.tipoC = tOp.ehFlutuante() ? tOp : isto.tMod.promocaoInteira(tOp)
+            retorna expr.tipoC
+            caso isto.Kind.ExprIndice:
+            const tBaseI: qualquer = isto.verificarExpr(expr.filhos[0], escopos)
+            isto.verificarExpr(expr.filhos[1], escopos)
+            se (tBaseI.base != isto.TB.Ponteiro e tBaseI.base != isto.TB.Array) {
+                isto.diag.erroEm(expr.linha, expr.coluna, "indexacao '[]' exige ponteiro ou array")
+            }
+            expr.tipoC = tBaseI.alvo
+            retorna expr.tipoC
+            caso isto.Kind.ExprMembro:
+            const tBaseM: qualquer = isto.verificarExpr(expr.filhos[0], escopos)
+            var tAgregado: qualquer = tBaseM
+            se (expr.ehSeta) {
+                se (tBaseM.base != isto.TB.Ponteiro) {
+                    isto.diag.erroEm(expr.linha, expr.coluna, "operador '->' exige ponteiro para struct/union")
+                }
+                tAgregado = tBaseM.alvo
+            }
+            const campo: qualquer = isto.tabela.buscarCampo(tAgregado, expr.nome)
+            expr.valor = campo.offset
+            expr.tipoC = campo.tipoCampo
+            expr.ehBitField = campo.ehBitField
+            expr.bitWidth = campo.bitWidth
+            expr.alinhamentoExplicito = campo.bitOffset // armazena bitOffset para lowering de bit-field
+            retorna campo.tipoCampo
+            caso isto.Kind.ExprBinaria:
+            const tEsqB: qualquer = isto.verificarExpr(expr.filhos[0], escopos)
+            const tDirB: qualquer = isto.verificarExpr(expr.filhos[1], escopos)
+            se (expr.opBin == isto.OpB.Add ou expr.opBin == isto.OpB.Sub) {
+                se (tEsqB.base == isto.TB.Ponteiro ou tEsqB.base == isto.TB.Array) {
+                    se (expr.opBin == isto.OpB.Sub e (tDirB.base == isto.TB.Ponteiro ou tDirB.base == isto.TB.Array)) {
+                        expr.tipoC = isto.tMod.TipoC.tipoLong(falso)
+                        retorna expr.tipoC
+                    }
+                    expr.tipoC = tEsqB.base == isto.TB.Array ? isto.tMod.TipoC.ponteiroPara(tEsqB.alvo) : tEsqB
+                    retorna expr.tipoC
+                }
+            }
+            se (expr.opBin == isto.OpB.Eq ou expr.opBin == isto.OpB.Neq ou expr.opBin == isto.OpB.Lt ou expr.opBin == isto.OpB.Le ou expr.opBin == isto.OpB.Gt ou expr.opBin == isto.OpB.Ge ou expr.opBin == isto.OpB.LogAnd ou expr.opBin == isto.OpB.LogOr) {
+                expr.tipoC = isto.tMod.TipoC.tipoInt(falso)
+                retorna expr.tipoC
+            }
+            expr.tipoC = isto.tMod.tipoAritmeticoComum(tEsqB, tDirB)
+            retorna expr.tipoC
+            caso isto.Kind.ExprTernario:
+            isto.verificarExpr(expr.filhos[0], escopos)
+            const tSim: qualquer = isto.verificarExpr(expr.filhos[1], escopos)
+            const tNao: qualquer = isto.verificarExpr(expr.filhos[2], escopos)
+            se (tSim.base == isto.TB.Void ou tNao.base == isto.TB.Void) {
+                expr.tipoC = isto.tMod.TipoC.tipoVoid()
+            } senao se (tSim.ehAritmetico() e tNao.ehAritmetico()) {
+                expr.tipoC = isto.tMod.tipoAritmeticoComum(tSim, tNao)
+            } senao {
+                expr.tipoC = tSim
+            }
+            retorna expr.tipoC
+            padrao:
+            se (!expr.ehSeta) {
+                const tVarFn: qualquer = isto.buscarVar(escopos, expr.nome)
+                se (tVarFn != nulo e tVarFn.base == isto.TB.Ponteiro e tVarFn.alvo != nulo e tVarFn.alvo.base == isto.TB.Funcao) {
+                    const fnT: qualquer = tVarFn.alvo
+                    expr.ehSeta = verdadeiro
+                    para (var i: inteiro = 0; i < expr.filhos.tamanho(); i++) {
+                        isto.verificarExpr(expr.filhos[i], escopos)
+                    }
+                    expr.tipoC = fnT.alvo
+                    retorna expr.tipoC
+                }
+                se (!isto.funcoes.contem(expr.nome)) {
+                    isto.diag.erroEm(expr.linha, expr.coluna, "funcao nao declarada '${expr.nome}'")
+                }
+                const info: InfoFuncao = isto.funcoes[expr.nome]
+                const nArgs: inteiro = expr.filhos.tamanho()
+                se (info.ehVariadica) {
+                    se (nArgs < info.aridade) {
+                        isto.diag.erroEm(expr.linha, expr.coluna, "'${expr.nome}' espera ao menos ${info.aridade} args, recebeu ${nArgs}")
+                    }
+                } senao se (nArgs != info.aridade) {
+                    isto.diag.erroEm(expr.linha, expr.coluna, "'${expr.nome}' espera ${info.aridade} args, recebeu ${nArgs}")
+                }
+                para (var i: inteiro = 0; i < nArgs; i++) {
+                    isto.verificarExpr(expr.filhos[i], escopos)
+                }
+                expr.tipoC = info.tipoRet
+                retorna info.tipoRet
+            }
+            const tCallee: qualquer = isto.verificarExpr(expr.filhos[0], escopos)
+            se (tCallee.base != isto.TB.Ponteiro ou tCallee.alvo == nulo ou tCallee.alvo.base != isto.TB.Funcao) {
+                isto.diag.erroEm(expr.linha, expr.coluna, "expressao chamada nao e ponteiro para funcao")
+            }
+            para (var i: inteiro = 1; i < expr.filhos.tamanho(); i++) {
+                isto.verificarExpr(expr.filhos[i], escopos)
+            }
+            expr.tipoC = tCallee.alvo.alvo
+            retorna expr.tipoC
+        }
+        retorna isto.tMod.TipoC.tipoInt(falso)
+    }
+}
+
+funcao analisarSemanticaDCC(prog: qualquer, diag: qualquer, exigirMain: logico = falso): ResultadoSemantica {
+    retorna AnalisadorSemanticoDCC(diag).verificarPrograma(prog, exigirMain)
+}

@@ -1,0 +1,225 @@
+// Emissor de arquivo objeto relocavel ELF64 padrao (ET_REL, .o) para x86-64 Linux.
+// Compativel tanto com o linker nativo do DCC quanto com GNU ld / gcc / clang!
+
+funcao anexarU16(buf: inteiro[], v: inteiro): vazio {
+    buf.empilhar(v & 255)
+    buf.empilhar((v >> 8) & 255)
+}
+
+funcao anexarU32(buf: inteiro[], v: inteiro): vazio {
+    buf.empilhar(v & 255)
+    buf.empilhar((v >> 8) & 255)
+    buf.empilhar((v >> 16) & 255)
+    buf.empilhar((v >> 24) & 255)
+}
+
+funcao anexarU64(buf: inteiro[], v: inteiro): vazio {
+    anexarU32(buf, v)
+    anexarU32(buf, v >> 32)
+}
+
+funcao preencherAlinh(buf: inteiro[], modAlinh: inteiro): vazio {
+    se (modAlinh <= 1) retorna
+    enquanto (buf.tamanho() % modAlinh != 0) buf.empilhar(0)
+}
+
+funcao anexarStrZ(buf: inteiro[], s: texto, bytesMod: qualquer): inteiro {
+    const ini: inteiro = buf.tamanho()
+    const dados: inteiro[] = bytesMod.Bytes.deTexto(s).paraVetor()
+    para (var i: inteiro = 0; i < dados.tamanho(); i++) buf.empilhar(dados[i])
+    buf.empilhar(0)
+    retorna ini
+}
+
+funcao anexarShdr(buf: inteiro[], shName: inteiro, shType: inteiro, shFlags: inteiro, shAddr: inteiro,
+    shOffset: inteiro, shSize: inteiro, shLink: inteiro, shInfo: inteiro, shAddrAlign: inteiro,
+    shEntSize: inteiro): vazio {
+    anexarU32(buf, shName)
+    anexarU32(buf, shType)
+    anexarU64(buf, shFlags)
+    anexarU64(buf, shAddr)
+    anexarU64(buf, shOffset)
+    anexarU64(buf, shSize)
+    anexarU32(buf, shLink)
+    anexarU32(buf, shInfo)
+    anexarU64(buf, shAddrAlign)
+    anexarU64(buf, shEntSize)
+}
+
+funcao anexarSym64(buf: inteiro[], stName: inteiro, stInfo: inteiro, stShndx: inteiro, stValue: inteiro,
+    stSize: inteiro): vazio {
+    anexarU32(buf, stName)
+    buf.empilhar(stInfo & 255)
+    buf.empilhar(0) // st_other = STV_DEFAULT
+    anexarU16(buf, stShndx)
+    anexarU64(buf, stValue)
+    anexarU64(buf, stSize)
+}
+
+funcao mapearSecaoShndx(sec: texto): inteiro {
+    se (sec == "TEXT") retorna 1
+    se (sec == "RODATA") retorna 3
+    se (sec == "DATA") retorna 4
+    se (sec == "BSS") retorna 5
+    retorna 0 // SHN_UNDEF
+}
+
+funcao emitirObjetoELF64(obj: qualquer): inteiro[] {
+    const bytesMod: qualquer = importar("cgd:bytes")
+
+    // 1. Constroi .strtab e .symtab (regra ELF: todos STB_LOCAL antes de todos STB_GLOBAL)
+    var strtab: inteiro[] = [0]
+    var symtab: inteiro[] = []
+    var symIdxMap: dicionario = {}
+
+    // Entrada 0: simbolo nulo
+    anexarSym64(symtab, 0, 0, 0, 0, 0)
+    var symCount: inteiro = 1
+
+    // Entradas 1..4: simbolos de secao locais (.text, .rodata, .data, .bss)
+    symIdxMap[".text"] = symCount
+    anexarSym64(symtab, 0, 3, 1, 0, 0) // STB_LOCAL | STT_SECTION, shndx=1
+    symCount++
+    symIdxMap[".rodata"] = symCount
+    anexarSym64(symtab, 0, 3, 3, 0, 0) // shndx=3
+    symCount++
+    symIdxMap[".data"] = symCount
+    anexarSym64(symtab, 0, 3, 4, 0, 0) // shndx=4
+    symCount++
+    symIdxMap[".bss"] = symCount
+    anexarSym64(symtab, 0, 3, 5, 0, 0) // shndx=5
+    symCount++
+
+    // Demais simbolos STB_LOCAL
+    para (var i: inteiro = 0; i < obj.simbolos.tamanho(); i++) {
+        const s: qualquer = obj.simbolos[i]
+        se (s.ehGlobal) continua
+        const nameOff: inteiro = anexarStrZ(strtab, s.nome, bytesMod)
+        symIdxMap[s.nome] = symCount
+        anexarSym64(symtab, nameOff, s.tipoSym & 15, mapearSecaoShndx(s.secao), s.offset,
+            s.tamanho)
+        symCount++
+    }
+
+    const firstGlobalIdx: inteiro = symCount
+
+    // Simbolos STB_GLOBAL (definidos e SHN_UNDEF)
+    para (var i: inteiro = 0; i < obj.simbolos.tamanho(); i++) {
+        const s: qualquer = obj.simbolos[i]
+        se (!s.ehGlobal) continua
+        const nameOff: inteiro = anexarStrZ(strtab, s.nome, bytesMod)
+        symIdxMap[s.nome] = symCount
+        anexarSym64(symtab, nameOff, 16 | (s.tipoSym & 15), mapearSecaoShndx(s.secao), s.offset,
+            s.tamanho)
+        symCount++
+    }
+
+    // 2. Constroi .rela.text
+    var relaText: inteiro[] = []
+    para (var i: inteiro = 0; i < obj.relocsText.tamanho(); i++) {
+        const r: qualquer = obj.relocsText[i]
+        const sIdx: inteiro = inteiro(symIdxMap[r.simbolo])
+        anexarU64(relaText, r.offset)
+        anexarU64(relaText, (sIdx << 32) | (r.tipoReloc & 4294967295))
+        anexarU64(relaText, r.addend)
+    }
+
+    // 3. Constroi .shstrtab
+    var shstrtab: inteiro[] = [0]
+    const nText: inteiro = anexarStrZ(shstrtab, ".text", bytesMod)
+    const nRelaText: inteiro = anexarStrZ(shstrtab, ".rela.text", bytesMod)
+    const nRodata: inteiro = anexarStrZ(shstrtab, ".rodata", bytesMod)
+    const nData: inteiro = anexarStrZ(shstrtab, ".data", bytesMod)
+    const nBss: inteiro = anexarStrZ(shstrtab, ".bss", bytesMod)
+    const nSymtab: inteiro = anexarStrZ(shstrtab, ".symtab", bytesMod)
+    const nStrtab: inteiro = anexarStrZ(shstrtab, ".strtab", bytesMod)
+    const nShstrtab: inteiro = anexarStrZ(shstrtab, ".shstrtab", bytesMod)
+    const nGnuStack: inteiro = anexarStrZ(shstrtab, ".note.GNU-stack", bytesMod)
+
+    // 4. Monta o corpo apos o header de 64 bytes
+    var corpo: inteiro[] = []
+
+    // .text (alinhado em 16)
+    const offText: inteiro = 64 + corpo.tamanho()
+    para (var i: inteiro = 0; i < obj.textBytes.tamanho(); i++) corpo.empilhar(obj.textBytes[i])
+    const lenText: inteiro = obj.textBytes.tamanho()
+
+    // .rodata (alinhado em 8)
+    preencherAlinh(corpo, 8)
+    const offRodata: inteiro = 64 + corpo.tamanho()
+    para (var i: inteiro = 0; i < obj.rodataBytes.tamanho(); i++) corpo.empilhar(obj.rodataBytes[i])
+    const lenRodata: inteiro = obj.rodataBytes.tamanho()
+
+    // .data (alinhado em 8)
+    preencherAlinh(corpo, 8)
+    const offData: inteiro = 64 + corpo.tamanho()
+    para (var i: inteiro = 0; i < obj.dataBytes.tamanho(); i++) corpo.empilhar(obj.dataBytes[i])
+    const lenData: inteiro = obj.dataBytes.tamanho()
+
+    // .bss (NOBITS: 0 bytes no arquivo)
+    preencherAlinh(corpo, 8)
+    const offBss: inteiro = 64 + corpo.tamanho()
+
+    // .rela.text (alinhado em 8)
+    preencherAlinh(corpo, 8)
+    const offRela: inteiro = 64 + corpo.tamanho()
+    para (var i: inteiro = 0; i < relaText.tamanho(); i++) corpo.empilhar(relaText[i])
+    const lenRela: inteiro = relaText.tamanho()
+
+    // .symtab (alinhado em 8)
+    preencherAlinh(corpo, 8)
+    const offSymtab: inteiro = 64 + corpo.tamanho()
+    para (var i: inteiro = 0; i < symtab.tamanho(); i++) corpo.empilhar(symtab[i])
+    const lenSymtab: inteiro = symtab.tamanho()
+
+    // .strtab
+    const offStrtab: inteiro = 64 + corpo.tamanho()
+    para (var i: inteiro = 0; i < strtab.tamanho(); i++) corpo.empilhar(strtab[i])
+    const lenStrtab: inteiro = strtab.tamanho()
+
+    // .shstrtab
+    const offShstrtab: inteiro = 64 + corpo.tamanho()
+    para (var i: inteiro = 0; i < shstrtab.tamanho(); i++) corpo.empilhar(shstrtab[i])
+    const lenShstrtab: inteiro = shstrtab.tamanho()
+
+    // Section headers (alinhados em 8)
+    preencherAlinh(corpo, 8)
+    const offShdrs: inteiro = 64 + corpo.tamanho()
+    const numShdrs: inteiro = 10
+
+    // 5. ELF64 Header (ET_REL = 1, EM_X86_64 = 62)
+    var elf: inteiro[] = [
+        127, 69, 76, 70, // 0x7F 'E' 'L' 'F'
+        2, 1, 1, 0, // ELFCLASS64, LSB, EV_CURRENT, SysV
+        0, 0, 0, 0, 0, 0, 0, 0
+    ]
+    anexarU16(elf, 1) // ET_REL
+    anexarU16(elf, 62) // EM_X86_64
+    anexarU32(elf, 1) // EV_CURRENT
+    anexarU64(elf, 0) // e_entry
+    anexarU64(elf, 0) // e_phoff
+    anexarU64(elf, offShdrs) // e_shoff
+    anexarU32(elf, 0) // e_flags
+    anexarU16(elf, 64) // e_ehsize
+    anexarU16(elf, 0) // e_phentsize
+    anexarU16(elf, 0) // e_phnum
+    anexarU16(elf, 64) // e_shentsize
+    anexarU16(elf, numShdrs) // e_shnum = 10
+    anexarU16(elf, 8) // e_shstrndx = 8 (.shstrtab)
+
+    para (var i: inteiro = 0; i < corpo.tamanho(); i++) elf.empilhar(corpo[i])
+
+    // 10 Section Headers
+    anexarShdr(elf, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0) // 0: NULL
+    anexarShdr(elf, nText, 1, 6, 0, offText, lenText, 0, 0, 16, 0) // 1: .text
+    anexarShdr(elf, nRelaText, 4, 64, 0, offRela, lenRela, 6, 1, 8, 24) // 2: .rela.text
+    anexarShdr(elf, nRodata, 1, 2, 0, offRodata, lenRodata, 0, 0, 8, 0) // 3: .rodata
+    anexarShdr(elf, nData, 1, 3, 0, offData, lenData, 0, 0, 8, 0) // 4: .data
+    anexarShdr(elf, nBss, 8, 3, 0, offBss, obj.bssSize, 0, 0, 8, 0) // 5: .bss
+    anexarShdr(elf, nSymtab, 2, 0, 0, offSymtab, lenSymtab, 7, firstGlobalIdx, 8, 24) // 6: .symtab
+    anexarShdr(elf, nStrtab, 3, 0, 0, offStrtab, lenStrtab, 0, 0, 1, 0) // 7: .strtab
+    anexarShdr(elf, nShstrtab, 3, 0, 0, offShstrtab, lenShstrtab, 0, 0, 1, 0) // 8: .shstrtab
+    anexarShdr(elf, nGnuStack, 1, 0, 0, offShdrs, 0, 0, 0, 1, 0) // 9: .note.GNU-stack
+
+    retorna elf
+}

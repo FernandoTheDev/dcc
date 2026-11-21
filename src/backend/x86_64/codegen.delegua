@@ -1,0 +1,1048 @@
+// Backend x86-64 (System V AMD64 ABI): Lowering direto de ModuloSSA para codigo de maquina PIC-compativel
+// e estrutura CodigoObjeto (.text, .rodata, .data, .bss, simbolos e relocacoes ELF64 padrao).
+// Usado tanto pela emissao de arquivos objeto .o (ET_REL) quanto pelo linker nativo do DCC (ET_EXEC).
+
+classe PatchRel32 {
+    pos: inteiro
+    alvo: texto
+
+    construtor(pos: inteiro, alvo: texto) {
+        isto.pos = pos
+        isto.alvo = alvo
+    }
+}
+
+classe SimboloObj {
+    nome: texto
+    secao: texto // "TEXT", "RODATA", "DATA", "BSS", "UNDEF"
+    offset: inteiro
+    tamanho: inteiro
+    ehGlobal: logico
+    tipoSym: inteiro // 0=NOTYPE, 1=OBJECT, 2=FUNC, 3=SECTION
+
+    construtor(nome: texto, secao: texto, offset: inteiro, tamanho: inteiro, ehGlobal: logico,
+        tipoSym: inteiro) {
+        isto.nome = nome
+        isto.secao = secao
+        isto.offset = offset
+        isto.tamanho = tamanho
+        isto.ehGlobal = ehGlobal
+        isto.tipoSym = tipoSym
+    }
+}
+
+classe RelocObj {
+    offset: inteiro
+    simbolo: texto
+    tipoReloc: inteiro // 1=R_X86_64_64, 2=R_X86_64_PC32, 4=R_X86_64_PLT32, 9=R_X86_64_GOTPCREL
+    addend: inteiro
+
+    construtor(offset: inteiro, simbolo: texto, tipoReloc: inteiro, addend: inteiro) {
+        isto.offset = offset
+        isto.simbolo = simbolo
+        isto.tipoReloc = tipoReloc
+        isto.addend = addend
+    }
+}
+
+classe CodigoObjeto {
+    textBytes: inteiro[]
+    rodataBytes: inteiro[]
+    dataBytes: inteiro[]
+    bssSize: inteiro
+    simbolos: SimboloObj[]
+    relocsText: RelocObj[]
+    libsExternas: texto[]
+
+    construtor() {
+        isto.textBytes = []
+        isto.rodataBytes = []
+        isto.dataBytes = []
+        isto.bssSize = 0
+        isto.simbolos = []
+        isto.relocsText = []
+        isto.libsExternas = []
+    }
+}
+
+funcao gravarU32Buf(buf: inteiro[], pos: inteiro, v: inteiro): vazio {
+    buf[pos] = v & 255
+    buf[pos + 1] = (v >> 8) & 255
+    buf[pos + 2] = (v >> 16) & 255
+    buf[pos + 3] = (v >> 24) & 255
+}
+
+funcao alinharVal(n: inteiro, modAlinh: inteiro): inteiro {
+    se (modAlinh <= 1) retorna n
+    const resto: inteiro = n % modAlinh
+    se (resto == 0) retorna n
+    retorna n + (modAlinh - resto)
+}
+
+funcao offRegObj(tamanhoLocaisBytes: inteiro, reg: inteiro): inteiro {
+    retorna tamanhoLocaisBytes + (reg + 1) * 8
+}
+
+classe EmissorX86_64 {
+    code: inteiro[]
+    labels: dicionario
+    patchesRel32: PatchRel32[]
+    relocs: RelocObj[]
+
+    construtor() {
+        isto.code = []
+        isto.labels = {}
+        isto.patchesRel32 = []
+        isto.relocs = []
+    }
+
+    u8(b: inteiro): vazio {
+        isto.code.empilhar(b & 255)
+    }
+
+    u32(v: inteiro): vazio {
+        isto.u8(v)
+        isto.u8(v >> 8)
+        isto.u8(v >> 16)
+        isto.u8(v >> 24)
+    }
+
+    u64(v: inteiro): vazio {
+        isto.u32(v)
+        isto.u32(v >> 32)
+    }
+
+    marcarLabel(nome: texto): vazio {
+        isto.labels[nome] = isto.code.tamanho()
+    }
+
+    pushRbp(): vazio {
+        isto.u8(85)
+    }
+
+    popRbp(): vazio {
+        isto.u8(93)
+    }
+
+    pushRax(): vazio {
+        isto.u8(80)
+    }
+
+    retInst(): vazio {
+        isto.u8(195)
+    }
+
+    movRbpRsp(): vazio {
+        isto.u8(72)
+        isto.u8(137)
+        isto.u8(229)
+    }
+
+    movRspRbp(): vazio {
+        isto.u8(72)
+        isto.u8(137)
+        isto.u8(236)
+    }
+
+    subRspImm32(n: inteiro): vazio {
+        isto.u8(72)
+        isto.u8(129)
+        isto.u8(236)
+        isto.u32(n)
+    }
+
+    addRspImm32(n: inteiro): vazio {
+        isto.u8(72)
+        isto.u8(129)
+        isto.u8(196)
+        isto.u32(n)
+    }
+
+    movRaxImm64(v: inteiro): vazio {
+        isto.u8(72)
+        isto.u8(184)
+        isto.u64(v)
+    }
+
+    movEaxImm32(v: inteiro): vazio {
+        isto.u8(184)
+        isto.u32(v)
+    }
+
+    // lea rax, [rip + disp32] -> 48 8D 05 disp32 (relocacao R_X86_64_PC32 ou patch interno)
+    leaRaxRipReloc(simbolo: texto, addend: inteiro): vazio {
+        isto.u8(72)
+        isto.u8(141)
+        isto.u8(5)
+        isto.relocs.empilhar(RelocObj(isto.code.tamanho(), simbolo, 2, addend))
+        isto.u32(0)
+    }
+
+    leaRaxRipLabel(labelInterno: texto): vazio {
+        isto.u8(72)
+        isto.u8(141)
+        isto.u8(5)
+        isto.patchesRel32.empilhar(PatchRel32(isto.code.tamanho(), labelInterno))
+        isto.u32(0)
+    }
+
+    // mov rax, [rip + disp32] -> 48 8B 05 disp32 (relocacao R_X86_64_GOTPCREL = 9)
+    movRaxGotReloc(simbolo: texto): vazio {
+        isto.u8(72)
+        isto.u8(139)
+        isto.u8(5)
+        isto.relocs.empilhar(RelocObj(isto.code.tamanho(), simbolo, 9, -4))
+        isto.u32(0)
+    }
+
+    // call sym@PLT -> E8 disp32 (relocacao R_X86_64_PLT32 = 4, addend = -4)
+    callExternReloc(simbolo: texto, numXmm: inteiro): vazio {
+        isto.movEaxImm32(numXmm)
+        isto.u8(232)
+        isto.relocs.empilhar(RelocObj(isto.code.tamanho(), simbolo, 4, -4))
+        isto.u32(0)
+    }
+
+    // call r10 via slot [rbp - off]
+    callIndirectRbp(offsetPositivo: inteiro, numXmm: inteiro): vazio {
+        isto.u8(76)
+        isto.u8(139)
+        isto.u8(149)
+        isto.u32(-offsetPositivo)
+        isto.movEaxImm32(numXmm)
+        isto.u8(65)
+        isto.u8(255)
+        isto.u8(210)
+    }
+
+    leaRaxRbpDisp(disp: inteiro): vazio {
+        isto.u8(72)
+        isto.u8(141)
+        isto.u8(133)
+        isto.u32(disp)
+    }
+
+    leaRaxRbp(offsetPositivo: inteiro): vazio {
+        isto.leaRaxRbpDisp(-offsetPositivo)
+    }
+
+    loadSizedFromPtrRax(largura: inteiro, ehSemSinal: logico): vazio {
+        se (largura == 1) {
+            isto.u8(72)
+            isto.u8(15)
+            isto.u8(ehSemSinal ? 182 : 190)
+            isto.u8(0)
+            retorna
+        }
+        se (largura == 2) {
+            isto.u8(72)
+            isto.u8(15)
+            isto.u8(ehSemSinal ? 183 : 191)
+            isto.u8(0)
+            retorna
+        }
+        se (largura == 4) {
+            se (ehSemSinal) {
+                isto.u8(139)
+                isto.u8(0)
+            } senao {
+                isto.u8(72)
+                isto.u8(99)
+                isto.u8(0)
+            }
+            retorna
+        }
+        isto.u8(72)
+        isto.u8(139)
+        isto.u8(0)
+    }
+
+    storeSizedRcxToPtrRax(largura: inteiro): vazio {
+        se (largura == 1) {
+            isto.u8(136)
+            isto.u8(8)
+            retorna
+        }
+        se (largura == 2) {
+            isto.u8(102)
+            isto.u8(137)
+            isto.u8(8)
+            retorna
+        }
+        se (largura == 4) {
+            isto.u8(137)
+            isto.u8(8)
+            retorna
+        }
+        isto.u8(72)
+        isto.u8(137)
+        isto.u8(8)
+    }
+
+    truncRax(largura: inteiro, ehZeroExt: logico): vazio {
+        se (largura == 1) {
+            isto.u8(72)
+            isto.u8(15)
+            isto.u8(ehZeroExt ? 182 : 190)
+            isto.u8(192)
+            retorna
+        }
+        se (largura == 2) {
+            isto.u8(72)
+            isto.u8(15)
+            isto.u8(ehZeroExt ? 183 : 191)
+            isto.u8(192)
+            retorna
+        }
+        se (largura == 4) {
+            se (ehZeroExt) {
+                isto.u8(137)
+                isto.u8(192)
+            } senao {
+                isto.u8(72)
+                isto.u8(99)
+                isto.u8(192)
+            }
+        }
+    }
+
+    loadRaxRbpDisp(disp: inteiro): vazio {
+        isto.u8(72)
+        isto.u8(139)
+        isto.u8(133)
+        isto.u32(disp)
+    }
+
+    loadRaxRbp(offsetPositivo: inteiro): vazio {
+        isto.loadRaxRbpDisp(-offsetPositivo)
+    }
+
+    loadRcxRbp(offsetPositivo: inteiro): vazio {
+        isto.u8(72)
+        isto.u8(139)
+        isto.u8(141)
+        isto.u32(-offsetPositivo)
+    }
+
+    storeRaxRbp(offsetPositivo: inteiro): vazio {
+        isto.u8(72)
+        isto.u8(137)
+        isto.u8(133)
+        isto.u32(-offsetPositivo)
+    }
+
+    loadXmmRbpDisp(xmmIdx: inteiro, disp: inteiro): vazio {
+        isto.u8(242)
+        isto.u8(15)
+        isto.u8(16)
+        isto.u8(133 + xmmIdx * 8)
+        isto.u32(disp)
+    }
+
+    storeXmmRbpDisp(xmmIdx: inteiro, disp: inteiro): vazio {
+        isto.u8(242)
+        isto.u8(15)
+        isto.u8(17)
+        isto.u8(133 + xmmIdx * 8)
+        isto.u32(disp)
+    }
+
+    cvtsd2ssXmm0(srcXmm: inteiro): vazio {
+        isto.u8(242)
+        isto.u8(15)
+        isto.u8(90)
+        isto.u8(192 + srcXmm)
+    }
+
+    cvtss2sdXmm0(): vazio {
+        isto.u8(243)
+        isto.u8(15)
+        isto.u8(90)
+        isto.u8(192)
+    }
+
+    storeXmm0FloatRbpDisp(disp: inteiro): vazio {
+        isto.u8(243)
+        isto.u8(15)
+        isto.u8(17)
+        isto.u8(133)
+        isto.u32(disp)
+    }
+
+    floadFromPtrRax(largura: inteiro): vazio {
+        se (largura == 4) {
+            isto.u8(243)
+            isto.u8(15)
+            isto.u8(16)
+            isto.u8(0)
+            isto.cvtss2sdXmm0()
+        } senao {
+            isto.u8(242)
+            isto.u8(15)
+            isto.u8(16)
+            isto.u8(0)
+        }
+    }
+
+    fstoreToPtrRax(largura: inteiro): vazio {
+        se (largura == 4) {
+            isto.cvtsd2ssXmm0(0)
+            isto.u8(243)
+            isto.u8(15)
+            isto.u8(17)
+            isto.u8(0)
+        } senao {
+            isto.u8(242)
+            isto.u8(15)
+            isto.u8(17)
+            isto.u8(0)
+        }
+    }
+
+    storeArgAbiRbp(idx: inteiro, offsetPositivo: inteiro): vazio {
+        escolha (idx) {
+            caso 0:
+            isto.u8(72)
+            isto.u8(137)
+            isto.u8(189)
+            isto.u32(-offsetPositivo)
+            caso 1:
+            isto.u8(72)
+            isto.u8(137)
+            isto.u8(181)
+            isto.u32(-offsetPositivo)
+            caso 2:
+            isto.u8(72)
+            isto.u8(137)
+            isto.u8(149)
+            isto.u32(-offsetPositivo)
+            caso 3:
+            isto.u8(72)
+            isto.u8(137)
+            isto.u8(141)
+            isto.u32(-offsetPositivo)
+            caso 4:
+            isto.u8(76)
+            isto.u8(137)
+            isto.u8(133)
+            isto.u32(-offsetPositivo)
+            padrao:
+            isto.u8(76)
+            isto.u8(137)
+            isto.u8(141)
+            isto.u32(-offsetPositivo)
+        }
+    }
+
+    loadArgAbiRbp(idx: inteiro, offsetPositivo: inteiro): vazio {
+        escolha (idx) {
+            caso 0:
+            isto.u8(72)
+            isto.u8(139)
+            isto.u8(189)
+            isto.u32(-offsetPositivo)
+            caso 1:
+            isto.u8(72)
+            isto.u8(139)
+            isto.u8(181)
+            isto.u32(-offsetPositivo)
+            caso 2:
+            isto.u8(72)
+            isto.u8(139)
+            isto.u8(149)
+            isto.u32(-offsetPositivo)
+            caso 3:
+            isto.u8(72)
+            isto.u8(139)
+            isto.u8(141)
+            isto.u32(-offsetPositivo)
+            caso 4:
+            isto.u8(76)
+            isto.u8(139)
+            isto.u8(133)
+            isto.u32(-offsetPositivo)
+            padrao:
+            isto.u8(76)
+            isto.u8(139)
+            isto.u8(141)
+            isto.u32(-offsetPositivo)
+        }
+    }
+
+    callLabel(nome: texto): vazio {
+        isto.u8(232)
+        isto.patchesRel32.empilhar(PatchRel32(isto.code.tamanho(), nome))
+        isto.u32(0)
+    }
+
+    jmpLabel(nome: texto): vazio {
+        isto.u8(233)
+        isto.patchesRel32.empilhar(PatchRel32(isto.code.tamanho(), nome))
+        isto.u32(0)
+    }
+
+    testRaxRax(): vazio {
+        isto.u8(72)
+        isto.u8(133)
+        isto.u8(192)
+    }
+
+    jzLabel(nome: texto): vazio {
+        isto.u8(15)
+        isto.u8(132)
+        isto.patchesRel32.empilhar(PatchRel32(isto.code.tamanho(), nome))
+        isto.u32(0)
+    }
+
+    movzxRaxAl(): vazio {
+        isto.u8(72)
+        isto.u8(15)
+        isto.u8(182)
+        isto.u8(192)
+    }
+
+    emitirBinariaInt(op: qualquer, OpI: qualquer): vazio {
+        escolha (op) {
+            caso OpI.Add:
+            isto.u8(72)
+            isto.u8(1)
+            isto.u8(200)
+            retorna
+            caso OpI.Sub:
+            isto.u8(72)
+            isto.u8(41)
+            isto.u8(200)
+            retorna
+            caso OpI.Mul:
+            isto.u8(72)
+            isto.u8(15)
+            isto.u8(175)
+            isto.u8(193)
+            retorna
+            caso OpI.SDiv:
+            isto.u8(72)
+            isto.u8(153)
+            isto.u8(72)
+            isto.u8(247)
+            isto.u8(249)
+            retorna
+            caso OpI.UDiv:
+            isto.u8(72)
+            isto.u8(49)
+            isto.u8(210)
+            isto.u8(72)
+            isto.u8(247)
+            isto.u8(241)
+            retorna
+            caso OpI.SMod:
+            isto.u8(72)
+            isto.u8(153)
+            isto.u8(72)
+            isto.u8(247)
+            isto.u8(249)
+            isto.u8(72)
+            isto.u8(137)
+            isto.u8(208)
+            retorna
+            caso OpI.UMod:
+            isto.u8(72)
+            isto.u8(49)
+            isto.u8(210)
+            isto.u8(72)
+            isto.u8(247)
+            isto.u8(241)
+            isto.u8(72)
+            isto.u8(137)
+            isto.u8(208)
+            retorna
+            caso OpI.BitAnd:
+            isto.u8(72)
+            isto.u8(33)
+            isto.u8(200)
+            retorna
+            caso OpI.BitOr:
+            isto.u8(72)
+            isto.u8(9)
+            isto.u8(200)
+            retorna
+            caso OpI.BitXor:
+            isto.u8(72)
+            isto.u8(49)
+            isto.u8(200)
+            retorna
+            caso OpI.Shl:
+            isto.u8(72)
+            isto.u8(211)
+            isto.u8(224)
+            retorna
+            caso OpI.AShr:
+            isto.u8(72)
+            isto.u8(211)
+            isto.u8(248)
+            retorna
+            caso OpI.LShr:
+            isto.u8(72)
+            isto.u8(211)
+            isto.u8(232)
+            retorna
+            padrao:
+            isto.u8(72)
+            isto.u8(57)
+            isto.u8(200)
+            isto.u8(15)
+            escolha (op) {
+                caso OpI.Eq: isto.u8(148)
+                caso OpI.Neq: isto.u8(149)
+                caso OpI.SLt: isto.u8(156)
+                caso OpI.SLe: isto.u8(158)
+                caso OpI.SGt: isto.u8(159)
+                caso OpI.SGe: isto.u8(157)
+                caso OpI.ULt: isto.u8(146)
+                caso OpI.ULe: isto.u8(150)
+                caso OpI.UGt: isto.u8(151)
+                padrao: isto.u8(147)
+            }
+            isto.u8(192)
+            isto.movzxRaxAl()
+        }
+    }
+
+    resolverPatchesInternos(): vazio {
+        para (var i: inteiro = 0; i < isto.patchesRel32.tamanho(); i++) {
+            const p: PatchRel32 = isto.patchesRel32[i]
+            const alvoAddr: inteiro = inteiro(isto.labels[p.alvo])
+            const rel32: inteiro = alvoAddr - (p.pos + 4)
+            gravarU32Buf(isto.code, p.pos, rel32)
+        }
+    }
+}
+
+funcao emitirCallObj(emissor: EmissorX86_64, fn: qualquer, inst: qualquer, ehExtern: logico,
+    ehIndireto: logico): vazio {
+    var intIdx: inteiro = 0
+    var fltIdx: inteiro = 0
+    var stackArgs: inteiro[] = []
+    var regIntSlots: inteiro[] = []
+    var regIntNums: inteiro[] = []
+    var regFltSlots: inteiro[] = []
+    var regFltNums: inteiro[] = []
+
+    para (var k: inteiro = 0; k < inst.callArgs.tamanho(); k++) {
+        const regArg: inteiro = inst.callArgs[k]
+        const ehFlt: logico = k < inst.callArgFloats.tamanho() ? inst.callArgFloats[k] : falso
+        se (ehFlt) {
+            se (fltIdx < 8) {
+                regFltNums.empilhar(fltIdx)
+                regFltSlots.empilhar(offRegObj(fn.tamanhoLocaisBytes, regArg))
+                fltIdx++
+            } senao {
+                stackArgs.empilhar(offRegObj(fn.tamanhoLocaisBytes, regArg))
+            }
+        } senao {
+            se (intIdx < 6) {
+                regIntNums.empilhar(intIdx)
+                regIntSlots.empilhar(offRegObj(fn.tamanhoLocaisBytes, regArg))
+                intIdx++
+            } senao {
+                stackArgs.empilhar(offRegObj(fn.tamanhoLocaisBytes, regArg))
+            }
+        }
+    }
+
+    const padStack: inteiro = stackArgs.tamanho() % 2 == 1 ? 8 : 0
+    se (padStack > 0) emissor.subRspImm32(8)
+    para (var s: inteiro = stackArgs.tamanho() - 1; s >= 0; s--) {
+        emissor.loadRaxRbp(stackArgs[s])
+        emissor.pushRax()
+    }
+
+    para (var i: inteiro = 0; i < regIntNums.tamanho(); i++) {
+        emissor.loadArgAbiRbp(regIntNums[i], regIntSlots[i])
+    }
+
+    para (var i: inteiro = 0; i < regFltNums.tamanho(); i++) {
+        emissor.loadXmmRbpDisp(regFltNums[i], -regFltSlots[i])
+    }
+
+    se (ehIndireto) {
+        emissor.callIndirectRbp(offRegObj(fn.tamanhoLocaisBytes, inst.a), fltIdx)
+    } senao se (ehExtern) {
+        emissor.callExternReloc(inst.alvo1, fltIdx)
+    } senao {
+        emissor.movEaxImm32(fltIdx)
+        emissor.callLabel("fn_" + inst.alvo1)
+    }
+
+    const totalPop: inteiro = stackArgs.tamanho() * 8 + padStack
+    se (totalPop > 0) emissor.addRspImm32(totalPop)
+
+    se (inst.dst >= 0) {
+        se (inst.ehFloatDst) {
+            emissor.storeXmmRbpDisp(0, -offRegObj(fn.tamanhoLocaisBytes, inst.dst))
+        } senao {
+            emissor.storeRaxRbp(offRegObj(fn.tamanhoLocaisBytes, inst.dst))
+        }
+    }
+}
+
+funcao gerarCodigoObjetoX86_64(modulo: qualquer): CodigoObjeto {
+    const tMod: qualquer = importar("../../types/tipos.delegua")
+    const bytesMod: qualquer = importar("cgd:bytes")
+    const OpI: qualquer = tMod.OpIR
+
+    const obj: CodigoObjeto = CodigoObjeto()
+    para (var i: inteiro = 0; i < modulo.libsExternas.tamanho(); i++) {
+        obj.libsExternas.empilhar(modulo.libsExternas[i])
+    }
+
+    // 1. Monta .rodata (strings)
+    var strOffsets: inteiro[] = []
+    para (var i: inteiro = 0; i < modulo.strings.tamanho(); i++) {
+        strOffsets.empilhar(obj.rodataBytes.tamanho())
+        const dados: inteiro[] = bytesMod.Bytes.deTexto(modulo.strings[i]).paraVetor()
+        para (var k: inteiro = 0; k < dados.tamanho(); k++) obj.rodataBytes.empilhar(dados[k])
+        obj.rodataBytes.empilhar(0)
+    }
+
+    // 2. Monta .data e .bss + tabela de offsets das globais locais desta TU
+    var mapaGlobalSec: dicionario = {}
+    var mapaGlobalOff: dicionario = {}
+    para (var i: inteiro = 0; i < modulo.globais.tamanho(); i++) {
+        const g: qualquer = modulo.globais[i]
+        se (g.temInit) {
+            enquanto (g.alinhamento > 1 e obj.dataBytes.tamanho() % g.alinhamento != 0) obj.dataBytes.empilhar(0)
+            const offG: inteiro = obj.dataBytes.tamanho()
+            mapaGlobalSec[g.nome] = ".data"
+            mapaGlobalOff[g.nome] = offG
+            para (var k: inteiro = 0; k < g.bytesInit.tamanho(); k++) obj.dataBytes.empilhar(g.bytesInit[k] & 255)
+            obj.simbolos.empilhar(SimboloObj(g.nome, "DATA", offG, g.tamanhoBytes, !g.ehStatic,
+                1))
+        } senao {
+            obj.bssSize = alinharVal(obj.bssSize, g.alinhamento)
+            const offB: inteiro = obj.bssSize
+            mapaGlobalSec[g.nome] = ".bss"
+            mapaGlobalOff[g.nome] = offB
+            obj.bssSize = obj.bssSize + g.tamanhoBytes
+            obj.simbolos.empilhar(SimboloObj(g.nome, "BSS", offB, g.tamanhoBytes, !g.ehStatic,
+                1))
+        }
+    }
+
+    // Mapeia funcoes definidas localmente nesta TU
+    var funcoesLocais: dicionario = {}
+    para (var f: inteiro = 0; f < modulo.funcoes.tamanho(); f++) {
+        funcoesLocais[modulo.funcoes[f].nome] = verdadeiro
+    }
+
+    // 3. Emite codigo de maquina .text para todas as funcoes desta TU
+    const emissor: EmissorX86_64 = EmissorX86_64()
+    const funcoes: qualquer[] = modulo.funcoes
+    var externosExtras: dicionario = {}
+
+    para (var f: inteiro = 0; f < funcoes.tamanho(); f++) {
+        const fn: qualquer = funcoes[f]
+        enquanto (emissor.code.tamanho() % 16 != 0) emissor.u8(144) // nop alinhamento 16B
+        const inicioFn: inteiro = emissor.code.tamanho()
+        const frameBytes: inteiro = alinharVal(fn.tamanhoLocaisBytes + fn.numRegs * 8, 16)
+
+        emissor.marcarLabel("fn_" + fn.nome)
+        emissor.pushRbp()
+        emissor.movRbpRsp()
+        se (frameBytes > 0) emissor.subRspImm32(frameBytes)
+
+        se (fn.ehVariadica) {
+            para (var r: inteiro = 0; r < 6; r++) {
+                emissor.storeArgAbiRbp(r, fn.regSaveOffset - r * 8)
+            }
+            para (var x: inteiro = 0; x < 8; x++) {
+                emissor.storeXmmRbpDisp(x, -(fn.regSaveOffset - (48 + x * 16)))
+            }
+        }
+
+        var pInt: inteiro = 0
+        var pFlt: inteiro = 0
+        var pStk: inteiro = 0
+        para (var p: inteiro = 0; p < fn.aridade; p++) {
+            const offP: inteiro = fn.paramOffsets[p]
+            const largP: inteiro = fn.paramLarguras[p]
+            const ehFltP: logico = fn.paramEhFloat[p]
+            se (ehFltP) {
+                se (pFlt < 8) {
+                    se (largP == 4) {
+                        emissor.cvtsd2ssXmm0(pFlt)
+                        emissor.storeXmm0FloatRbpDisp(-offP)
+                    } senao {
+                        emissor.storeXmmRbpDisp(pFlt, -offP)
+                    }
+                    pFlt++
+                } senao {
+                    const stkOff: inteiro = 16 + pStk * 8
+                    emissor.loadXmmRbpDisp(0, stkOff)
+                    se (largP == 4) {
+                        emissor.cvtsd2ssXmm0(0)
+                        emissor.storeXmm0FloatRbpDisp(-offP)
+                    } senao {
+                        emissor.storeXmmRbpDisp(0, -offP)
+                    }
+                    pStk++
+                }
+            } senao {
+                se (pInt < 6) {
+                    emissor.storeArgAbiRbp(pInt, offP)
+                    pInt++
+                } senao {
+                    const stkOff: inteiro = 16 + pStk * 8
+                    emissor.loadRaxRbpDisp(stkOff)
+                    emissor.storeRaxRbp(offP)
+                    pStk++
+                }
+            }
+        }
+
+        para (var b: inteiro = 0; b < fn.blocos.tamanho(); b++) {
+            const bb: qualquer = fn.blocos[b]
+            emissor.marcarLabel("bb_" + fn.nome + "_" + bb.nome)
+
+            para (var i: inteiro = 0; i < bb.insts.tamanho(); i++) {
+                const inst: qualquer = bb.insts[i]
+                const op: qualquer = inst.op
+
+                escolha (op) {
+                    caso OpI.Const:
+                    emissor.movRaxImm64(inst.a)
+                    emissor.storeRaxRbp(offRegObj(fn.tamanhoLocaisBytes, inst.dst))
+                    caso OpI.FConst:
+                    const fBits: inteiro = tMod.doubleParaBitsIEEE754(inst.fval)
+                    emissor.movRaxImm64(fBits)
+                    emissor.storeRaxRbp(offRegObj(fn.tamanhoLocaisBytes, inst.dst))
+                    caso OpI.Copy:
+                    emissor.loadRaxRbp(offRegObj(fn.tamanhoLocaisBytes, inst.a))
+                    emissor.storeRaxRbp(offRegObj(fn.tamanhoLocaisBytes, inst.dst))
+                    caso OpI.AddrSlot:
+                    emissor.leaRaxRbp(inst.a)
+                    emissor.storeRaxRbp(offRegObj(fn.tamanhoLocaisBytes, inst.dst))
+                    caso OpI.AddrRbpDisp:
+                    emissor.leaRaxRbpDisp(inst.a)
+                    emissor.storeRaxRbp(offRegObj(fn.tamanhoLocaisBytes, inst.dst))
+                    caso OpI.AddrGlobal:
+                    const secG: texto = texto(mapaGlobalSec[inst.alvo1])
+                    const offG: inteiro = inteiro(mapaGlobalOff[inst.alvo1])
+                    emissor.leaRaxRipReloc(secG, offG - 4)
+                    emissor.storeRaxRbp(offRegObj(fn.tamanhoLocaisBytes, inst.dst))
+                    caso OpI.AddrExternGlobal:
+                    emissor.movRaxGotReloc(inst.alvo1)
+                    emissor.storeRaxRbp(offRegObj(fn.tamanhoLocaisBytes, inst.dst))
+                    caso OpI.AddrFunc:
+                    se (funcoesLocais.contem(inst.alvo1)) {
+                        emissor.leaRaxRipLabel("fn_" + inst.alvo1)
+                    } senao {
+                        externosExtras[inst.alvo1] = verdadeiro
+                        emissor.movRaxGotReloc(inst.alvo1)
+                    }
+                    emissor.storeRaxRbp(offRegObj(fn.tamanhoLocaisBytes, inst.dst))
+                    caso OpI.AddrStr:
+                    emissor.leaRaxRipReloc(".rodata", strOffsets[inst.a] - 4)
+                    emissor.storeRaxRbp(offRegObj(fn.tamanhoLocaisBytes, inst.dst))
+                    caso OpI.Alloca:
+                    emissor.loadRaxRbp(offRegObj(fn.tamanhoLocaisBytes, inst.a))
+                    emissor.u8(72)
+                    emissor.u8(131)
+                    emissor.u8(192)
+                    emissor.u8(15)
+                    emissor.u8(72)
+                    emissor.u8(131)
+                    emissor.u8(224)
+                    emissor.u8(240)
+                    emissor.u8(72)
+                    emissor.u8(41)
+                    emissor.u8(196)
+                    emissor.u8(72)
+                    emissor.u8(137)
+                    emissor.u8(224)
+                    emissor.storeRaxRbp(offRegObj(fn.tamanhoLocaisBytes, inst.dst))
+                    caso OpI.Load:
+                    emissor.loadRaxRbp(offRegObj(fn.tamanhoLocaisBytes, inst.a))
+                    emissor.loadSizedFromPtrRax(inst.largura, inst.ehSemSinal)
+                    emissor.storeRaxRbp(offRegObj(fn.tamanhoLocaisBytes, inst.dst))
+                    caso OpI.Store:
+                    emissor.loadRaxRbp(offRegObj(fn.tamanhoLocaisBytes, inst.a))
+                    emissor.loadRcxRbp(offRegObj(fn.tamanhoLocaisBytes, inst.b))
+                    emissor.storeSizedRcxToPtrRax(inst.largura)
+                    caso OpI.FLoad:
+                    emissor.loadRaxRbp(offRegObj(fn.tamanhoLocaisBytes, inst.a))
+                    emissor.floadFromPtrRax(inst.largura)
+                    emissor.storeXmmRbpDisp(0, -offRegObj(fn.tamanhoLocaisBytes, inst.dst))
+                    caso OpI.FStore:
+                    emissor.loadRaxRbp(offRegObj(fn.tamanhoLocaisBytes, inst.a))
+                    emissor.loadXmmRbpDisp(0, -offRegObj(fn.tamanhoLocaisBytes, inst.b))
+                    emissor.fstoreToPtrRax(inst.largura)
+                    caso OpI.Neg:
+                    emissor.loadRaxRbp(offRegObj(fn.tamanhoLocaisBytes, inst.a))
+                    emissor.u8(72)
+                    emissor.u8(247)
+                    emissor.u8(216)
+                    emissor.storeRaxRbp(offRegObj(fn.tamanhoLocaisBytes, inst.dst))
+                    caso OpI.BitNot:
+                    emissor.loadRaxRbp(offRegObj(fn.tamanhoLocaisBytes, inst.a))
+                    emissor.u8(72)
+                    emissor.u8(247)
+                    emissor.u8(208)
+                    emissor.storeRaxRbp(offRegObj(fn.tamanhoLocaisBytes, inst.dst))
+                    caso OpI.LogNot:
+                    emissor.loadRaxRbp(offRegObj(fn.tamanhoLocaisBytes, inst.a))
+                    emissor.testRaxRax()
+                    emissor.u8(15)
+                    emissor.u8(148)
+                    emissor.u8(192)
+                    emissor.movzxRaxAl()
+                    emissor.storeRaxRbp(offRegObj(fn.tamanhoLocaisBytes, inst.dst))
+                    caso OpI.ToBool:
+                    emissor.loadRaxRbp(offRegObj(fn.tamanhoLocaisBytes, inst.a))
+                    emissor.testRaxRax()
+                    emissor.u8(15)
+                    emissor.u8(149)
+                    emissor.u8(192)
+                    emissor.movzxRaxAl()
+                    emissor.storeRaxRbp(offRegObj(fn.tamanhoLocaisBytes, inst.dst))
+                    caso OpI.TruncSext:
+                    emissor.loadRaxRbp(offRegObj(fn.tamanhoLocaisBytes, inst.a))
+                    emissor.truncRax(inst.largura, falso)
+                    emissor.storeRaxRbp(offRegObj(fn.tamanhoLocaisBytes, inst.dst))
+                    caso OpI.TruncZext:
+                    emissor.loadRaxRbp(offRegObj(fn.tamanhoLocaisBytes, inst.a))
+                    emissor.truncRax(inst.largura, verdadeiro)
+                    emissor.storeRaxRbp(offRegObj(fn.tamanhoLocaisBytes, inst.dst))
+                    caso OpI.ItoF:
+                    emissor.loadRaxRbp(offRegObj(fn.tamanhoLocaisBytes, inst.a))
+                    emissor.u8(242)
+                    emissor.u8(72)
+                    emissor.u8(15)
+                    emissor.u8(42)
+                    emissor.u8(192)
+                    emissor.storeXmmRbpDisp(0, -offRegObj(fn.tamanhoLocaisBytes, inst.dst))
+                    caso OpI.FtoI:
+                    emissor.loadXmmRbpDisp(0, -offRegObj(fn.tamanhoLocaisBytes, inst.a))
+                    emissor.u8(242)
+                    emissor.u8(72)
+                    emissor.u8(15)
+                    emissor.u8(44)
+                    emissor.u8(192)
+                    emissor.storeRaxRbp(offRegObj(fn.tamanhoLocaisBytes, inst.dst))
+                    caso OpI.FNeg:
+                    emissor.loadXmmRbpDisp(0, -offRegObj(fn.tamanhoLocaisBytes, inst.a))
+                    emissor.movRaxImm64(-9223372036854775807 - 1)
+                    emissor.u8(102)
+                    emissor.u8(72)
+                    emissor.u8(15)
+                    emissor.u8(110)
+                    emissor.u8(200)
+                    emissor.u8(102)
+                    emissor.u8(15)
+                    emissor.u8(87)
+                    emissor.u8(193)
+                    emissor.storeXmmRbpDisp(0, -offRegObj(fn.tamanhoLocaisBytes, inst.dst))
+                    caso OpI.FAdd:
+                    caso OpI.FSub:
+                    caso OpI.FMul:
+                    caso OpI.FDiv:
+                    emissor.loadXmmRbpDisp(0, -offRegObj(fn.tamanhoLocaisBytes, inst.a))
+                    emissor.loadXmmRbpDisp(1, -offRegObj(fn.tamanhoLocaisBytes, inst.b))
+                    emissor.u8(242)
+                    emissor.u8(15)
+                    se (op == OpI.FAdd) emissor.u8(88)
+                    senao se (op == OpI.FSub) emissor.u8(92)
+                    senao se (op == OpI.FMul) emissor.u8(89)
+                    senao emissor.u8(94)
+                    emissor.u8(193)
+                    emissor.storeXmmRbpDisp(0, -offRegObj(fn.tamanhoLocaisBytes, inst.dst))
+                    caso OpI.FEq:
+                    caso OpI.FNeq:
+                    caso OpI.FLt:
+                    caso OpI.FLe:
+                    caso OpI.FGt:
+                    caso OpI.FGe:
+                    emissor.loadXmmRbpDisp(0, -offRegObj(fn.tamanhoLocaisBytes, inst.a))
+                    emissor.loadXmmRbpDisp(1, -offRegObj(fn.tamanhoLocaisBytes, inst.b))
+                    emissor.u8(102)
+                    emissor.u8(15)
+                    emissor.u8(46)
+                    emissor.u8(193)
+                    emissor.u8(15)
+                    se (op == OpI.FEq) emissor.u8(148)
+                    senao se (op == OpI.FNeq) emissor.u8(149)
+                    senao se (op == OpI.FLt) emissor.u8(146)
+                    senao se (op == OpI.FLe) emissor.u8(150)
+                    senao se (op == OpI.FGt) emissor.u8(151)
+                    senao emissor.u8(147)
+                    emissor.u8(192)
+                    emissor.movzxRaxAl()
+                    emissor.storeRaxRbp(offRegObj(fn.tamanhoLocaisBytes, inst.dst))
+                    caso OpI.Br:
+                    emissor.jmpLabel("bb_" + fn.nome + "_" + inst.alvo1)
+                    caso OpI.BrCond:
+                    emissor.loadRaxRbp(offRegObj(fn.tamanhoLocaisBytes, inst.a))
+                    emissor.testRaxRax()
+                    emissor.jzLabel("bb_" + fn.nome + "_" + inst.alvo2)
+                    emissor.jmpLabel("bb_" + fn.nome + "_" + inst.alvo1)
+                    caso OpI.Ret:
+                    emissor.loadRaxRbp(offRegObj(fn.tamanhoLocaisBytes, inst.a))
+                    emissor.movRspRbp()
+                    emissor.popRbp()
+                    emissor.retInst()
+                    caso OpI.FRet:
+                    emissor.loadXmmRbpDisp(0, -offRegObj(fn.tamanhoLocaisBytes, inst.a))
+                    emissor.movRspRbp()
+                    emissor.popRbp()
+                    emissor.retInst()
+                    caso OpI.Call:
+                    emitirCallObj(emissor, fn, inst, falso, falso)
+                    caso OpI.CallExtern:
+                    emitirCallObj(emissor, fn, inst, verdadeiro, falso)
+                    caso OpI.CallIndirect:
+                    emitirCallObj(emissor, fn, inst, falso, verdadeiro)
+                    padrao:
+                    emissor.loadRaxRbp(offRegObj(fn.tamanhoLocaisBytes, inst.a))
+                    emissor.loadRcxRbp(offRegObj(fn.tamanhoLocaisBytes, inst.b))
+                    emissor.emitirBinariaInt(op, OpI)
+                    emissor.storeRaxRbp(offRegObj(fn.tamanhoLocaisBytes, inst.dst))
+                }
+            }
+        }
+        const tamFn: inteiro = emissor.code.tamanho() - inicioFn
+        obj.simbolos.empilhar(SimboloObj(fn.nome, "TEXT", inicioFn, tamFn, !fn.ehStatic,
+            2))
+    }
+
+    emissor.resolverPatchesInternos()
+    obj.textBytes = emissor.code
+    obj.relocsText = emissor.relocs
+
+    // Registra simbolos externos indefinidos (funcoes e dados)
+    var extVistos: dicionario = {}
+    para (var i: inteiro = 0; i < modulo.externos.tamanho(); i++) {
+        const nm: texto = modulo.externos[i]
+        se (!extVistos.contem(nm)) {
+            extVistos[nm] = verdadeiro
+            obj.simbolos.empilhar(SimboloObj(nm, "UNDEF", 0, 0, verdadeiro, 0))
+        }
+    }
+
+    para (var i: inteiro = 0; i < modulo.externosDados.tamanho(); i++) {
+        const nm: texto = modulo.externosDados[i]
+        se (!extVistos.contem(nm)) {
+            extVistos[nm] = verdadeiro
+            obj.simbolos.empilhar(SimboloObj(nm, "UNDEF", 0, 0, verdadeiro, 0))
+        }
+    }
+
+    const chavesEx: texto[] = externosExtras.chaves()
+    para (var i: inteiro = 0; i < chavesEx.tamanho(); i++) {
+        const nm: texto = chavesEx[i]
+        se (!extVistos.contem(nm)) {
+            extVistos[nm] = verdadeiro
+            obj.simbolos.empilhar(SimboloObj(nm, "UNDEF", 0, 0, verdadeiro, 0))
+        }
+    }
+
+    retorna obj
+}

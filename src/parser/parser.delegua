@@ -1,0 +1,1693 @@
+// Fase 2: AST tipada por Enums e Parser ISO C99 / GNU99 para o DCC (Delegua C Compiler).
+// Suporta declaracoes reais dos headers do sistema (/usr/include), camada formal GNU (Cat A/B/C),
+// bit-fields, struct/union anonimos, forward declarations, __asm__("sym"), __attribute__((...)),
+// __builtin_va_list/__builtin_offsetof, ponteiros de funcao complexos, VLAs e literais compostos.
+
+classe NoAST {
+    kind: qualquer
+    opBin: qualquer
+    opUn: qualquer
+    nome: texto
+    nomeSimboloLink: texto
+    textoLit: texto
+    valor: inteiro
+    valorReal: real
+    tipoC: qualquer
+    ehSeta: logico
+    ehExtern: logico
+    ehStatic: logico
+    ehVariadica: logico
+    ehSemSinal: logico
+    ehLongo: logico
+    ehPacked: logico
+    alinhamentoExplicito: inteiro
+    ehBitField: logico
+    bitWidth: inteiro
+    linha: inteiro
+    coluna: inteiro
+    filhos: NoAST[]
+
+    construtor(kind: qualquer, linha: inteiro = 0, coluna: inteiro = 1) {
+        isto.kind = kind
+        isto.opBin = 0
+        isto.opUn = 0
+        isto.nome = ""
+        isto.nomeSimboloLink = ""
+        isto.textoLit = ""
+        isto.valor = 0
+        isto.valorReal = 0.0
+        isto.tipoC = nulo
+        isto.ehSeta = falso
+        isto.ehExtern = falso
+        isto.ehStatic = falso
+        isto.ehVariadica = falso
+        isto.ehSemSinal = falso
+        isto.ehLongo = falso
+        isto.ehPacked = falso
+        isto.alinhamentoExplicito = 0
+        isto.ehBitField = falso
+        isto.bitWidth = 0
+        isto.linha = linha
+        isto.coluna = coluna
+        isto.filhos = []
+    }
+}
+
+funcao normalizarNomeAtributo(bruto: texto): texto {
+    var ini: inteiro = 0
+    var fim: inteiro = bruto.tamanho()
+    se (fim >= 4 e bruto[0] == "_" e bruto[1] == "_" e bruto[fim - 1] == "_" e bruto[fim - 2] == "_") {
+        ini = 2
+        fim = fim - 2
+    }
+
+    var out: texto[] = []
+    para (var i: inteiro = ini; i < fim; i++) out.empilhar(bruto[i])
+    retorna out.juntar("")
+}
+
+classe ParserDCC {
+    tMod: qualquer
+    Tok: qualquer
+    Kind: qualquer
+    OpB: qualquer
+    OpU: qualquer
+    TB: qualquer
+    diag: qualquer
+    modoGnu: logico
+    tokens: qualquer[]
+    pos: inteiro
+    typedefs: dicionario
+    enumConsts: dicionario
+    declsPendentes: NoAST[]
+    contAnon: inteiro
+    mapaAtrib: dicionario
+    mapaRel: dicionario
+    mapaFator: dicionario
+    mapaUnario: dicionario
+    attrsCatA: dicionario
+
+    construtor(tokens: qualquer[], diag: qualquer, modoGnu: logico = falso) {
+        isto.tMod = importar("../types/tipos.delegua")
+        isto.Tok = isto.tMod.TokC99
+        isto.Kind = isto.tMod.NoKind
+        isto.OpB = isto.tMod.OpBin
+        isto.OpU = isto.tMod.OpUn
+        isto.TB = isto.tMod.TipoBase
+        isto.diag = diag
+        isto.modoGnu = modoGnu
+        isto.tokens = tokens
+        isto.pos = 0
+        isto.typedefs = {}
+        isto.enumConsts = {}
+        isto.declsPendentes = []
+        isto.contAnon = 0
+
+        isto.mapaAtrib = {
+            "=": isto.OpB.Assign,
+            "+=": isto.OpB.AddAssign,
+            "-=": isto.OpB.SubAssign,
+            "*=": isto.OpB.MulAssign,
+            "/=": isto.OpB.DivAssign,
+            "%=": isto.OpB.ModAssign,
+            "&=": isto.OpB.BitAndAssign,
+            "|=": isto.OpB.BitOrAssign,
+            "^=": isto.OpB.BitXorAssign,
+            "<<=": isto.OpB.ShlAssign,
+            ">>=": isto.OpB.ShrAssign
+        }
+        isto.mapaRel = {
+            "<": isto.OpB.Lt,
+            "<=": isto.OpB.Le,
+            ">": isto.OpB.Gt,
+            ">=": isto.OpB.Ge
+        }
+        isto.mapaFator = {
+            "*": isto.OpB.Mul,
+            "/": isto.OpB.Div,
+            "%": isto.OpB.Mod
+        }
+        isto.mapaUnario = {
+            "-": isto.OpU.Neg,
+            "+": isto.OpU.Pos,
+            "!": isto.OpU.LogNot,
+            "~": isto.OpU.BitNot,
+            "*": isto.OpU.Deref,
+            "&": isto.OpU.AddrOf,
+            "++": isto.OpU.PreInc,
+            "--": isto.OpU.PreDec
+        }
+        // Categoria A: metadados e dicas de otimizacao/diagnostico que nao alteram layout nem ABI
+        isto.attrsCatA = {
+            "nonnull": verdadeiro,
+            "format": verdadeiro,
+            "format_arg": verdadeiro,
+            "noreturn": verdadeiro,
+            "pure": verdadeiro,
+            "const": verdadeiro,
+            "malloc": verdadeiro,
+            "nothrow": verdadeiro,
+            "leaf": verdadeiro,
+            "deprecated": verdadeiro,
+            "unused": verdadeiro,
+            "used": verdadeiro,
+            "warn_unused_result": verdadeiro,
+            "always_inline": verdadeiro,
+            "noinline": verdadeiro,
+            "cold": verdadeiro,
+            "hot": verdadeiro,
+            "visibility": verdadeiro,
+            "access": verdadeiro,
+            "alloc_size": verdadeiro,
+            "returns_twice": verdadeiro,
+            "returns_nonnull": verdadeiro,
+            "sentinel": verdadeiro,
+            "artificial": verdadeiro,
+            "gnu_inline": verdadeiro,
+            "may_alias": verdadeiro,
+            "weak": verdadeiro,
+            "fd_arg": verdadeiro,
+            "fd_arg_read": verdadeiro,
+            "fd_arg_write": verdadeiro,
+            "null_terminated_string_arg": verdadeiro,
+            "externally_visible": verdadeiro,
+            "no_sanitize": verdadeiro,
+            "fallthrough": verdadeiro,
+            "error": verdadeiro,
+            "warning": verdadeiro
+        }
+    }
+
+    atual(): qualquer {
+        retorna isto.tokens[isto.pos]
+    }
+
+    espiar(desloc: inteiro): qualquer {
+        const idx: inteiro = isto.pos + desloc
+        se (idx >= isto.tokens.tamanho()) retorna isto.tokens[isto.tokens.tamanho() - 1]
+        retorna isto.tokens[idx]
+    }
+
+    avancar(): qualquer {
+        const t: qualquer = isto.tokens[isto.pos]
+        isto.pos++
+        retorna t
+    }
+
+    consumir(tag: qualquer, msg: texto): qualquer {
+        se (isto.atual().tag != tag) {
+            isto.diag.erroEm(isto.atual().linha, isto.atual().coluna, "${msg}, encontrado '${isto.atual().lexema}'")
+        }
+        retorna isto.avancar()
+    }
+
+    // Classificador formal GNU __attribute__((...)) — Cat A (metadado), Cat B (layout/ABI), Cat C (erro explicito)
+    lerAtributosGNU()
+
+    : (logico, inteiro) {
+        var ehPacked: logico = falso
+        var alinhExp: inteiro = 0
+        enquanto (isto.atual().tag == isto.Tok.KwAttribute) {
+            isto.avancar()
+            isto.consumir(isto.Tok.LParen, "'(' esperado apos __attribute__")
+            isto.consumir(isto.Tok.LParen, "'((' esperado em __attribute__")
+            enquanto (isto.atual().tag != isto.Tok.RParen e isto.atual().tag != isto.Tok.Fim) {
+                se (isto.atual().tag == isto.Tok.Comma) {
+                    isto.avancar()
+                    continua
+                }
+                const tokAttr: qualquer = isto.avancar()
+                const norm: texto = normalizarNomeAtributo(tokAttr.lexema)
+                var argsExpr: NoAST[] = []
+                se (isto.atual().tag == isto.Tok.LParen) {
+                    isto.avancar()
+                    var depth: inteiro = 1
+                    se (norm == "aligned" e isto.atual().tag != isto.Tok.RParen) {
+                        argsExpr.empilhar(isto.parseExprAtribOuCond())
+                    }
+                    enquanto (depth > 0 e isto.atual().tag != isto.Tok.Fim) {
+                        se (isto.atual().tag == isto.Tok.LParen) depth++
+                        senao se (isto.atual().tag == isto.Tok.RParen) depth--
+                        isto.avancar()
+                    }
+                }
+
+                // Categoria B: layout / alinhamento
+                se (norm == "packed") {
+                    ehPacked = verdadeiro
+                } senao se (norm == "aligned") {
+                    se (argsExpr.tamanho() > 0) {
+                        const valAl: inteiro = isto.avaliarConstSimples(argsExpr[0])
+                        se (valAl > alinhExp) alinhExp = valAl
+                    } senao {
+                        se (16 > alinhExp) alinhExp = 16
+                    }
+                } senao se (isto.attrsCatA.contem(norm)) {
+                    // Categoria A: metadado aceito sem alterar semantica/ABI
+                    var noopA: inteiro = 0
+                } senao {
+                    // Categoria C: atributo nao suportado -> erro explicito, nunca ignorar silenciosamente!
+                    isto.diag.erroEm(tokAttr.linha, tokAttr.coluna, "atributo GNU nao suportado (Categoria C): '${tokAttr.lexema}'")
+                }
+            }
+            isto.consumir(isto.Tok.RParen, "')' esperado em __attribute__")
+            isto.consumir(isto.Tok.RParen, "'))' esperado em __attribute__")
+        }
+        retorna tupla([ehPacked, alinhExp])
+    }
+
+    // Redirecionamento de simbolo GNU: __asm__("nome_simbolo") em prototipos/externs (Cat B)
+    lerAsmSimboloLink(): texto {
+        se (isto.atual().tag != isto.Tok.KwAsm) retorna ""
+        isto.avancar()
+        isto.consumir(isto.Tok.LParen, "'(' esperado apos __asm__")
+        const tokStr: qualquer = isto.consumir(isto.Tok.StrLit, "string de simbolo esperada em __asm__")
+        isto.consumir(isto.Tok.RParen, "')' esperado em __asm__")
+        retorna tokStr.lexema
+    }
+
+    iniciaTipoEm(desloc: inteiro): logico {
+        const t: qualquer = isto.espiar(desloc)
+        const tag: qualquer = t.tag
+        se (tag == isto.Tok.KwExtension ou tag == isto.Tok.KwAttribute ou tag == isto.Tok.KwTypeof) {
+            retorna verdadeiro
+        }
+        se (tag == isto.Tok.KwConst ou tag == isto.Tok.KwVolatile ou tag == isto.Tok.KwRestrict ou tag == isto.Tok.KwInline ou tag == isto.Tok.KwStatic ou tag == isto.Tok.KwExtern ou tag == isto.Tok.KwAuto ou tag == isto.Tok.KwRegister) {
+            retorna verdadeiro
+        }
+        se (tag == isto.Tok.KwVoid ou tag == isto.Tok.KwBool ou tag == isto.Tok.KwChar ou tag == isto.Tok.KwShort ou tag == isto.Tok.KwInt ou tag == isto.Tok.KwLong ou tag == isto.Tok.KwSigned ou tag == isto.Tok.KwUnsigned ou tag == isto.Tok.KwFloat ou tag == isto.Tok.KwDouble ou tag == isto.Tok.KwFloat32 ou tag == isto.Tok.KwFloat64 ou tag == isto.Tok.KwFloat32x ou tag == isto.Tok.KwFloat64x ou tag == isto.Tok.KwBuiltinVaList ou tag == isto.Tok.KwStruct ou tag == isto.Tok.KwUnion ou tag == isto.Tok.KwEnum) {
+            retorna verdadeiro
+        }
+        se (tag == isto.Tok.Ident e isto.typedefs.contem(t.lexema)) {
+            retorna verdadeiro
+        }
+        retorna falso
+    }
+
+    iniciaTipo(): logico {
+        retorna isto.iniciaTipoEm(0)
+    }
+
+    lerTipoBase()
+
+    : (qualquer, logico, logico) {
+        var ehExtern: logico = falso
+        var ehStatic: logico = falso
+        var viuSigned: logico = falso
+        var viuUnsigned: logico = falso
+        var viuShort: logico = falso
+        var viuLong: inteiro = 0
+        var viuChar: logico = falso
+        var viuInt: logico = falso
+        var viuVoid: logico = falso
+        var viuBool: logico = falso
+        var viuFloat: logico = falso
+        var viuDouble: logico = falso
+        var tipoExplicito: qualquer = nulo
+        var consumiuAlgo: logico = falso
+        var alinhAttr: inteiro = 0
+
+        enquanto (verdadeiro) {
+            const t: qualquer = isto.atual()
+            const tag: qualquer = t.tag
+            se (tag == isto.Tok.KwExtension) {
+                isto.avancar()
+                continua
+            }
+            se (tag == isto.Tok.KwAttribute) {
+                const attrInfo: (logico, inteiro) = isto.lerAtributosGNU()
+                se (attrInfo[1] > alinhAttr) alinhAttr = attrInfo[1]
+                continua
+            }
+            se (tag == isto.Tok.KwConst ou tag == isto.Tok.KwVolatile ou tag == isto.Tok.KwRestrict ou tag == isto.Tok.KwInline ou tag == isto.Tok.KwAuto ou tag == isto.Tok.KwRegister) {
+                isto.avancar()
+                consumiuAlgo = verdadeiro
+                continua
+            }
+            se (tag == isto.Tok.KwExtern) {
+                isto.avancar()
+                ehExtern = verdadeiro
+                consumiuAlgo = verdadeiro
+                continua
+            }
+            se (tag == isto.Tok.KwStatic) {
+                isto.avancar()
+                ehStatic = verdadeiro
+                consumiuAlgo = verdadeiro
+                continua
+            }
+            se (tag == isto.Tok.KwSigned) {
+                isto.avancar()
+                viuSigned = verdadeiro
+                consumiuAlgo = verdadeiro
+                continua
+            }
+            se (tag == isto.Tok.KwUnsigned) {
+                isto.avancar()
+                viuUnsigned = verdadeiro
+                consumiuAlgo = verdadeiro
+                continua
+            }
+            se (tag == isto.Tok.KwShort) {
+                isto.avancar()
+                viuShort = verdadeiro
+                consumiuAlgo = verdadeiro
+                continua
+            }
+            se (tag == isto.Tok.KwLong) {
+                isto.avancar()
+                viuLong++
+                consumiuAlgo = verdadeiro
+                continua
+            }
+            se (tag == isto.Tok.KwChar) {
+                isto.avancar()
+                viuChar = verdadeiro
+                consumiuAlgo = verdadeiro
+                continua
+            }
+            se (tag == isto.Tok.KwInt) {
+                isto.avancar()
+                viuInt = verdadeiro
+                consumiuAlgo = verdadeiro
+                continua
+            }
+            se (tag == isto.Tok.KwVoid) {
+                isto.avancar()
+                viuVoid = verdadeiro
+                consumiuAlgo = verdadeiro
+                continua
+            }
+            se (tag == isto.Tok.KwBool) {
+                isto.avancar()
+                viuBool = verdadeiro
+                consumiuAlgo = verdadeiro
+                continua
+            }
+            se (tag == isto.Tok.KwFloat ou tag == isto.Tok.KwFloat32) {
+                isto.avancar()
+                viuFloat = verdadeiro
+                consumiuAlgo = verdadeiro
+                continua
+            }
+            se (tag == isto.Tok.KwDouble ou tag == isto.Tok.KwFloat64 ou tag == isto.Tok.KwFloat32x) {
+                isto.avancar()
+                viuDouble = verdadeiro
+                consumiuAlgo = verdadeiro
+                continua
+            }
+            se (tag == isto.Tok.KwFloat64x) {
+                isto.avancar()
+                tipoExplicito = isto.tMod.TipoC.tipoLongDouble()
+                consumiuAlgo = verdadeiro
+                continua
+            }
+            se (tag == isto.Tok.KwBuiltinVaList) {
+                isto.avancar()
+                tipoExplicito = isto.tMod.TipoC.tipoBuiltinVaList()
+                consumiuAlgo = verdadeiro
+                continua
+            }
+            se (tag == isto.Tok.KwTypeof e tipoExplicito == nulo) {
+                isto.avancar()
+                isto.consumir(isto.Tok.LParen, "'(' esperado apos typeof")
+                se (isto.iniciaTipo()) {
+                    tipoExplicito = isto.lerTipoAbstrato()
+                } senao {
+                    const exprT: NoAST = isto.parseExpr()
+                    tipoExplicito = exprT.kind == isto.Kind.ExprFloat ? isto.tMod.TipoC.tipoDouble() : isto.tMod.TipoC.tipoInt(falso)
+                }
+                isto.consumir(isto.Tok.RParen, "')' esperado em typeof")
+                consumiuAlgo = verdadeiro
+                continua
+            }
+            se ((tag == isto.Tok.KwStruct ou tag == isto.Tok.KwUnion) e tipoExplicito == nulo) {
+                const ehUnion: logico = tag == isto.Tok.KwUnion
+                const linS: inteiro = t.linha
+                isto.avancar()
+                const attrAntes: (logico, inteiro) = isto.lerAtributosGNU()
+                var nomeA: texto = ""
+                se (isto.atual().tag == isto.Tok.Ident) {
+                    nomeA = isto.avancar().lexema
+                } senao {
+                    isto.contAnon++
+                    nomeA = "__anon_${isto.contAnon}"
+                }
+                se (isto.atual().tag == isto.Tok.LBrace) {
+                    const declAg: NoAST = isto.parseCorpoAgregado(nomeA, ehUnion, linS)
+                    const attrDepois: (logico, inteiro) = isto.lerAtributosGNU()
+                    declAg.ehPacked = attrAntes[0] ou attrDepois[0]
+                    const maxAl: inteiro = attrAntes[1] > attrDepois[1] ? attrAntes[1] : attrDepois[1]
+                    declAg.alinhamentoExplicito = maxAl
+                    isto.declsPendentes.empilhar(declAg)
+                }
+                tipoExplicito = ehUnion ? isto.tMod.TipoC.deUnion(nomeA) : isto.tMod.TipoC.deStruct(nomeA)
+                consumiuAlgo = verdadeiro
+                continua
+            }
+            se (tag == isto.Tok.KwEnum e tipoExplicito == nulo) {
+                const linE: inteiro = t.linha
+                isto.avancar()
+                var nomeE: texto = ""
+                se (isto.atual().tag == isto.Tok.Ident) {
+                    nomeE = isto.avancar().lexema
+                } senao {
+                    isto.contAnon++
+                    nomeE = "__enum_${isto.contAnon}"
+                }
+                se (isto.atual().tag == isto.Tok.LBrace) {
+                    const declE: NoAST = isto.parseCorpoEnum(nomeE, linE)
+                    isto.declsPendentes.empilhar(declE)
+                }
+                tipoExplicito = isto.tMod.TipoC.tipoInt(falso)
+                consumiuAlgo = verdadeiro
+                continua
+            }
+            const temTipoBase: logico = tipoExplicito != nulo ou viuVoid ou viuBool ou viuChar ou viuShort ou viuInt ou viuLong > 0 ou viuSigned ou viuUnsigned ou viuFloat ou viuDouble
+            se (tag == isto.Tok.Ident e !temTipoBase e isto.typedefs.contem(t.lexema)) {
+                isto.avancar()
+                tipoExplicito = isto.typedefs[t.lexema]
+                consumiuAlgo = verdadeiro
+                continua
+            }
+            sustar
+        }
+
+        se (!consumiuAlgo) {
+            isto.diag.erroEm(isto.atual().linha, isto.atual().coluna, "tipo esperado, encontrado '${isto.atual().lexema}'")
+        }
+
+        var resTipo: qualquer = tipoExplicito
+        se (resTipo == nulo) {
+            se (viuVoid) resTipo = isto.tMod.TipoC.tipoVoid()
+            senao se (viuBool) resTipo = isto.tMod.TipoC.tipoBool()
+            senao se (viuDouble e viuLong > 0) resTipo = isto.tMod.TipoC.tipoLongDouble()
+            senao se (viuDouble) resTipo = isto.tMod.TipoC.tipoDouble()
+            senao se (viuFloat) resTipo = isto.tMod.TipoC.tipoFloat()
+            senao se (viuChar) resTipo = isto.tMod.TipoC.tipoChar(viuUnsigned)
+            senao se (viuShort) resTipo = isto.tMod.TipoC.tipoShort(viuUnsigned)
+            senao se (viuLong > 0) resTipo = isto.tMod.TipoC.tipoLong(viuUnsigned)
+            senao se (viuInt ou viuSigned ou viuUnsigned) resTipo = isto.tMod.TipoC.tipoInt(viuUnsigned)
+            senao resTipo = isto.tMod.TipoC.tipoInt(falso)
+        }
+        se (alinhAttr > 0) {
+            resTipo.alinhamentoExplicito = alinhAttr
+        }
+        retorna tupla([resTipo, ehExtern, ehStatic])
+    }
+
+    lerPonteiros(tipoAtual: qualquer): qualquer {
+        var t: qualquer = tipoAtual
+        enquanto (isto.atual().tag == isto.Tok.Vezes ou isto.atual().tag == isto.Tok.KwConst ou isto.atual().tag == isto.Tok.KwVolatile ou isto.atual().tag == isto.Tok.KwRestrict ou isto.atual().tag == isto.Tok.KwAttribute) {
+            se (isto.atual().tag == isto.Tok.Vezes) {
+                isto.avancar()
+                t = isto.tMod.TipoC.ponteiroPara(t)
+            } senao se (isto.atual().tag == isto.Tok.KwAttribute) {
+                isto.lerAtributosGNU()
+            } senao {
+                isto.avancar()
+            }
+        }
+        retorna t
+    }
+
+    lerDimensoesArray(tipoElem: qualquer): qualquer {
+        var dimsConst: inteiro[] = []
+        var dimsExpr: qualquer[] = []
+        var dimsVla: logico[] = []
+        enquanto (isto.atual().tag == isto.Tok.LBracket) {
+            isto.avancar()
+            // Qualificadores de parametro em C99: [restrict N], [static N], [const N]
+            enquanto (isto.atual().tag == isto.Tok.KwRestrict ou isto.atual().tag == isto.Tok.KwConst ou isto.atual().tag == isto.Tok.KwVolatile ou isto.atual().tag == isto.Tok.KwStatic) {
+                isto.avancar()
+            }
+            var tam: inteiro = 0
+            var ehVla: logico = falso
+            var exprV: qualquer = nulo
+            se (isto.atual().tag == isto.Tok.Vezes e isto.espiar(1).tag == isto.Tok.RBracket) {
+                isto.avancar()
+            } senao se (isto.atual().tag != isto.Tok.RBracket) {
+                const exprDim: NoAST = isto.parseExprAtribOuCond()
+                se (isto.ehConstSimples(exprDim)) {
+                    tam = isto.avaliarConstSimples(exprDim)
+                } senao {
+                    ehVla = verdadeiro
+                    exprV = exprDim
+                }
+            }
+            isto.consumir(isto.Tok.RBracket, "']' esperado em dimensao de array")
+            dimsConst.empilhar(tam)
+            dimsExpr.empilhar(exprV)
+            dimsVla.empilhar(ehVla)
+        }
+        var res: qualquer = tipoElem
+        para (var i: inteiro = dimsConst.tamanho() - 1; i >= 0; i--) {
+            se (dimsVla[i]) {
+                res = isto.tMod.TipoC.vlaDe(res, dimsExpr[i])
+            } senao {
+                res = isto.tMod.TipoC.arrayDe(res, dimsConst[i])
+            }
+        }
+        retorna res
+    }
+
+    ehConstSimples(no: NoAST): logico {
+        se (no.kind == isto.Kind.ExprInt) retorna verdadeiro
+        se (no.kind == isto.Kind.ExprVar e isto.enumConsts.contem(no.nome)) retorna verdadeiro
+        se (no.kind == isto.Kind.ExprCast) retorna isto.ehConstSimples(no.filhos[0])
+        se (no.kind == isto.Kind.ExprUnaria) {
+            se (no.opUn == isto.OpU.Neg ou no.opUn == isto.OpU.Pos ou no.opUn == isto.OpU.BitNot ou no.opUn == isto.OpU.LogNot) {
+                retorna isto.ehConstSimples(no.filhos[0])
+            }
+            retorna falso
+        }
+        se (no.kind == isto.Kind.ExprBinaria) {
+            retorna isto.ehConstSimples(no.filhos[0]) e isto.ehConstSimples(no.filhos[1])
+        }
+        se (no.kind == isto.Kind.ExprTernario) {
+            retorna isto.ehConstSimples(no.filhos[0]) e isto.ehConstSimples(no.filhos[1]) e isto.ehConstSimples(no.filhos[2])
+        }
+        retorna falso
+    }
+
+    avaliarConstSimples(no: NoAST): inteiro {
+        se (no.kind == isto.Kind.ExprInt) retorna no.valor
+        se (no.kind == isto.Kind.ExprVar e isto.enumConsts.contem(no.nome)) retorna inteiro(isto.enumConsts[no.nome])
+        se (no.kind == isto.Kind.ExprCast) retorna isto.avaliarConstSimples(no.filhos[0])
+        se (no.kind == isto.Kind.ExprUnaria) {
+            const v: inteiro = isto.avaliarConstSimples(no.filhos[0])
+            se (no.opUn == isto.OpU.Neg) retorna -v
+            se (no.opUn == isto.OpU.Pos) retorna v
+            se (no.opUn == isto.OpU.BitNot) retorna ~v
+            se (no.opUn == isto.OpU.LogNot) retorna v == 0 ? 1 : 0
+            retorna 0
+        }
+        se (no.kind == isto.Kind.ExprTernario) {
+            const c: inteiro = isto.avaliarConstSimples(no.filhos[0])
+            retorna c != 0 ? isto.avaliarConstSimples(no.filhos[1]) : isto.avaliarConstSimples(no.filhos[2])
+        }
+        se (no.kind == isto.Kind.ExprBinaria) {
+            const a: inteiro = isto.avaliarConstSimples(no.filhos[0])
+            const b: inteiro = isto.avaliarConstSimples(no.filhos[1])
+            escolha (no.opBin) {
+                caso isto.OpB.Add: retorna a + b
+                caso isto.OpB.Sub: retorna a - b
+                caso isto.OpB.Mul: retorna a * b
+                caso isto.OpB.Div: retorna b != 0 ? inteiro(a / b) : 0
+                caso isto.OpB.Mod: retorna b != 0 ? a % b : 0
+                caso isto.OpB.Shl: retorna a << b
+                caso isto.OpB.Shr: retorna a >> b
+                caso isto.OpB.BitAnd: retorna a & b
+                caso isto.OpB.BitOr: retorna a | b
+                caso isto.OpB.BitXor: retorna a ^ b
+                caso isto.OpB.Eq: retorna a == b ? 1 : 0
+                caso isto.OpB.Neq: retorna a != b ? 1 : 0
+                caso isto.OpB.Lt: retorna a < b ? 1 : 0
+                caso isto.OpB.Le: retorna a <= b ? 1 : 0
+                caso isto.OpB.Gt: retorna a > b ? 1 : 0
+                caso isto.OpB.Ge: retorna a >= b ? 1 : 0
+                caso isto.OpB.LogAnd: retorna (a != 0 e b != 0) ? 1 : 0
+                caso isto.OpB.LogOr: retorna (a != 0 ou b != 0) ? 1 : 0
+                padrao: retorna 0
+            }
+        }
+        retorna 0
+    }
+
+    inferirTamanhoArrayDeInic(tipoV: qualquer, inic: NoAST): qualquer {
+        se (tipoV.base != isto.TB.Array ou tipoV.tamArray != 0 ou tipoV.ehVLA) retorna tipoV
+        se (inic.kind == isto.Kind.ExprStr) {
+            const bytesMod: qualquer = importar("cgd:bytes")
+            const nBytes: inteiro = bytesMod.Bytes.deTexto(inic.textoLit).tamanho() + 1
+            retorna isto.tMod.TipoC.arrayDe(tipoV.alvo, nBytes)
+        }
+        se (inic.kind == isto.Kind.ExprInitList) {
+            var maxIdx: inteiro = 0
+            var seq: inteiro = 0
+            para (var k: inteiro = 0; k < inic.filhos.tamanho(); k++) {
+                const it: NoAST = inic.filhos[k]
+                se (it.kind == isto.Kind.ExprInicDesignado e it.ehSeta) {
+                    seq = it.valor + 1
+                } senao {
+                    seq++
+                }
+                se (seq > maxIdx) maxIdx = seq
+            }
+            retorna isto.tMod.TipoC.arrayDe(tipoV.alvo, maxIdx)
+        }
+        retorna tipoV
+    }
+
+    lerListaParamsTipo()
+
+    : (qualquer[], logico) {
+        isto.consumir(isto.Tok.LParen, "'(' esperado em lista de parametros")
+        var pTipos: qualquer[] = []
+        var variadica: logico = falso
+        se (isto.atual().tag != isto.Tok.RParen) {
+            se (isto.atual().tag == isto.Tok.KwVoid e isto.espiar(1).tag == isto.Tok.RParen) {
+                isto.avancar()
+            } senao {
+                enquanto (verdadeiro) {
+                    se (isto.atual().tag == isto.Tok.Ellipsis) {
+                        isto.avancar()
+                        variadica = verdadeiro
+                        sustar
+                    }
+                    const ptInfo: (qualquer, logico, logico) = isto.lerTipoBase()
+                    const pDecl: (qualquer, texto) = isto.lerDeclarador(ptInfo[0])
+                    var pT: qualquer = pDecl[0]
+                    se (pT.base == isto.TB.Array) pT = isto.tMod.TipoC.ponteiroPara(pT.alvo)
+                    pTipos.empilhar(pT)
+                    se (isto.atual().tag == isto.Tok.Comma) isto.avancar()
+                    senao sustar
+                }
+            }
+        }
+        isto.consumir(isto.Tok.RParen, "')' esperado em lista de parametros")
+        retorna tupla([pTipos, variadica])
+    }
+
+    // Declarador completo: ponteiros, (*fp)(...), (*fn(params...))(retParams...) (ex: signal.h), arrays
+    lerDeclarador(tipoBase: qualquer)
+
+    : (qualquer, texto) {
+        var t: qualquer = isto.lerPonteiros(tipoBase)
+        var nome: texto = ""
+
+        se (isto.atual().tag == isto.Tok.LParen e (isto.espiar(1).tag == isto.Tok.Vezes ou isto.espiar(1).tag == isto.Tok.LParen)) {
+            isto.avancar() // '('
+            var ptrsInternos: inteiro = 0
+            enquanto (isto.atual().tag == isto.Tok.Vezes ou isto.atual().tag == isto.Tok.KwConst ou isto.atual().tag == isto.Tok.KwVolatile ou isto.atual().tag == isto.Tok.KwRestrict) {
+                se (isto.atual().tag == isto.Tok.Vezes) ptrsInternos++
+                isto.avancar()
+            }
+            se (isto.atual().tag == isto.Tok.Ident) nome = isto.avancar().lexema
+
+            // Caso especial de declarador aninhado: void (*signal(int, void (*)(int)))(int)
+            se (isto.atual().tag == isto.Tok.LParen) {
+                const paramsExterno: (qualquer[], logico) = isto.lerListaParamsTipo()
+                isto.consumir(isto.Tok.RParen, "')' esperado em declarador de funcao")
+                const paramsRet: (qualquer[], logico) = isto.lerListaParamsTipo()
+                const retFnPtr: qualquer = isto.tMod.TipoC.ponteiroPara(isto.tMod.TipoC.funcaoTipo(t,
+                    paramsRet[0], paramsRet[1]))
+                const fnCompleta: qualquer = isto.tMod.TipoC.funcaoTipo(retFnPtr, paramsExterno[0],
+                    paramsExterno[1])
+                retorna tupla([fnCompleta, nome])
+            }
+
+            // Array de ponteiros de funcao: int (*ops[4])(int)
+            var dimFp: inteiro = 0
+            var ehArrFp: logico = falso
+            se (isto.atual().tag == isto.Tok.LBracket) {
+                ehArrFp = verdadeiro
+                isto.avancar()
+                se (isto.atual().tag != isto.Tok.RBracket) {
+                    dimFp = isto.avaliarConstSimples(isto.parseExprAtribOuCond())
+                }
+                isto.consumir(isto.Tok.RBracket, "']' esperado")
+            }
+            isto.consumir(isto.Tok.RParen, "')' esperado em ponteiro para funcao")
+            const paramsFp: (qualquer[], logico) = isto.lerListaParamsTipo()
+            var fnTipo: qualquer = isto.tMod.TipoC.funcaoTipo(t, paramsFp[0], paramsFp[1])
+            para (var k: inteiro = 0; k < ptrsInternos; k++) {
+                fnTipo = isto.tMod.TipoC.ponteiroPara(fnTipo)
+            }
+            se (ehArrFp) fnTipo = isto.tMod.TipoC.arrayDe(fnTipo, dimFp)
+            retorna tupla([fnTipo, nome])
+        }
+
+        se (isto.atual().tag == isto.Tok.Ident) {
+            nome = isto.avancar().lexema
+        }
+        t = isto.lerDimensoesArray(t)
+        // Prototipo de funcao usado em typedef: typedef void (*sighandler_t)(int) ou typedef int cmp_t(const void*, const void*)
+        se (isto.atual().tag == isto.Tok.LParen e !isto.iniciaTipoEm(0) e nome.tamanho() == 0) {
+            const pAbs: (qualquer[], logico) = isto.lerListaParamsTipo()
+            t = isto.tMod.TipoC.funcaoTipo(t, pAbs[0], pAbs[1])
+        }
+        retorna tupla([t, nome])
+    }
+
+    lerTipoAbstrato(): qualquer {
+        const info: (qualquer, logico, logico) = isto.lerTipoBase()
+        const decl: (qualquer, texto) = isto.lerDeclarador(info[0])
+        retorna decl[0]
+    }
+
+    drenarPendentes(destino: NoAST[]): vazio {
+        para (var i: inteiro = 0; i < isto.declsPendentes.tamanho(); i++) {
+            destino.empilhar(isto.declsPendentes[i])
+        }
+        isto.declsPendentes = []
+    }
+
+    parsePrograma(): NoAST {
+        const prog: NoAST = NoAST(isto.Kind.Programa, 1, 1)
+        enquanto (isto.atual().tag != isto.Tok.Fim) {
+            se (isto.atual().tag == isto.Tok.Semi) {
+                isto.avancar()
+                continua
+            }
+            se (isto.atual().tag == isto.Tok.KwExtension) {
+                isto.avancar()
+                continua
+            }
+            se (isto.atual().tag == isto.Tok.KwTypedef) {
+                const tds: NoAST[] = isto.parseTypedefs()
+                isto.drenarPendentes(prog.filhos)
+                para (var k: inteiro = 0; k < tds.tamanho(); k++) prog.filhos.empilhar(tds[k])
+                continua
+            }
+            const lin: inteiro = isto.atual().linha
+            const col: inteiro = isto.atual().coluna
+            const baseInfo: (qualquer, logico, logico) = isto.lerTipoBase()
+            isto.drenarPendentes(prog.filhos)
+
+            se (isto.atual().tag == isto.Tok.Semi) {
+                isto.avancar()
+                continua
+            }
+
+            const decl: (qualquer, texto) = isto.lerDeclarador(baseInfo[0])
+            const tipoItem: qualquer = decl[0]
+            const nomeItem: texto = decl[1]
+
+            // Declarador ja produziu tipo Funcao (ex: void (*signal(int, ...))(int);)
+            se (tipoItem.base == isto.TB.Funcao) {
+                const linkSym: texto = isto.lerAsmSimboloLink()
+                isto.lerAtributosGNU()
+                isto.consumir(isto.Tok.Semi, "';' esperado apos prototipo")
+                const protoAn: NoAST = NoAST(isto.Kind.Prototipo, lin, col)
+                protoAn.tipoC = tipoItem.alvo
+                protoAn.nome = nomeItem
+                protoAn.nomeSimboloLink = linkSym
+                protoAn.ehExtern = verdadeiro
+                protoAn.ehVariadica = tipoItem.ehVariadica
+                const paramsAn: NoAST = NoAST(isto.Kind.Params, lin, col)
+                para (var p: inteiro = 0; p < tipoItem.paramsFn.tamanho(); p++) {
+                    const pNo: NoAST = NoAST(isto.Kind.Param, lin, col)
+                    pNo.tipoC = tipoItem.paramsFn[p]
+                    pNo.nome = "arg_${p}"
+                    paramsAn.filhos.empilhar(pNo)
+                }
+                protoAn.filhos.empilhar(paramsAn)
+                prog.filhos.empilhar(protoAn)
+                continua
+            }
+
+            // Funcao ou prototipo
+            se (isto.atual().tag == isto.Tok.LParen) {
+                prog.filhos.empilhar(isto.parseRestoFuncao(tipoItem, nomeItem, baseInfo[1],
+                    baseInfo[2], lin, col))
+                continua
+            }
+
+            // Variavel global (com suporte a multiplos declaradores, __asm__ e __attribute__)
+            prog.filhos.empilhar(isto.parseRestoVarGlobal(tipoItem, nomeItem, baseInfo[1],
+                baseInfo[2], lin, col))
+            enquanto (isto.atual().tag == isto.Tok.Comma) {
+                isto.avancar()
+                const proxD: (qualquer, texto) = isto.lerDeclarador(baseInfo[0])
+                prog.filhos.empilhar(isto.parseRestoVarGlobal(proxD[0], proxD[1], baseInfo[1],
+                    baseInfo[2], lin, col))
+            }
+            isto.consumir(isto.Tok.Semi, "';' esperado apos declaracao global")
+        }
+        retorna prog
+    }
+
+    parseRestoVarGlobal(tipoV: qualquer, nomeV: texto, ehExtern: logico, ehStatic: logico,
+        lin: inteiro, col: inteiro): NoAST {
+        const no: NoAST = NoAST(isto.Kind.VarGlobal, lin, col)
+        var tFinal: qualquer = tipoV
+        no.nome = nomeV
+        no.ehExtern = ehExtern
+        no.ehStatic = ehStatic
+        const linkSym: texto = isto.lerAsmSimboloLink()
+        se (linkSym.tamanho() > 0) no.nomeSimboloLink = linkSym
+        const attrG: (logico, inteiro) = isto.lerAtributosGNU()
+        se (attrG[1] > 0) tFinal.alinhamentoExplicito = attrG[1]
+        se (isto.atual().tag == isto.Tok.Igual) {
+            isto.avancar()
+            const inic: NoAST = isto.parseInicializador()
+            tFinal = isto.inferirTamanhoArrayDeInic(tFinal, inic)
+            no.filhos.empilhar(inic)
+        }
+        no.tipoC = tFinal
+        retorna no
+    }
+
+    parseTypedefs(): NoAST[] {
+        const lin: inteiro = isto.atual().linha
+        const col: inteiro = isto.atual().coluna
+        isto.consumir(isto.Tok.KwTypedef, "'typedef' esperado")
+        const baseInfo: (qualquer, logico, logico) = isto.lerTipoBase()
+        var lista: NoAST[] = []
+        enquanto (verdadeiro) {
+            const decl: (qualquer, texto) = isto.lerDeclarador(baseInfo[0])
+            var tDef: qualquer = decl[0]
+            // typedef int fn_t(int);
+            se (isto.atual().tag == isto.Tok.LParen) {
+                const pTd: (qualquer[], logico) = isto.lerListaParamsTipo()
+                tDef = isto.tMod.TipoC.funcaoTipo(tDef, pTd[0], pTd[1])
+            }
+            isto.lerAtributosGNU()
+            isto.typedefs[decl[1]] = tDef
+            const no: NoAST = NoAST(isto.Kind.DeclTypedef, lin, col)
+            no.nome = decl[1]
+            no.tipoC = tDef
+            lista.empilhar(no)
+            se (isto.atual().tag == isto.Tok.Comma) isto.avancar()
+            senao sustar
+        }
+        isto.consumir(isto.Tok.Semi, "';' esperado apos typedef")
+        retorna lista
+    }
+
+    parseCorpoEnum(nomeE: texto, lin: inteiro): NoAST {
+        isto.consumir(isto.Tok.LBrace, "'{' esperado em enum")
+        const no: NoAST = NoAST(isto.Kind.DeclEnum, lin)
+        no.nome = nomeE
+        var proximoVal: inteiro = 0
+        enquanto (isto.atual().tag != isto.Tok.RBrace e isto.atual().tag != isto.Tok.Fim) {
+            const itemNome: texto = isto.consumir(isto.Tok.Ident, "identificador de enum esperado").lexema
+            se (isto.atual().tag == isto.Tok.Igual) {
+                isto.avancar()
+                proximoVal = isto.avaliarConstSimples(isto.parseExprAtribOuCond())
+            }
+            const item: NoAST = NoAST(isto.Kind.ItemEnum, isto.atual().linha)
+            item.nome = itemNome
+            item.valor = proximoVal
+            isto.enumConsts[itemNome] = proximoVal
+            no.filhos.empilhar(item)
+            proximoVal++
+            se (isto.atual().tag == isto.Tok.Comma) isto.avancar()
+            senao sustar
+        }
+        isto.consumir(isto.Tok.RBrace, "'}' esperado em enum")
+        retorna no
+    }
+
+    parseCorpoAgregado(nomeA: texto, ehUnion: logico, lin: inteiro): NoAST {
+        isto.consumir(isto.Tok.LBrace, "'{' esperado")
+        const no: NoAST = NoAST(ehUnion ? isto.Kind.DeclUnion : isto.Kind.DeclStruct, lin)
+        no.nome = nomeA
+        enquanto (isto.atual().tag != isto.Tok.RBrace e isto.atual().tag != isto.Tok.Fim) {
+            se (isto.atual().tag == isto.Tok.Semi) {
+                isto.avancar()
+                continua
+            }
+            const cLin: inteiro = isto.atual().linha
+            const cCol: inteiro = isto.atual().coluna
+            const cBase: (qualquer, logico, logico) = isto.lerTipoBase()
+
+            // Campo struct/union anonimo embutido (C11/GNU usado em headers glibc): union { ... };
+            se (isto.atual().tag == isto.Tok.Semi) {
+                isto.avancar()
+                const campoAnon: NoAST = NoAST(isto.Kind.Campo, cLin, cCol)
+                campoAnon.nome = ""
+                campoAnon.tipoC = cBase[0]
+                no.filhos.empilhar(campoAnon)
+                continua
+            }
+
+            enquanto (verdadeiro) {
+                var cTipo: qualquer = cBase[0]
+                var cNome: texto = ""
+                se (isto.atual().tag != isto.Tok.Colon) {
+                    const cDecl: (qualquer, texto) = isto.lerDeclarador(cBase[0])
+                    cTipo = cDecl[0]
+                    cNome = cDecl[1]
+                }
+                const campo: NoAST = NoAST(isto.Kind.Campo, cLin, cCol)
+                campo.nome = cNome
+                campo.tipoC = cTipo
+                // Bit-field C99: unsigned int flags : 3;
+                se (isto.atual().tag == isto.Tok.Colon) {
+                    isto.avancar()
+                    campo.ehBitField = verdadeiro
+                    campo.bitWidth = isto.avaliarConstSimples(isto.parseExprAtribOuCond())
+                }
+                const cAttr: (logico, inteiro) = isto.lerAtributosGNU()
+                se (cAttr[1] > 0) campo.tipoC.alinhamentoExplicito = cAttr[1]
+                no.filhos.empilhar(campo)
+                se (isto.atual().tag == isto.Tok.Comma) isto.avancar()
+                senao sustar
+            }
+            isto.consumir(isto.Tok.Semi, "';' esperado apos campo")
+        }
+        isto.consumir(isto.Tok.RBrace, "'}' esperado")
+        retorna no
+    }
+
+    parseRestoFuncao(tipoRet: qualquer, nomeFn: texto, ehExtern: logico, ehStatic: logico,
+        lin: inteiro, col: inteiro): NoAST {
+        isto.consumir(isto.Tok.LParen, "'(' esperado")
+        const params: NoAST = NoAST(isto.Kind.Params, lin, col)
+        var ehVariadica: logico = falso
+
+        se (isto.atual().tag != isto.Tok.RParen) {
+            se (isto.atual().tag == isto.Tok.KwVoid e isto.espiar(1).tag == isto.Tok.RParen) {
+                isto.avancar()
+            } senao {
+                enquanto (verdadeiro) {
+                    se (isto.atual().tag == isto.Tok.Ellipsis) {
+                        isto.avancar()
+                        ehVariadica = verdadeiro
+                        sustar
+                    }
+                    const pLin: inteiro = isto.atual().linha
+                    const pCol: inteiro = isto.atual().coluna
+                    const pBase: (qualquer, logico, logico) = isto.lerTipoBase()
+                    const pDecl: (qualquer, texto) = isto.lerDeclarador(pBase[0])
+                    var pTipo: qualquer = pDecl[0]
+                    se (pTipo.base == isto.TB.Array) {
+                        pTipo = isto.tMod.TipoC.ponteiroPara(pTipo.alvo)
+                    }
+                    se (pTipo.base == isto.TB.Funcao) {
+                        pTipo = isto.tMod.TipoC.ponteiroPara(pTipo)
+                    }
+                    const pNome: texto = pDecl[1].tamanho() > 0 ? pDecl[1] : "arg_${params.filhos.tamanho()}"
+                    const pNo: NoAST = NoAST(isto.Kind.Param, pLin, pCol)
+                    pNo.tipoC = pTipo
+                    pNo.nome = pNome
+                    params.filhos.empilhar(pNo)
+                    se (isto.atual().tag == isto.Tok.Comma) isto.avancar()
+                    senao sustar
+                }
+            }
+        }
+        isto.consumir(isto.Tok.RParen, "')' esperado")
+
+        // Extensoes GNU pos-parametros em headers glibc: __asm__("sym") e __attribute__((...))
+        var linkSym: texto = ""
+        enquanto (isto.atual().tag == isto.Tok.KwAsm ou isto.atual().tag == isto.Tok.KwAttribute) {
+            se (isto.atual().tag == isto.Tok.KwAsm) {
+                linkSym = isto.lerAsmSimboloLink()
+            } senao {
+                isto.lerAtributosGNU()
+            }
+        }
+
+        se (isto.atual().tag == isto.Tok.Semi) {
+            isto.avancar()
+            const proto: NoAST = NoAST(isto.Kind.Prototipo, lin, col)
+            proto.tipoC = tipoRet
+            proto.nome = nomeFn
+            proto.nomeSimboloLink = linkSym
+            proto.ehExtern = ehExtern
+            proto.ehStatic = ehStatic
+            proto.ehVariadica = ehVariadica
+            proto.filhos.empilhar(params)
+            retorna proto
+        }
+
+        const fn: NoAST = NoAST(isto.Kind.Funcao, lin, col)
+        fn.tipoC = tipoRet
+        fn.nome = nomeFn
+        fn.nomeSimboloLink = linkSym
+        fn.ehStatic = ehStatic
+        fn.ehVariadica = ehVariadica
+        fn.filhos.empilhar(params)
+        fn.filhos.empilhar(isto.parseBloco())
+        retorna fn
+    }
+
+    parseBloco(): NoAST {
+        const lin: inteiro = isto.atual().linha
+        const col: inteiro = isto.atual().coluna
+        isto.consumir(isto.Tok.LBrace, "'{' esperado")
+        const bloco: NoAST = NoAST(isto.Kind.Bloco, lin, col)
+        enquanto (isto.atual().tag != isto.Tok.RBrace e isto.atual().tag != isto.Tok.Fim) {
+            se (isto.atual().tag == isto.Tok.Semi) {
+                isto.avancar()
+                continua
+            }
+            se (isto.atual().tag == isto.Tok.KwTypedef) {
+                const tdsL: NoAST[] = isto.parseTypedefs()
+                isto.drenarPendentes(bloco.filhos)
+                para (var k: inteiro = 0; k < tdsL.tamanho(); k++) bloco.filhos.empilhar(tdsL[k])
+                continua
+            }
+            se (isto.iniciaTipo()) {
+                isto.parseDeclVarLocal(bloco.filhos, verdadeiro)
+            } senao {
+                bloco.filhos.empilhar(isto.parseStmt())
+            }
+        }
+        isto.consumir(isto.Tok.RBrace, "'}' esperado")
+        retorna bloco
+    }
+
+    parseInicializador(): NoAST {
+        se (isto.atual().tag == isto.Tok.LBrace) {
+            const lin: inteiro = isto.atual().linha
+            const col: inteiro = isto.atual().coluna
+            isto.avancar()
+            const lista: NoAST = NoAST(isto.Kind.ExprInitList, lin, col)
+            enquanto (isto.atual().tag != isto.Tok.RBrace e isto.atual().tag != isto.Tok.Fim) {
+                se (isto.atual().tag == isto.Tok.Dot) {
+                    const dLin: inteiro = isto.atual().linha
+                    isto.avancar()
+                    const campoN: texto = isto.consumir(isto.Tok.Ident, "nome de campo esperado em inicializador designado").lexema
+                    isto.consumir(isto.Tok.Igual, "'=' esperado em inicializador designado")
+                    const des: NoAST = NoAST(isto.Kind.ExprInicDesignado, dLin)
+                    des.nome = campoN
+                    des.ehSeta = falso
+                    des.filhos.empilhar(isto.parseInicializador())
+                    lista.filhos.empilhar(des)
+                } senao se (isto.atual().tag == isto.Tok.LBracket) {
+                    const dLin: inteiro = isto.atual().linha
+                    isto.avancar()
+                    const idxExpr: NoAST = isto.parseExprAtribOuCond()
+                    const idxVal: inteiro = isto.avaliarConstSimples(idxExpr)
+                    isto.consumir(isto.Tok.RBracket, "']' esperado em inicializador designado")
+                    isto.consumir(isto.Tok.Igual, "'=' esperado em inicializador designado")
+                    const des: NoAST = NoAST(isto.Kind.ExprInicDesignado, dLin)
+                    des.valor = idxVal
+                    des.ehSeta = verdadeiro
+                    des.filhos.empilhar(isto.parseInicializador())
+                    lista.filhos.empilhar(des)
+                } senao {
+                    lista.filhos.empilhar(isto.parseInicializador())
+                }
+                se (isto.atual().tag == isto.Tok.Comma) isto.avancar()
+                senao sustar
+            }
+            isto.consumir(isto.Tok.RBrace, "'}' esperado em lista de inicializacao")
+            retorna lista
+        }
+        retorna isto.parseAtrib()
+    }
+
+    parseDeclVarLocal(destino: NoAST[], comPontoVirgula: logico): vazio {
+        const lin: inteiro = isto.atual().linha
+        const col: inteiro = isto.atual().coluna
+        const baseInfo: (qualquer, logico, logico) = isto.lerTipoBase()
+        isto.drenarPendentes(destino)
+        se (comPontoVirgula e isto.atual().tag == isto.Tok.Semi) {
+            isto.avancar()
+            retorna
+        }
+        enquanto (verdadeiro) {
+            const decl: (qualquer, texto) = isto.lerDeclarador(baseInfo[0])
+            var tipoV: qualquer = decl[0]
+            const attrL: (logico, inteiro) = isto.lerAtributosGNU()
+            se (attrL[1] > 0) tipoV.alinhamentoExplicito = attrL[1]
+            const no: NoAST = NoAST(isto.Kind.VarDecl, lin, col)
+            no.nome = decl[1]
+            no.ehStatic = baseInfo[2]
+            no.ehExtern = baseInfo[1]
+            se (isto.atual().tag == isto.Tok.Igual) {
+                isto.avancar()
+                const inic: NoAST = isto.parseInicializador()
+                tipoV = isto.inferirTamanhoArrayDeInic(tipoV, inic)
+                no.filhos.empilhar(inic)
+            }
+            no.tipoC = tipoV
+            destino.empilhar(no)
+            se (isto.atual().tag == isto.Tok.Comma) isto.avancar()
+            senao sustar
+        }
+        se (comPontoVirgula) isto.consumir(isto.Tok.Semi, "';' esperado apos declaracao")
+    }
+
+    parseStmt(): NoAST {
+        const tag: qualquer = isto.atual().tag
+        const lin: inteiro = isto.atual().linha
+        const col: inteiro = isto.atual().coluna
+
+        se (tag == isto.Tok.LBrace) retorna isto.parseBloco()
+        se (tag == isto.Tok.Semi) {
+            isto.avancar()
+            retorna NoAST(isto.Kind.StmtVazio, lin, col)
+        }
+        se (tag == isto.Tok.KwAsm) {
+            isto.diag.erroEm(lin, col, "inline assembly (__asm__) dentro de funcoes nao e suportado (Categoria C)")
+        }
+        se (isto.iniciaTipo()) {
+            const blocoTemp: NoAST = NoAST(isto.Kind.Bloco, lin, col)
+            isto.parseDeclVarLocal(blocoTemp.filhos, verdadeiro)
+            se (blocoTemp.filhos.tamanho() == 1) retorna blocoTemp.filhos[0]
+            retorna blocoTemp
+        }
+        se (tag == isto.Tok.Ident e isto.espiar(1).tag == isto.Tok.Colon) {
+            const lblNome: texto = isto.avancar().lexema
+            isto.avancar()
+            const lbl: NoAST = NoAST(isto.Kind.StmtLabel, lin, col)
+            lbl.nome = lblNome
+            se (isto.atual().tag != isto.Tok.RBrace) {
+                lbl.filhos.empilhar(isto.parseStmt())
+            }
+            retorna lbl
+        }
+
+        escolha (tag) {
+            caso isto.Tok.KwIf:
+            isto.avancar()
+            isto.consumir(isto.Tok.LParen, "'(' esperado")
+            const cond: NoAST = isto.parseExpr()
+            isto.consumir(isto.Tok.RParen, "')' esperado")
+            const entao: NoAST = isto.parseStmt()
+            const noIf: NoAST = NoAST(isto.Kind.StmtIf, lin, col)
+            noIf.filhos.empilhar(cond)
+            noIf.filhos.empilhar(entao)
+            se (isto.atual().tag == isto.Tok.KwElse) {
+                isto.avancar()
+                noIf.filhos.empilhar(isto.parseStmt())
+            }
+            retorna noIf
+            caso isto.Tok.KwWhile:
+            isto.avancar()
+            isto.consumir(isto.Tok.LParen, "'(' esperado")
+            const condW: NoAST = isto.parseExpr()
+            isto.consumir(isto.Tok.RParen, "')' esperado")
+            const corpoW: NoAST = isto.parseStmt()
+            const noW: NoAST = NoAST(isto.Kind.StmtWhile, lin, col)
+            noW.filhos.empilhar(condW)
+            noW.filhos.empilhar(corpoW)
+            retorna noW
+            caso isto.Tok.KwDo:
+            isto.avancar()
+            const corpoD: NoAST = isto.parseStmt()
+            isto.consumir(isto.Tok.KwWhile, "'while' esperado apos 'do'")
+            isto.consumir(isto.Tok.LParen, "'(' esperado")
+            const condD: NoAST = isto.parseExpr()
+            isto.consumir(isto.Tok.RParen, "')' esperado")
+            isto.consumir(isto.Tok.Semi, "';' esperado apos do-while")
+            const noD: NoAST = NoAST(isto.Kind.StmtDoWhile, lin, col)
+            noD.filhos.empilhar(corpoD)
+            noD.filhos.empilhar(condD)
+            retorna noD
+            caso isto.Tok.KwFor:
+            isto.avancar()
+            isto.consumir(isto.Tok.LParen, "'(' esperado")
+            var inicF: NoAST = NoAST(isto.Kind.StmtVazio, lin, col)
+            se (isto.atual().tag != isto.Tok.Semi) {
+                se (isto.iniciaTipo()) {
+                    const bInic: NoAST = NoAST(isto.Kind.Bloco, lin, col)
+                    isto.parseDeclVarLocal(bInic.filhos, falso)
+                    inicF = bInic.filhos.tamanho() == 1 ? bInic.filhos[0] : bInic
+                } senao {
+                    inicF = NoAST(isto.Kind.StmtExpr, lin, col)
+                    inicF.filhos.empilhar(isto.parseExpr())
+                }
+            }
+            isto.consumir(isto.Tok.Semi, "';' esperado no for")
+            var condF: NoAST = NoAST(isto.Kind.ExprInt, lin, col)
+            condF.valor = 1
+            se (isto.atual().tag != isto.Tok.Semi) {
+                condF = isto.parseExpr()
+            }
+            isto.consumir(isto.Tok.Semi, "';' esperado no for")
+            var passoF: NoAST = NoAST(isto.Kind.StmtVazio, lin, col)
+            se (isto.atual().tag != isto.Tok.RParen) {
+                passoF = NoAST(isto.Kind.StmtExpr, lin, col)
+                passoF.filhos.empilhar(isto.parseExpr())
+            }
+            isto.consumir(isto.Tok.RParen, "')' esperado no for")
+            const corpoF: NoAST = isto.parseStmt()
+            const noF: NoAST = NoAST(isto.Kind.StmtFor, lin, col)
+            noF.filhos.empilhar(inicF)
+            noF.filhos.empilhar(condF)
+            noF.filhos.empilhar(passoF)
+            noF.filhos.empilhar(corpoF)
+            retorna noF
+            caso isto.Tok.KwSwitch:
+            isto.avancar()
+            isto.consumir(isto.Tok.LParen, "'(' esperado")
+            const alvoSw: NoAST = isto.parseExpr()
+            isto.consumir(isto.Tok.RParen, "')' esperado")
+            isto.consumir(isto.Tok.LBrace, "'{' esperado em switch")
+            const noSw: NoAST = NoAST(isto.Kind.StmtSwitch, lin, col)
+            noSw.filhos.empilhar(alvoSw)
+            enquanto (isto.atual().tag != isto.Tok.RBrace e isto.atual().tag != isto.Tok.Fim) {
+                const cLin: inteiro = isto.atual().linha
+                const cCol: inteiro = isto.atual().coluna
+                const ramoCaso: NoAST = NoAST(isto.Kind.StmtCase, cLin, cCol)
+                se (isto.atual().tag == isto.Tok.KwCase) {
+                    isto.avancar()
+                    ramoCaso.filhos.empilhar(isto.parseExpr())
+                    isto.consumir(isto.Tok.Colon, "':' esperado em case")
+                } senao se (isto.atual().tag == isto.Tok.KwDefault) {
+                    isto.avancar()
+                    ramoCaso.ehSeta = verdadeiro
+                    isto.consumir(isto.Tok.Colon, "':' esperado em default")
+                } senao {
+                    isto.diag.erroEm(cLin, cCol, "'case' ou 'default' esperado em switch")
+                }
+                const corpoCaso: NoAST = NoAST(isto.Kind.Bloco, cLin, cCol)
+                enquanto (isto.atual().tag != isto.Tok.KwCase e isto.atual().tag != isto.Tok.KwDefault e isto.atual().tag != isto.Tok.RBrace e isto.atual().tag != isto.Tok.Fim) {
+                    corpoCaso.filhos.empilhar(isto.parseStmt())
+                }
+                ramoCaso.filhos.empilhar(corpoCaso)
+                noSw.filhos.empilhar(ramoCaso)
+            }
+            isto.consumir(isto.Tok.RBrace, "'}' esperado em switch")
+            retorna noSw
+            caso isto.Tok.KwBreak:
+            isto.avancar()
+            isto.consumir(isto.Tok.Semi, "';' esperado")
+            retorna NoAST(isto.Kind.StmtBreak, lin, col)
+            caso isto.Tok.KwContinue:
+            isto.avancar()
+            isto.consumir(isto.Tok.Semi, "';' esperado")
+            retorna NoAST(isto.Kind.StmtContinue, lin, col)
+            caso isto.Tok.KwGoto:
+            isto.avancar()
+            const alvoLbl: texto = isto.consumir(isto.Tok.Ident, "label esperado apos goto").lexema
+            isto.consumir(isto.Tok.Semi, "';' esperado apos goto")
+            const noG: NoAST = NoAST(isto.Kind.StmtGoto, lin, col)
+            noG.nome = alvoLbl
+            retorna noG
+            caso isto.Tok.KwReturn:
+            isto.avancar()
+            const noR: NoAST = NoAST(isto.Kind.StmtReturn, lin, col)
+            se (isto.atual().tag != isto.Tok.Semi) {
+                noR.filhos.empilhar(isto.parseExpr())
+            }
+            isto.consumir(isto.Tok.Semi, "';' esperado")
+            retorna noR
+            padrao:
+            const exprStmt: NoAST = NoAST(isto.Kind.StmtExpr, lin, col)
+            exprStmt.filhos.empilhar(isto.parseExpr())
+            isto.consumir(isto.Tok.Semi, "';' esperado")
+            retorna exprStmt
+        }
+        retorna NoAST(isto.Kind.StmtVazio, lin, col)
+    }
+
+    parseExpr(): NoAST {
+        var esq: NoAST = isto.parseAtrib()
+        enquanto (isto.atual().tag == isto.Tok.Comma) {
+            const lin: inteiro = isto.atual().linha
+            const col: inteiro = isto.atual().coluna
+            isto.avancar()
+            const no: NoAST = NoAST(isto.Kind.ExprComma, lin, col)
+            no.filhos.empilhar(esq)
+            no.filhos.empilhar(isto.parseAtrib())
+            esq = no
+        }
+        retorna esq
+    }
+
+    parseExprAtribOuCond(): NoAST {
+        retorna isto.parseAtrib()
+    }
+
+    parseAtrib(): NoAST {
+        const esq: NoAST = isto.parseTernario()
+        const lexAtual: texto = isto.atual().lexema
+        se (isto.mapaAtrib.contem(lexAtual)) {
+            const tOp: qualquer = isto.avancar()
+            const dir: NoAST = isto.parseAtrib()
+            const no: NoAST = NoAST(isto.Kind.ExprAtrib, tOp.linha, tOp.coluna)
+            no.opBin = isto.mapaAtrib[lexAtual]
+            no.filhos.empilhar(esq)
+            no.filhos.empilhar(dir)
+            retorna no
+        }
+        retorna esq
+    }
+
+    parseTernario(): NoAST {
+        const cond: NoAST = isto.parseOrLog()
+        se (isto.atual().tag == isto.Tok.Interrog) {
+            isto.avancar()
+            const sim: NoAST = isto.parseExpr()
+            isto.consumir(isto.Tok.Colon, "':' esperado no ternario")
+            const falsoRamo: NoAST = isto.parseTernario()
+            const no: NoAST = NoAST(isto.Kind.ExprTernario, cond.linha, cond.coluna)
+            no.filhos.empilhar(cond)
+            no.filhos.empilhar(sim)
+            no.filhos.empilhar(falsoRamo)
+            retorna no
+        }
+        retorna cond
+    }
+
+    parseOrLog(): NoAST {
+        var esq: NoAST = isto.parseAndLog()
+        enquanto (isto.atual().tag == isto.Tok.OrLog) {
+            const t: qualquer = isto.avancar()
+            const no: NoAST = NoAST(isto.Kind.ExprBinaria, t.linha, t.coluna)
+            no.opBin = isto.OpB.LogOr
+            no.filhos.empilhar(esq)
+            no.filhos.empilhar(isto.parseAndLog())
+            esq = no
+        }
+        retorna esq
+    }
+
+    parseAndLog(): NoAST {
+        var esq: NoAST = isto.parseBitOr()
+        enquanto (isto.atual().tag == isto.Tok.AndLog) {
+            const t: qualquer = isto.avancar()
+            const no: NoAST = NoAST(isto.Kind.ExprBinaria, t.linha, t.coluna)
+            no.opBin = isto.OpB.LogAnd
+            no.filhos.empilhar(esq)
+            no.filhos.empilhar(isto.parseBitOr())
+            esq = no
+        }
+        retorna esq
+    }
+
+    parseBitOr(): NoAST {
+        var esq: NoAST = isto.parseBitXor()
+        enquanto (isto.atual().tag == isto.Tok.BitOr) {
+            const t: qualquer = isto.avancar()
+            const no: NoAST = NoAST(isto.Kind.ExprBinaria, t.linha, t.coluna)
+            no.opBin = isto.OpB.BitOr
+            no.filhos.empilhar(esq)
+            no.filhos.empilhar(isto.parseBitXor())
+            esq = no
+        }
+        retorna esq
+    }
+
+    parseBitXor(): NoAST {
+        var esq: NoAST = isto.parseBitAnd()
+        enquanto (isto.atual().tag == isto.Tok.BitXor) {
+            const t: qualquer = isto.avancar()
+            const no: NoAST = NoAST(isto.Kind.ExprBinaria, t.linha, t.coluna)
+            no.opBin = isto.OpB.BitXor
+            no.filhos.empilhar(esq)
+            no.filhos.empilhar(isto.parseBitAnd())
+            esq = no
+        }
+        retorna esq
+    }
+
+    parseBitAnd(): NoAST {
+        var esq: NoAST = isto.parseIgualdade()
+        enquanto (isto.atual().tag == isto.Tok.BitAnd) {
+            const t: qualquer = isto.avancar()
+            const no: NoAST = NoAST(isto.Kind.ExprBinaria, t.linha, t.coluna)
+            no.opBin = isto.OpB.BitAnd
+            no.filhos.empilhar(esq)
+            no.filhos.empilhar(isto.parseIgualdade())
+            esq = no
+        }
+        retorna esq
+    }
+
+    parseIgualdade(): NoAST {
+        var esq: NoAST = isto.parseRelacional()
+        enquanto (isto.atual().tag == isto.Tok.Eq ou isto.atual().tag == isto.Tok.Neq) {
+            const t: qualquer = isto.avancar()
+            const no: NoAST = NoAST(isto.Kind.ExprBinaria, t.linha, t.coluna)
+            no.opBin = t.tag == isto.Tok.Eq ? isto.OpB.Eq : isto.OpB.Neq
+            no.filhos.empilhar(esq)
+            no.filhos.empilhar(isto.parseRelacional())
+            esq = no
+        }
+        retorna esq
+    }
+
+    parseRelacional(): NoAST {
+        var esq: NoAST = isto.parseShift()
+        enquanto (isto.mapaRel.contem(isto.atual().lexema)) {
+            const t: qualquer = isto.avancar()
+            const no: NoAST = NoAST(isto.Kind.ExprBinaria, t.linha, t.coluna)
+            no.opBin = isto.mapaRel[t.lexema]
+            no.filhos.empilhar(esq)
+            no.filhos.empilhar(isto.parseShift())
+            esq = no
+        }
+        retorna esq
+    }
+
+    parseShift(): NoAST {
+        var esq: NoAST = isto.parseAdicao()
+        enquanto (isto.atual().tag == isto.Tok.Shl ou isto.atual().tag == isto.Tok.Shr) {
+            const t: qualquer = isto.avancar()
+            const no: NoAST = NoAST(isto.Kind.ExprBinaria, t.linha, t.coluna)
+            no.opBin = t.tag == isto.Tok.Shl ? isto.OpB.Shl : isto.OpB.Shr
+            no.filhos.empilhar(esq)
+            no.filhos.empilhar(isto.parseAdicao())
+            esq = no
+        }
+        retorna esq
+    }
+
+    parseAdicao(): NoAST {
+        var esq: NoAST = isto.parseFator()
+        enquanto (isto.atual().tag == isto.Tok.Mais ou isto.atual().tag == isto.Tok.Menos) {
+            const t: qualquer = isto.avancar()
+            const no: NoAST = NoAST(isto.Kind.ExprBinaria, t.linha, t.coluna)
+            no.opBin = t.tag == isto.Tok.Mais ? isto.OpB.Add : isto.OpB.Sub
+            no.filhos.empilhar(esq)
+            no.filhos.empilhar(isto.parseFator())
+            esq = no
+        }
+        retorna esq
+    }
+
+    parseFator(): NoAST {
+        var esq: NoAST = isto.parseCast()
+        enquanto (isto.mapaFator.contem(isto.atual().lexema)) {
+            const t: qualquer = isto.avancar()
+            const no: NoAST = NoAST(isto.Kind.ExprBinaria, t.linha, t.coluna)
+            no.opBin = isto.mapaFator[t.lexema]
+            no.filhos.empilhar(esq)
+            no.filhos.empilhar(isto.parseCast())
+            esq = no
+        }
+        retorna esq
+    }
+
+    parseCast(): NoAST {
+        se (isto.atual().tag == isto.Tok.KwExtension) {
+            isto.avancar()
+            retorna isto.parseCast()
+        }
+        se (isto.atual().tag == isto.Tok.LParen e isto.iniciaTipoEm(1)) {
+            const posSalva: inteiro = isto.pos
+            const lin: inteiro = isto.atual().linha
+            const col: inteiro = isto.atual().coluna
+            isto.avancar()
+            const tAlvo: qualquer = isto.lerTipoAbstrato()
+            isto.consumir(isto.Tok.RParen, "')' esperado em cast")
+            se (isto.atual().tag == isto.Tok.LBrace) {
+                isto.pos = posSalva
+                retorna isto.parseUnario()
+            }
+            const no: NoAST = NoAST(isto.Kind.ExprCast, lin, col)
+            no.tipoC = tAlvo
+            no.filhos.empilhar(isto.parseCast())
+            retorna no
+        }
+        retorna isto.parseUnario()
+    }
+
+    parseUnario(): NoAST {
+        const t: qualquer = isto.atual()
+        se (t.tag == isto.Tok.KwExtension) {
+            isto.avancar()
+            retorna isto.parseUnario()
+        }
+        se (t.tag == isto.Tok.KwSizeof) {
+            isto.avancar()
+            se (isto.atual().tag == isto.Tok.LParen e isto.iniciaTipoEm(1)) {
+                isto.avancar()
+                const tAlvo: qualquer = isto.lerTipoAbstrato()
+                isto.consumir(isto.Tok.RParen, "')' esperado em sizeof")
+                const no: NoAST = NoAST(isto.Kind.ExprSizeofTipo, t.linha, t.coluna)
+                no.tipoC = tAlvo
+                retorna no
+            }
+            const noE: NoAST = NoAST(isto.Kind.ExprSizeofExpr, t.linha, t.coluna)
+            noE.filhos.empilhar(isto.parseUnario())
+            retorna noE
+        }
+        se (t.tag == isto.Tok.KwAlignof) {
+            isto.avancar()
+            isto.consumir(isto.Tok.LParen, "'(' esperado em _Alignof")
+            const tAl: qualquer = isto.lerTipoAbstrato()
+            isto.consumir(isto.Tok.RParen, "')' esperado em _Alignof")
+            const noAl: NoAST = NoAST(isto.Kind.ExprSizeofTipo, t.linha, t.coluna)
+            noAl.tipoC = tAl
+            noAl.ehSeta = verdadeiro // indica _Alignof em vez de sizeof
+            retorna noAl
+        }
+        se (isto.mapaUnario.contem(t.lexema)) {
+            isto.avancar()
+            const no: NoAST = NoAST(isto.Kind.ExprUnaria, t.linha, t.coluna)
+            no.opUn = isto.mapaUnario[t.lexema]
+            no.filhos.empilhar(isto.parseCast())
+            retorna no
+        }
+        retorna isto.parsePosfixo()
+    }
+
+    parsePosfixo(): NoAST {
+        var base: NoAST = isto.parsePrimario()
+        enquanto (verdadeiro) {
+            const tag: qualquer = isto.atual().tag
+            const lin: inteiro = isto.atual().linha
+            const col: inteiro = isto.atual().coluna
+            se (tag == isto.Tok.LParen) {
+                isto.avancar()
+                const ch: NoAST = NoAST(isto.Kind.ExprChamada, lin, col)
+                se (base.kind == isto.Kind.ExprVar) {
+                    ch.nome = base.nome
+                } senao {
+                    ch.ehSeta = verdadeiro
+                    ch.filhos.empilhar(base)
+                }
+                se (isto.atual().tag != isto.Tok.RParen) {
+                    enquanto (verdadeiro) {
+                        ch.filhos.empilhar(isto.parseAtrib())
+                        se (isto.atual().tag == isto.Tok.Comma) isto.avancar()
+                        senao sustar
+                    }
+                }
+                isto.consumir(isto.Tok.RParen, "')' esperado")
+                base = ch
+                continua
+            }
+            se (tag == isto.Tok.LBracket) {
+                isto.avancar()
+                const idx: NoAST = isto.parseExpr()
+                isto.consumir(isto.Tok.RBracket, "']' esperado")
+                const no: NoAST = NoAST(isto.Kind.ExprIndice, lin, col)
+                no.filhos.empilhar(base)
+                no.filhos.empilhar(idx)
+                base = no
+                continua
+            }
+            se (tag == isto.Tok.Dot ou tag == isto.Tok.Arrow) {
+                isto.avancar()
+                const campo: texto = isto.consumir(isto.Tok.Ident, "nome de campo esperado").lexema
+                const no: NoAST = NoAST(isto.Kind.ExprMembro, lin, col)
+                no.nome = campo
+                no.ehSeta = tag == isto.Tok.Arrow
+                no.filhos.empilhar(base)
+                base = no
+                continua
+            }
+            se (tag == isto.Tok.Inc ou tag == isto.Tok.Dec) {
+                isto.avancar()
+                const no: NoAST = NoAST(isto.Kind.ExprPosfixo, lin, col)
+                no.opUn = tag == isto.Tok.Inc ? isto.OpU.PostInc : isto.OpU.PostDec
+                no.filhos.empilhar(base)
+                base = no
+                continua
+            }
+            sustar
+        }
+        retorna base
+    }
+
+    parsePrimario(): NoAST {
+        const t: qualquer = isto.atual()
+        escolha (t.tag) {
+            caso isto.Tok.IntLit:
+            caso isto.Tok.CharLit:
+            isto.avancar()
+            const noI: NoAST = NoAST(isto.Kind.ExprInt, t.linha, t.coluna)
+            noI.valor = t.valorInt
+            noI.ehSemSinal = t.ehSemSinal
+            noI.ehLongo = t.ehLongo
+            retorna noI
+            caso isto.Tok.FloatLit:
+            isto.avancar()
+            const noF: NoAST = NoAST(isto.Kind.ExprFloat, t.linha, t.coluna)
+            noF.valorReal = t.valorReal
+            retorna noF
+            caso isto.Tok.StrLit:
+            isto.avancar()
+            const noS: NoAST = NoAST(isto.Kind.ExprStr, t.linha, t.coluna)
+            noS.textoLit = t.lexema
+            retorna noS
+            caso isto.Tok.LParen:
+            se (isto.iniciaTipoEm(1)) {
+                const linCL: inteiro = t.linha
+                const colCL: inteiro = t.coluna
+                isto.avancar()
+                var tCL: qualquer = isto.lerTipoAbstrato()
+                isto.consumir(isto.Tok.RParen, "')' esperado em literal composto")
+                const inicCL: NoAST = isto.parseInicializador()
+                tCL = isto.inferirTamanhoArrayDeInic(tCL, inicCL)
+                const noCL: NoAST = NoAST(isto.Kind.ExprLiteralComposto, linCL, colCL)
+                noCL.tipoC = tCL
+                noCL.filhos.empilhar(inicCL)
+                retorna noCL
+            }
+            isto.avancar()
+            const interna: NoAST = isto.parseExpr()
+            isto.consumir(isto.Tok.RParen, "')' esperado")
+            retorna interna
+            caso isto.Tok.Ident:
+            se (t.lexema == "__builtin_va_start" e isto.espiar(1).tag == isto.Tok.LParen) {
+                isto.avancar()
+                isto.avancar()
+                const apExpr: NoAST = isto.parseAtrib()
+                isto.consumir(isto.Tok.Comma, "',' esperado em __builtin_va_start")
+                const lastExpr: NoAST = isto.parseAtrib()
+                isto.consumir(isto.Tok.RParen, "')' esperado em __builtin_va_start")
+                const noVS: NoAST = NoAST(isto.Kind.ExprVaStart, t.linha, t.coluna)
+                noVS.filhos.empilhar(apExpr)
+                noVS.filhos.empilhar(lastExpr)
+                retorna noVS
+            }
+            se (t.lexema == "__builtin_va_arg" e isto.espiar(1).tag == isto.Tok.LParen) {
+                isto.avancar()
+                isto.avancar()
+                const apExprA: NoAST = isto.parseAtrib()
+                isto.consumir(isto.Tok.Comma, "',' esperado em __builtin_va_arg")
+                const tipoArg: qualquer = isto.lerTipoAbstrato()
+                isto.consumir(isto.Tok.RParen, "')' esperado em __builtin_va_arg")
+                const noVA: NoAST = NoAST(isto.Kind.ExprVaArg, t.linha, t.coluna)
+                noVA.tipoC = tipoArg
+                noVA.filhos.empilhar(apExprA)
+                retorna noVA
+            }
+            se (t.lexema == "__builtin_va_end" e isto.espiar(1).tag == isto.Tok.LParen) {
+                isto.avancar()
+                isto.avancar()
+                const apEnd: NoAST = isto.parseAtrib()
+                isto.consumir(isto.Tok.RParen, "')' esperado em __builtin_va_end")
+                const noVE: NoAST = NoAST(isto.Kind.ExprVaEnd, t.linha, t.coluna)
+                noVE.filhos.empilhar(apEnd)
+                retorna noVE
+            }
+            se (t.lexema == "__builtin_va_copy" e isto.espiar(1).tag == isto.Tok.LParen) {
+                isto.avancar()
+                isto.avancar()
+                const dstVa: NoAST = isto.parseAtrib()
+                isto.consumir(isto.Tok.Comma, "',' esperado em __builtin_va_copy")
+                const srcVa: NoAST = isto.parseAtrib()
+                isto.consumir(isto.Tok.RParen, "')' esperado em __builtin_va_copy")
+                const noVC: NoAST = NoAST(isto.Kind.ExprVaCopy, t.linha, t.coluna)
+                noVC.filhos.empilhar(dstVa)
+                noVC.filhos.empilhar(srcVa)
+                retorna noVC
+            }
+            se (t.lexema == "__builtin_offsetof" e isto.espiar(1).tag == isto.Tok.LParen) {
+                isto.avancar()
+                isto.avancar()
+                const tOff: qualquer = isto.lerTipoAbstrato()
+                isto.consumir(isto.Tok.Comma, "',' esperado em __builtin_offsetof")
+                const mOff: texto = isto.consumir(isto.Tok.Ident, "campo esperado em __builtin_offsetof").lexema
+                isto.consumir(isto.Tok.RParen, "')' esperado em __builtin_offsetof")
+                const noOf: NoAST = NoAST(isto.Kind.ExprOffsetof, t.linha, t.coluna)
+                noOf.tipoC = tOff
+                noOf.nome = mOff
+                retorna noOf
+            }
+            isto.avancar()
+            const v: NoAST = NoAST(isto.Kind.ExprVar, t.linha, t.coluna)
+            v.nome = t.lexema
+            retorna v
+            padrao:
+            isto.diag.erroEm(t.linha, t.coluna, "expressao C99 invalida '${t.lexema}'")
+        }
+        retorna NoAST(isto.Kind.ExprInt, t.linha, t.coluna)
+    }
+}
+
+funcao analisarSintaxeDCC(tokens: qualquer[], diag: qualquer, modoGnu: logico = falso): NoAST {
+    retorna ParserDCC(tokens, diag, modoGnu).parsePrograma()
+}

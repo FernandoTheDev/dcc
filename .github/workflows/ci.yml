@@ -1,0 +1,27 @@
+name: DCC CI
+
+on:
+  push:
+    branches: [main, dev]
+  pull_request:
+
+jobs:
+  build-and-test:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Check toolchain prerequisites
+        run: |
+          gcc --version
+          clang --version
+          readelf --version | head -n 1
+
+      - name: Build DCC (requires CGD installed in runner)
+        run: ./bootstrap/build.sh
+
+      - name: Check Delegua formatting
+        run: make check-format
+
+      - name: Run full verification and differential suite
+        run: ./bootstrap/verify.sh
