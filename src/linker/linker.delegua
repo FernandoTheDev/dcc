@@ -43,7 +43,8 @@ funcao prepararPatchesRelocWorker(loteRaw: qualquer): qualquer {
     const count: inteiro = inp.lerU32LE(0)
     const out = BytesMod.Bytes.criarReservado(5 + count * 18)
     out.anexarByte(1)
-    out.anexarU32LE(count)
+    out.anexarU32LE(0)
+    var emitidos: inteiro = 0
     var cur: inteiro = 4
     para (var i: inteiro = 0; i < count; i++) {
         const objIdx: inteiro = inp.lerU32LE(cur)
@@ -63,6 +64,8 @@ funcao prepararPatchesRelocWorker(loteRaw: qualquer): qualquer {
         const patchOff: inteiro = inp.lerU64LE(cur + 72)
         cur = cur + 80
 
+        se (rType == 0) continua
+
         var valPatch: inteiro = 0
         var largura: inteiro = 4
         var checarS32: logico = verdadeiro
@@ -80,15 +83,40 @@ funcao prepararPatchesRelocWorker(loteRaw: qualquer): qualquer {
         } senao se (rType == 2 ou rType == 4) {
             se (ehDin) valPatch = L + rAdd - P
             senao valPatch = S + rAdd - P
-        } senao se (rType == 9 ou rType == 41 ou rType == 42) {
+        } senao se (rType == 9 ou rType == 22 ou rType == 41 ou rType == 42) {
             se (!temGot) errId = 1
             senao valPatch = G + rAdd - P
         } senao se (rType == 10) {
-            valPatch = S + rAdd
+            se (ehDin) {
+                se (temPlt) valPatch = L + rAdd
+                senao errId = 2
+            } senao {
+                valPatch = S + rAdd
+            }
             checarS32 = falso
-            se (valPatch < 0 ou valPatch > 4294967295) errId = 3
+            se (errId == 0 e (valPatch < 0 ou valPatch > 4294967295)) errId = 3
         } senao se (rType == 11) {
+            se (ehDin) {
+                se (temPlt) valPatch = L + rAdd
+                senao errId = 2
+            } senao {
+                valPatch = S + rAdd
+            }
+        } senao se (rType == 17) {
             valPatch = S + rAdd
+            largura = 8
+            checarS32 = falso
+        } senao se (rType == 21 ou rType == 23) {
+            valPatch = S + rAdd
+        } senao se (rType == 24) {
+            se (ehDin) {
+                se (temPlt) valPatch = L + rAdd - P
+                senao errId = 2
+            } senao {
+                valPatch = S + rAdd - P
+            }
+            largura = 8
+            checarS32 = falso
         } senao {
             errId = 2
         }
@@ -114,9 +142,161 @@ funcao prepararPatchesRelocWorker(loteRaw: qualquer): qualquer {
         out.anexarByte(largura)
         out.anexarU64LE(patchOff)
         out.anexarU64LE(valPatch)
+        emitidos++
     }
 
+    out.definirU32LE(1, emitidos)
     retorna out.congelar().recursoInterno()
+}
+
+// Aplica relaxacao TLS x86-64 (GD->LE, GD->IE, LD->LE, TLSDESC->LE/IE) diretamente no buffer finalText.
+funcao aplicarRelaxacaoTlsTexto(finalText: qualquer, patchOff: inteiro, P: inteiro, S: inteiro,
+    G: inteiro, rAdd: inteiro, ehDin: logico, temGot: logico, rType: inteiro, nomeArq: texto,
+    diag: qualquer): vazio {
+    const ec: qualquer = importar("../object/elf/elf_comum.delegua")
+    se (rType == ec.R_X86_64_TLSDESC_CALL) {
+        se (patchOff < 0 ou patchOff + 2 > finalText.tamanho()) {
+            diag.erroDireto(nomeArq, 0, 0, "relocacao R_X86_64_TLSDESC_CALL fora dos limites de .text",
+                "", "", "E5015")
+        }
+        // Relaxa `call *(%reg)` (2 bytes) para NOP de 2 bytes (`66 90`)
+        finalText.definir(patchOff, 102)
+        finalText.definir(patchOff + 1, 144)
+        retorna
+    }
+
+    se (rType == ec.R_X86_64_GOTPC32_TLSDESC) {
+        const baseDesc: inteiro = patchOff - 3
+        se (baseDesc < 0 ou baseDesc + 7 > finalText.tamanho()) {
+            diag.erroDireto(nomeArq, 0, 0, "sequencia R_X86_64_GOTPC32_TLSDESC fora dos limites de .text",
+                "", "", "E5015")
+        }
+        const rexB: inteiro = finalText.obter(baseDesc)
+        const opB: inteiro = finalText.obter(baseDesc + 1)
+        const modrmB: inteiro = finalText.obter(baseDesc + 2)
+        se ((rexB != 72 e rexB != 76) ou opB != 141) {
+            diag.erroDireto(nomeArq, 0, 0, "sequencia de instrucoes R_X86_64_GOTPC32_TLSDESC nao reconhecida",
+                "", "", "E5013")
+        }
+        se (!ehDin) {
+            se (S < -2147483648 ou S > 2147483647) {
+                diag.erroDireto(nomeArq, 0, 0, "estouro de 32 bits em tpoff R_X86_64_GOTPC32_TLSDESC",
+                    "", "", "E5014")
+            }
+            // Relaxa `lea 0(%rip), %reg` -> `mov $tpoff32, %reg` (7 bytes)
+            const rexMov: inteiro = rexB == 76 ? 73 : 72
+            const reg3: inteiro = (modrmB >> 3) & 7
+            finalText.definir(baseDesc, rexMov)
+            finalText.definir(baseDesc + 1, 199)
+            finalText.definir(baseDesc + 2, 192 | reg3)
+            finalText.definirU32LE(baseDesc + 3, S)
+        } senao {
+            se (!temGot) {
+                diag.erroDireto(nomeArq, 0, 0, "entrada GOT ausente para R_X86_64_GOTPC32_TLSDESC externo",
+                    "", "", "E5012")
+            }
+            const dispDesc: inteiro = G + rAdd - P
+            se (dispDesc < -2147483648 ou dispDesc > 2147483647) {
+                diag.erroDireto(nomeArq, 0, 0, "estouro de 32 bits em R_X86_64_GOTPC32_TLSDESC (IE)",
+                    "", "", "E5014")
+            }
+            // Relaxa `lea disp(%rip), %reg` -> `mov disp(%rip), %reg` (7 bytes)
+            finalText.definir(baseDesc + 1, 139)
+            finalText.definirU32LE(baseDesc + 3, dispDesc)
+        }
+        retorna
+    }
+
+    se (rType == ec.R_X86_64_TLSGD) {
+        const baseOff: inteiro = patchOff - 4
+        se (baseOff < 0 ou baseOff + 15 > finalText.tamanho()) {
+            diag.erroDireto(nomeArq, 0, 0, "sequencia R_X86_64_TLSGD fora dos limites de .text",
+                "", "", "E5015")
+        }
+        const ehSeq16: logico = baseOff + 16 <= finalText.tamanho() e finalText.obter(baseOff) == 102 e finalText.obter(baseOff + 1) == 72 e finalText.obter(baseOff + 2) == 141 e finalText.obter(baseOff + 3) == 61 e finalText.obter(baseOff + 8) == 102 e finalText.obter(baseOff + 9) == 102 e finalText.obter(baseOff + 10) == 72 e finalText.obter(baseOff + 11) == 232
+        const ehSeq15: logico = !ehSeq16 e finalText.obter(baseOff) == 102 e finalText.obter(baseOff + 1) == 72 e finalText.obter(baseOff + 2) == 141 e finalText.obter(baseOff + 3) == 61 e finalText.obter(baseOff + 8) == 102 e finalText.obter(baseOff + 9) == 72 e finalText.obter(baseOff + 10) == 255 e finalText.obter(baseOff + 11) == 21
+        se (!ehSeq16 e !ehSeq15) {
+            diag.erroDireto(nomeArq, 0, 0, "sequencia de instrucoes R_X86_64_TLSGD nao reconhecida",
+                "", "", "E5013")
+        }
+        // mov %fs:0x0, %rax (9 bytes: 64 48 8b 04 25 00 00 00 00)
+        finalText.definir(baseOff, 100)
+        finalText.definir(baseOff + 1, 72)
+        finalText.definir(baseOff + 2, 139)
+        finalText.definir(baseOff + 3, 4)
+        finalText.definir(baseOff + 4, 37)
+        finalText.definir(baseOff + 5, 0)
+        finalText.definir(baseOff + 6, 0)
+        finalText.definir(baseOff + 7, 0)
+        finalText.definir(baseOff + 8, 0)
+        se (!ehDin) {
+            se (S < -2147483648 ou S > 2147483647) {
+                diag.erroDireto(nomeArq, 0, 0, "estouro de 32 bits em tpoff R_X86_64_TLSGD",
+                    "", "", "E5014")
+            }
+            se (ehSeq16) {
+                // lea disp32(%rax), %rax (7 bytes: 48 8d 80 <tpoff32>)
+                finalText.definir(baseOff + 9, 72)
+                finalText.definir(baseOff + 10, 141)
+                finalText.definir(baseOff + 11, 128)
+                finalText.definirU32LE(baseOff + 12, S)
+            } senao {
+                // add $imm32, %rax (6 bytes: 48 05 <tpoff32>)
+                finalText.definir(baseOff + 9, 72)
+                finalText.definir(baseOff + 10, 5)
+                finalText.definirU32LE(baseOff + 11, S)
+            }
+        } senao {
+            se (!temGot ou !ehSeq16) {
+                diag.erroDireto(nomeArq, 0, 0, "relocacao externa R_X86_64_TLSGD requer entrada GOT e sequencia de 16 bytes",
+                    "", "", "E5013")
+            }
+            const dispIe: inteiro = G - (P + 12)
+            se (dispIe < -2147483648 ou dispIe > 2147483647) {
+                diag.erroDireto(nomeArq, 0, 0, "estouro de 32 bits em R_X86_64_TLSGD (GD->IE)",
+                    "", "", "E5014")
+            }
+            // add disp32(%rip), %rax (7 bytes: 48 03 05 <disp32>)
+            finalText.definir(baseOff + 9, 72)
+            finalText.definir(baseOff + 10, 3)
+            finalText.definir(baseOff + 11, 5)
+            finalText.definirU32LE(baseOff + 12, dispIe)
+        }
+        retorna
+    }
+
+    se (rType == ec.R_X86_64_TLSLD) {
+        const baseOffL: inteiro = patchOff - 3
+        se (baseOffL < 0 ou baseOffL + 12 > finalText.tamanho()) {
+            diag.erroDireto(nomeArq, 0, 0, "sequencia R_X86_64_TLSLD fora dos limites de .text",
+                "", "", "E5015")
+        }
+        const ehLd12: logico = finalText.obter(baseOffL) == 72 e finalText.obter(baseOffL + 1) == 141 e finalText.obter(baseOffL + 2) == 61 e finalText.obter(baseOffL + 7) == 232
+        const ehLd13: logico = !ehLd12 e baseOffL + 13 <= finalText.tamanho() e finalText.obter(baseOffL) == 72 e finalText.obter(baseOffL + 1) == 141 e finalText.obter(baseOffL + 2) == 61 e finalText.obter(baseOffL + 7) == 255 e finalText.obter(baseOffL + 8) == 21
+        se (!ehLd12 e !ehLd13) {
+            diag.erroDireto(nomeArq, 0, 0, "sequencia de instrucoes R_X86_64_TLSLD nao reconhecida",
+                "", "", "E5013")
+        }
+        var pMov: inteiro = baseOffL
+        se (ehLd13) {
+            finalText.definir(pMov, 144) // nop
+            pMov++
+        }
+        // data16 data16 data16 mov %fs:0x0, %rax (12 bytes: 66 66 66 64 48 8b 04 25 00 00 00 00)
+        finalText.definir(pMov, 102)
+        finalText.definir(pMov + 1, 102)
+        finalText.definir(pMov + 2, 102)
+        finalText.definir(pMov + 3, 100)
+        finalText.definir(pMov + 4, 72)
+        finalText.definir(pMov + 5, 139)
+        finalText.definir(pMov + 6, 4)
+        finalText.definir(pMov + 7, 37)
+        finalText.definir(pMov + 8, 0)
+        finalText.definir(pMov + 9, 0)
+        finalText.definir(pMov + 10, 0)
+        finalText.definir(pMov + 11, 0)
+        retorna
+    }
 }
 
 classe EstadoLink {
@@ -159,6 +339,21 @@ classe EstadoLink {
     posDataNoRW: inteiro
     offBss: inteiro
     bssVaddr: inteiro
+    offTdata: inteiro
+    lenTdata: inteiro
+    tdataVaddr: inteiro
+    posTdataNoBuf: inteiro
+    tlsMemSize: inteiro
+    tlsAlign: inteiro
+    tlsBlockSize: inteiro
+    offInitArray: inteiro
+    lenInitArray: inteiro
+    initArrayVaddr: inteiro
+    posInitArrayNoRW: inteiro
+    offFiniArray: inteiro
+    lenFiniArray: inteiro
+    finiArrayVaddr: inteiro
+    posFiniArrayNoRW: inteiro
     corpoPreText: qualquer
     finalText: qualquer
     segRW: qualquer
@@ -169,6 +364,7 @@ classe EstadoLink {
     pltOffsets: dicionario
     gotVaddrs: dicionario
     localGotPosRW: dicionario
+    skipTlsReloc: dicionario
 
     construtor() {
         isto.objs = []
@@ -210,6 +406,21 @@ classe EstadoLink {
         isto.posDataNoRW = 0
         isto.offBss = 0
         isto.bssVaddr = 0
+        isto.offTdata = 0
+        isto.lenTdata = 0
+        isto.tdataVaddr = 0
+        isto.posTdataNoBuf = 0
+        isto.tlsMemSize = 0
+        isto.tlsAlign = 1
+        isto.tlsBlockSize = 0
+        isto.offInitArray = 0
+        isto.lenInitArray = 0
+        isto.initArrayVaddr = 0
+        isto.posInitArrayNoRW = 0
+        isto.offFiniArray = 0
+        isto.lenFiniArray = 0
+        isto.finiArrayVaddr = 0
+        isto.posFiniArrayNoRW = 0
         isto.corpoPreText = nulo
         isto.finalText = nulo
         isto.segRW = nulo
@@ -220,11 +431,12 @@ classe EstadoLink {
         isto.pltOffsets = {}
         isto.gotVaddrs = {}
         isto.localGotPosRW = {}
+        isto.skipTlsReloc = {}
     }
 }
 
 funcao prepararEstadoLink(objs: qualquer[], arquivosAr: qualquer[], defsPrevia: dicionario,
-    libsEntrada: texto[], diag: qualquer): EstadoLink {
+    libsEntrada: texto[], diag: qualquer, rpathsEntrada: texto[] = []): EstadoLink {
     const bytesMod: qualquer = importar("cgd:bytes")
     const texMod: qualquer = importar("cgd:textos")
     const ec: qualquer = importar("../object/elf/elf_comum.delegua")
@@ -259,15 +471,24 @@ funcao prepararEstadoLink(objs: qualquer[], arquivosAr: qualquer[], defsPrevia: 
         }
     }
 
-    // 1. Calculo prefixado de offsets de secoes (.text, .rodata, .data, .bss) e pre-alocacao exata
+    // 1. Calculo prefixado de offsets de secoes (.text, .rodata, .tdata, .tbss, .init_array, .fini_array, .data, .bss)
     var totalUserText: inteiro = 0
     var totalRodata: inteiro = 0
     var totalData: inteiro = 0
     var mergedBssSize: inteiro = 0
+    var totalTdata: inteiro = 0
+    var tlsAlign: inteiro = 1
+    var maxTextAlign: inteiro = 16
+    var maxRodataAlign: inteiro = 16
+    var maxDataAlign: inteiro = 16
+    var maxBssAlign: inteiro = 16
+    var totalInitArray: inteiro = 0
+    var totalFiniArray: inteiro = 0
 
     var secTipoDest: dicionario = {}
     var secOffDest: dicionario = {}
     var planosCopia: qualquer[] = [] // tupla([destId, objIdx, shOffset, shSize, alinh])
+    var tbssPlanos: qualquer[] = [] // tupla([chave, shSize, alinh])
 
     para (var o: inteiro = 0; o < objs.tamanho(); o++) {
         const obj: qualquer = objs[o]
@@ -276,30 +497,60 @@ funcao prepararEstadoLink(objs: qualquer[], arquivosAr: qualquer[], defsPrevia: 
             const ehAlloc: logico = (sec.shFlags & ec.SHF_ALLOC) != 0
             se (!ehAlloc) continua
             se (texMod.Textos.comecaCom(sec.nome, ".eh_frame") ou texMod.Textos.comecaCom(sec.nome,
-                ".note")) continua
+                ".note") ou sec.nome == ".llvm_addrsig") continua
 
             const chave: texto = "${o}:${s}"
             const alinh: inteiro = sec.shAlign > 1 ? sec.shAlign : 1
 
-            se ((sec.shFlags & ec.SHF_EXECINSTR) != 0 e sec.shType == ec.SHT_PROGBITS) {
+            se ((sec.shFlags & ec.SHF_TLS) != 0) {
+                se (alinh > tlsAlign) tlsAlign = alinh
+                se (sec.shType == ec.SHT_PROGBITS) {
+                    totalTdata = ec.alinharValor(totalTdata, alinh)
+                    secTipoDest[chave] = "TDATA"
+                    secOffDest[chave] = totalTdata
+                    planosCopia.empilhar(tupla([4, o, sec.shOffset, sec.shSize, alinh]))
+                    totalTdata = totalTdata + sec.shSize
+                } senao se (sec.shType == ec.SHT_NOBITS) {
+                    secTipoDest[chave] = "TBSS"
+                    tbssPlanos.empilhar(tupla([chave, sec.shSize, alinh]))
+                }
+            } senao se (sec.shType == ec.SHT_INIT_ARRAY) {
+                const alIa: inteiro = alinh > 8 ? alinh : 8
+                totalInitArray = ec.alinharValor(totalInitArray, alIa)
+                secTipoDest[chave] = "INIT_ARRAY"
+                secOffDest[chave] = totalInitArray
+                planosCopia.empilhar(tupla([5, o, sec.shOffset, sec.shSize, alIa]))
+                totalInitArray = totalInitArray + sec.shSize
+            } senao se (sec.shType == ec.SHT_FINI_ARRAY) {
+                const alFa: inteiro = alinh > 8 ? alinh : 8
+                totalFiniArray = ec.alinharValor(totalFiniArray, alFa)
+                secTipoDest[chave] = "FINI_ARRAY"
+                secOffDest[chave] = totalFiniArray
+                planosCopia.empilhar(tupla([6, o, sec.shOffset, sec.shSize, alFa]))
+                totalFiniArray = totalFiniArray + sec.shSize
+            } senao se ((sec.shFlags & ec.SHF_EXECINSTR) != 0 e sec.shType == ec.SHT_PROGBITS) {
+                se (alinh > maxTextAlign) maxTextAlign = alinh
                 totalUserText = ec.alinharValor(totalUserText, alinh)
                 secTipoDest[chave] = "TEXT"
                 secOffDest[chave] = totalUserText
                 planosCopia.empilhar(tupla([1, o, sec.shOffset, sec.shSize, alinh]))
                 totalUserText = totalUserText + sec.shSize
             } senao se ((sec.shFlags & ec.SHF_WRITE) == 0 e sec.shType == ec.SHT_PROGBITS) {
+                se (alinh > maxRodataAlign) maxRodataAlign = alinh
                 totalRodata = ec.alinharValor(totalRodata, alinh)
                 secTipoDest[chave] = "RODATA"
                 secOffDest[chave] = totalRodata
                 planosCopia.empilhar(tupla([2, o, sec.shOffset, sec.shSize, alinh]))
                 totalRodata = totalRodata + sec.shSize
             } senao se ((sec.shFlags & ec.SHF_WRITE) != 0 e sec.shType == ec.SHT_PROGBITS) {
+                se (alinh > maxDataAlign) maxDataAlign = alinh
                 totalData = ec.alinharValor(totalData, alinh)
                 secTipoDest[chave] = "DATA"
                 secOffDest[chave] = totalData
                 planosCopia.empilhar(tupla([3, o, sec.shOffset, sec.shSize, alinh]))
                 totalData = totalData + sec.shSize
             } senao se ((sec.shFlags & ec.SHF_WRITE) != 0 e sec.shType == ec.SHT_NOBITS) {
+                se (alinh > maxBssAlign) maxBssAlign = alinh
                 mergedBssSize = ec.alinharValor(mergedBssSize, alinh)
                 secTipoDest[chave] = "BSS"
                 secOffDest[chave] = mergedBssSize
@@ -308,9 +559,25 @@ funcao prepararEstadoLink(objs: qualquer[], arquivosAr: qualquer[], defsPrevia: 
         }
     }
 
+    var tlsMemSize: inteiro = totalTdata
+    para (var t: inteiro = 0; t < tbssPlanos.tamanho(); t++) {
+        const tp: qualquer = tbssPlanos[t]
+        const chTb: texto = texto(tp[0])
+        const szTb: inteiro = inteiro(tp[1])
+        const alTb: inteiro = inteiro(tp[2])
+        tlsMemSize = ec.alinharValor(tlsMemSize, alTb)
+        secOffDest[chTb] = tlsMemSize
+        tlsMemSize = tlsMemSize + szTb
+    }
+
+    const tlsBlockSize: inteiro = tlsMemSize > 0 ? ec.alinharValor(tlsMemSize, tlsAlign) : 0
+
     const userText: qualquer = bytesMod.Bytes.criarReservado(totalUserText)
     const mergedRodata: qualquer = bytesMod.Bytes.criarReservado(totalRodata)
     const mergedData: qualquer = bytesMod.Bytes.criarReservado(totalData)
+    const mergedTdata: qualquer = bytesMod.Bytes.criarReservado(totalTdata)
+    const mergedInitArray: qualquer = bytesMod.Bytes.criarReservado(totalInitArray)
+    const mergedFiniArray: qualquer = bytesMod.Bytes.criarReservado(totalFiniArray)
 
     para (var p: inteiro = 0; p < planosCopia.tamanho(); p++) {
         const pl: qualquer = planosCopia[p]
@@ -325,9 +592,18 @@ funcao prepararEstadoLink(objs: qualquer[], arquivosAr: qualquer[], defsPrevia: 
         } senao se (dId == 2) {
             ec.preencherAlinhBytes(mergedRodata, alP, 0)
             se (sSz > 0) mergedRodata.anexarBytesFatia(objSrc.dados, sOff, sSz)
-        } senao {
+        } senao se (dId == 3) {
             ec.preencherAlinhBytes(mergedData, alP, 0)
             se (sSz > 0) mergedData.anexarBytesFatia(objSrc.dados, sOff, sSz)
+        } senao se (dId == 4) {
+            ec.preencherAlinhBytes(mergedTdata, alP, 0)
+            se (sSz > 0) mergedTdata.anexarBytesFatia(objSrc.dados, sOff, sSz)
+        } senao se (dId == 5) {
+            ec.preencherAlinhBytes(mergedInitArray, alP, 0)
+            se (sSz > 0) mergedInitArray.anexarBytesFatia(objSrc.dados, sOff, sSz)
+        } senao {
+            ec.preencherAlinhBytes(mergedFiniArray, alP, 0)
+            se (sSz > 0) mergedFiniArray.anexarBytesFatia(objSrc.dados, sOff, sSz)
         }
     }
 
@@ -391,19 +667,39 @@ funcao prepararEstadoLink(objs: qualquer[], arquivosAr: qualquer[], defsPrevia: 
         diag.erroDireto("", 0, 0, "linker: simbolo indefinido 'main'", "", "", "E5011")
     }
 
-    // 3. Descobre simbolos externos dinamicos (PLT/GOT) e simbolos locais que precisem de slot GOT
+    // 3. Descobre simbolos externos dinamicos (PLT/GOT/TLS) e simbolos locais que precisem de slot GOT
     var dynSyms: texto[] = []
     var mapaDynSyms: dicionario = {}
+    var dynTlsSyms: dicionario = {}
+    var dynWeakSyms: dicionario = {}
+    var dynStrongRef: dicionario = {}
     var pltSyms: texto[] = []
     var mapaPltSyms: dicionario = {}
     var localGotSyms: texto[] = []
     var mapaLocalGot: dicionario = {}
+    var skipTlsReloc: dicionario = {}
     var totalRelocsLink: inteiro = 0
 
-    mapaDynSyms["exit"] = 0
-    dynSyms.empilhar("exit")
-    mapaPltSyms["exit"] = 0
-    pltSyms.empilhar("exit")
+    // Pre-passe rapido: marca chamadas pareadas __tls_get_addr apos R_X86_64_TLSGD/TLSLD
+    para (var o: inteiro = 0; o < objs.tamanho(); o++) {
+        const obj: qualquer = objs[o]
+        para (var r: inteiro = 0; r < obj.relocs.tamanho(); r++) {
+            const rel: qualquer = obj.relocs[r]
+            se (rel.rType == ec.R_X86_64_TLSGD) {
+                skipTlsReloc["${o}:${rel.alvoSecIdx}:${rel.rOffset + 8}"] = verdadeiro
+                skipTlsReloc["${o}:${rel.alvoSecIdx}:${rel.rOffset + 7}"] = verdadeiro
+            } senao se (rel.rType == ec.R_X86_64_TLSLD) {
+                skipTlsReloc["${o}:${rel.alvoSecIdx}:${rel.rOffset + 5}"] = verdadeiro
+                skipTlsReloc["${o}:${rel.alvoSecIdx}:${rel.rOffset + 6}"] = verdadeiro
+            }
+        }
+    }
+
+    mapaDynSyms["__libc_start_main"] = 0
+    dynSyms.empilhar("__libc_start_main")
+    mapaPltSyms["__libc_start_main"] = 0
+    pltSyms.empilhar("__libc_start_main")
+    dynStrongRef["__libc_start_main"] = verdadeiro
 
     para (var o: inteiro = 0; o < objs.tamanho(); o++) {
         const obj: qualquer = objs[o]
@@ -412,8 +708,12 @@ funcao prepararEstadoLink(objs: qualquer[], arquivosAr: qualquer[], defsPrevia: 
             const rel: qualquer = obj.relocs[r]
             const chaveAlvo: texto = "${o}:${rel.alvoSecIdx}"
             se (!secTipoDest.contem(chaveAlvo)) continua
+            se (rel.rType == ec.R_X86_64_NONE) continua
             const sym: qualquer = obj.simbolos[rel.symIdx]
-            const ehGotRel: logico = rel.rType == ec.R_X86_64_GOTPCREL ou rel.rType == ec.R_X86_64_GOTPCRELX ou rel.rType == ec.R_X86_64_REX_GOTPCRELX
+            se (sym.nome == "__tls_get_addr" e skipTlsReloc.contem("${o}:${rel.alvoSecIdx}:${rel.rOffset}")) continua
+
+            const ehGotRel: logico = rel.rType == ec.R_X86_64_GOTPCREL ou rel.rType == ec.R_X86_64_GOTPCRELX ou rel.rType == ec.R_X86_64_REX_GOTPCRELX ou rel.rType == ec.R_X86_64_GOTTPOFF
+            const ehTlsDynRel: logico = rel.rType == ec.R_X86_64_GOTTPOFF ou rel.rType == ec.R_X86_64_TLSGD ou rel.rType == ec.R_X86_64_GOTPC32_TLSDESC ou rel.rType == ec.R_X86_64_TLSDESC_CALL
             se (sym.shndx == ec.SHN_UNDEF e sym.nome.tamanho() > 0) {
                 se (globDefObj.contem(sym.nome)) {
                     se (ehGotRel e !mapaLocalGot.contem(sym.nome)) {
@@ -425,7 +725,15 @@ funcao prepararEstadoLink(objs: qualquer[], arquivosAr: qualquer[], defsPrevia: 
                         mapaDynSyms[sym.nome] = dynSyms.tamanho()
                         dynSyms.empilhar(sym.nome)
                     }
-                    se ((rel.rType == ec.R_X86_64_PLT32 ou rel.rType == ec.R_X86_64_PC32 ou rel.rType == ec.R_X86_64_64) e !mapaPltSyms.contem(sym.nome)) {
+                    se (sym.bind == ec.STB_WEAK) {
+                        se (!dynStrongRef.contem(sym.nome)) dynWeakSyms[sym.nome] = verdadeiro
+                    } senao {
+                        dynStrongRef[sym.nome] = verdadeiro
+                        se (dynWeakSyms.contem(sym.nome)) dynWeakSyms[sym.nome] = falso
+                    }
+                    se (ehTlsDynRel ou sym.tipoSym == ec.STT_TLS) {
+                        dynTlsSyms[sym.nome] = verdadeiro
+                    } senao se ((rel.rType == ec.R_X86_64_PLT32 ou rel.rType == ec.R_X86_64_PC32 ou rel.rType == ec.R_X86_64_64 ou rel.rType == ec.R_X86_64_32 ou rel.rType == ec.R_X86_64_32S ou rel.rType == ec.R_X86_64_PC64) e !mapaPltSyms.contem(sym.nome)) {
                         mapaPltSyms[sym.nome] = pltSyms.tamanho()
                         pltSyms.empilhar(sym.nome)
                     }
@@ -440,28 +748,47 @@ funcao prepararEstadoLink(objs: qualquer[], arquivosAr: qualquer[], defsPrevia: 
         }
     }
 
-    // 4. Monta _start (passando argc em rdi e argv em rsi) + stubs PLT + userText em finalText (Bytes)
+    // 4. Monta _start padrao System V AMD64 (via __libc_start_main@PLT) + stubs PLT + userText
     const finalText: qualquer = bytesMod.Bytes.criarReservado(64 + pltSyms.tamanho() * 6 + totalUserText)
-    finalText.anexarByte(72)
-    finalText.anexarByte(139)
-    finalText.anexarByte(60)
-    finalText.anexarByte(36)
-    finalText.anexarByte(72)
-    finalText.anexarByte(141)
-    finalText.anexarByte(116)
-    finalText.anexarByte(36)
-    finalText.anexarByte(8)
-    finalText.anexarByte(232)
-    const posCallMain: inteiro = finalText.tamanho()
-    finalText.anexarU32LE(0)
+    // xor %ebp, %ebp
+    finalText.anexarByte(49)
+    finalText.anexarByte(237)
+    // mov %rdx, %r9 (rtld_fini)
+    finalText.anexarByte(73)
+    finalText.anexarByte(137)
+    finalText.anexarByte(209)
+    // pop %rsi (argc)
+    finalText.anexarByte(94)
+    // mov %rsp, %rdx (argv)
     finalText.anexarByte(72)
     finalText.anexarByte(137)
-    finalText.anexarByte(199)
+    finalText.anexarByte(226)
+    // and $-16, %rsp
+    finalText.anexarByte(72)
+    finalText.anexarByte(131)
+    finalText.anexarByte(228)
+    finalText.anexarByte(240)
+    // push %rax ; push %rsp (stack_end)
+    finalText.anexarByte(80)
+    finalText.anexarByte(84)
+    // xor %r8d, %r8d (fini = NULL) ; xor %ecx, %ecx (init = NULL)
+    finalText.anexarByte(69)
     finalText.anexarByte(49)
     finalText.anexarByte(192)
-    finalText.anexarByte(232)
-    const posCallExit: inteiro = finalText.tamanho()
+    finalText.anexarByte(49)
+    finalText.anexarByte(201)
+    // lea main(%rip), %rdi
+    finalText.anexarByte(72)
+    finalText.anexarByte(141)
+    finalText.anexarByte(61)
+    const posLeaMain: inteiro = finalText.tamanho()
     finalText.anexarU32LE(0)
+    // call __libc_start_main@PLT
+    finalText.anexarByte(232)
+    const posCallLibcStart: inteiro = finalText.tamanho()
+    finalText.anexarU32LE(0)
+    // hlt
+    finalText.anexarByte(244)
     ec.preencherAlinhBytes(finalText, 16, 144)
 
     var pltOffsets: dicionario = {}
@@ -474,27 +801,41 @@ funcao prepararEstadoLink(objs: qualquer[], arquivosAr: qualquer[], defsPrevia: 
         finalText.anexarU32LE(0)
     }
 
-    ec.preencherAlinhBytes(finalText, 16, 144)
+    ec.preencherAlinhBytes(finalText, maxTextAlign, 144)
     const userTextBaseOff: inteiro = finalText.tamanho()
     se (userText.tamanho() > 0) finalText.anexarBytes(userText)
     userText.liberar()
 
     // 5. Layout do Segmento 1 (R+X) em Bytes
     const baseVaddr: inteiro = 4194304 // 0x400000
-    const numPhdrs: inteiro = 5
+    const numPhdrs: inteiro = tlsMemSize > 0 ? 7 : 6
     const headersFim: inteiro = 64 + numPhdrs * 56
 
     var libsFinais: texto[] = ["libc.so.6"]
     var libsVistas: dicionario = { "libc.so.6": verdadeiro }
     para (var i: inteiro = 0; i < libsEntrada.tamanho(); i++) {
         const l: texto = libsEntrada[i]
-        se (!libsVistas.contem(l)) {
+        se (l.tamanho() > 0 e !libsVistas.contem(l)) {
             libsVistas[l] = verdadeiro
             libsFinais.empilhar(l)
         }
     }
 
-    const corpoPreText: qualquer = bytesMod.Bytes.criarReservado(4096 + totalRodata)
+    var runpathStr: texto = ""
+    se (rpathsEntrada.tamanho() > 0) {
+        var rpsUnicos: texto[] = []
+        var rpsVistos: dicionario = {}
+        para (var i: inteiro = 0; i < rpathsEntrada.tamanho(); i++) {
+            const rp: texto = rpathsEntrada[i]
+            se (rp.tamanho() > 0 e !rpsVistos.contem(rp)) {
+                rpsVistos[rp] = verdadeiro
+                rpsUnicos.empilhar(rp)
+            }
+        }
+        runpathStr = rpsUnicos.juntar(":")
+    }
+
+    const corpoPreText: qualquer = bytesMod.Bytes.criarReservado(4096 + totalRodata + totalTdata)
 
     const offInterp: inteiro = headersFim + corpoPreText.tamanho()
     ec.anexarCStringBytes(corpoPreText, "/lib64/ld-linux-x86-64.so.2")
@@ -506,6 +847,11 @@ funcao prepararEstadoLink(objs: qualquer[], arquivosAr: qualquer[], defsPrevia: 
     var libNameOffs: inteiro[] = []
     para (var i: inteiro = 0; i < libsFinais.tamanho(); i++) {
         libNameOffs.empilhar(ec.anexarCStringBytes(dynstrBuf, libsFinais[i]))
+    }
+
+    var runpathOff: inteiro = -1
+    se (runpathStr.tamanho() > 0) {
+        runpathOff = ec.anexarCStringBytes(dynstrBuf, runpathStr)
     }
 
     var dynSymNameOffs: inteiro[] = []
@@ -521,9 +867,14 @@ funcao prepararEstadoLink(objs: qualquer[], arquivosAr: qualquer[], defsPrevia: 
     const numDyn: inteiro = dynSyms.tamanho()
     corpoPreText.anexarZeros(24)
     para (var i: inteiro = 0; i < numDyn; i++) {
+        const nmD: texto = dynSyms[i]
         corpoPreText.anexarU32LE(dynSymNameOffs[i])
-        const ehFnDyn: logico = mapaPltSyms.contem(dynSyms[i])
-        const infoDyn: inteiro = (ec.STB_GLOBAL << 4) | (ehFnDyn ? ec.STT_FUNC : ec.STT_NOTYPE)
+        const ehTlsD: logico = dynTlsSyms.contem(nmD)
+        const ehFnDyn: logico = mapaPltSyms.contem(nmD)
+        const ehWeakD: logico = dynWeakSyms.contem(nmD) e dynWeakSyms[nmD]
+        const bindD: inteiro = ehWeakD ? ec.STB_WEAK : ec.STB_GLOBAL
+        const tipoD: inteiro = ehTlsD ? ec.STT_TLS : (ehFnDyn ? ec.STT_FUNC : ec.STT_NOTYPE)
+        const infoDyn: inteiro = (bindD << 4) | tipoD
         corpoPreText.anexarByte(infoDyn)
         corpoPreText.anexarByte(0)
         corpoPreText.anexarU16LE(ec.SHN_UNDEF)
@@ -547,7 +898,8 @@ funcao prepararEstadoLink(objs: qualquer[], arquivosAr: qualquer[], defsPrevia: 
     const lenRela: inteiro = numDyn * 24
     se (lenRela > 0) corpoPreText.anexarZeros(lenRela)
 
-    ec.preencherAlinhBytes(corpoPreText, 8, 0)
+    const remRo: inteiro = (headersFim + corpoPreText.tamanho()) % maxRodataAlign
+    se (remRo != 0) corpoPreText.anexarZeros(maxRodataAlign - remRo)
     const posRodataNoBuf: inteiro = corpoPreText.tamanho()
     const offRodata: inteiro = headersFim + posRodataNoBuf
     const rodataVaddr: inteiro = baseVaddr + offRodata
@@ -555,7 +907,19 @@ funcao prepararEstadoLink(objs: qualquer[], arquivosAr: qualquer[], defsPrevia: 
     se (lenRodata > 0) corpoPreText.anexarBytes(mergedRodata)
     mergedRodata.liberar()
 
-    ec.preencherAlinhBytes(corpoPreText, 16, 0)
+    // Imagem inicial TLS (.tdata) dentro do segmento RX/R, alinhada a tlsAlign
+    const alTlsPad: inteiro = tlsAlign > 8 ? tlsAlign : 8
+    const remTls: inteiro = (headersFim + corpoPreText.tamanho()) % alTlsPad
+    se (remTls != 0) corpoPreText.anexarZeros(alTlsPad - remTls)
+    const posTdataNoBuf: inteiro = corpoPreText.tamanho()
+    const offTdata: inteiro = headersFim + posTdataNoBuf
+    const tdataVaddr: inteiro = baseVaddr + offTdata
+    const lenTdata: inteiro = mergedTdata.tamanho()
+    se (lenTdata > 0) corpoPreText.anexarBytes(mergedTdata)
+    mergedTdata.liberar()
+
+    const remTxt: inteiro = (headersFim + corpoPreText.tamanho()) % maxTextAlign
+    se (remTxt != 0) corpoPreText.anexarZeros(maxTextAlign - remTxt)
     const offText: inteiro = headersFim + corpoPreText.tamanho()
     const textVaddr: inteiro = baseVaddr + offText
     const lenText: inteiro = finalText.tamanho()
@@ -564,13 +928,41 @@ funcao prepararEstadoLink(objs: qualquer[], arquivosAr: qualquer[], defsPrevia: 
     // 6. Layout do Segmento 2 (R+W, pagina separada 4096 -> W^X estrito)
     const rwFileOff: inteiro = ec.alinharValor(rxSize, 4096)
     const rwVaddr: inteiro = baseVaddr + rwFileOff
-    const segRW: qualquer = bytesMod.Bytes.criarReservado(1024 + (numDyn + localGotSyms.tamanho()) * 8 + totalData)
+    const segRW: qualquer = bytesMod.Bytes.criarReservado(1024 + (numDyn + localGotSyms.tamanho()) * 8 + totalInitArray + totalFiniArray + totalData)
 
     const offDynamic: inteiro = rwFileOff + segRW.tamanho()
     const vaddrDynamic: inteiro = rwVaddr + segRW.tamanho()
+    var nDynEnt: inteiro = 0
     para (var i: inteiro = 0; i < libNameOffs.tamanho(); i++) {
         segRW.anexarU64LE(ec.DT_NEEDED)
         segRW.anexarU64LE(libNameOffs[i])
+        nDynEnt++
+    }
+
+    se (runpathOff >= 0) {
+        segRW.anexarU64LE(ec.DT_RUNPATH)
+        segRW.anexarU64LE(runpathOff)
+        nDynEnt++
+    }
+
+    var posDtInitArrVal: inteiro = -1
+    se (totalInitArray > 0) {
+        segRW.anexarU64LE(ec.DT_INIT_ARRAY)
+        posDtInitArrVal = segRW.tamanho()
+        segRW.anexarU64LE(0)
+        segRW.anexarU64LE(ec.DT_INIT_ARRAYSZ)
+        segRW.anexarU64LE(totalInitArray)
+        nDynEnt = nDynEnt + 2
+    }
+
+    var posDtFiniArrVal: inteiro = -1
+    se (totalFiniArray > 0) {
+        segRW.anexarU64LE(ec.DT_FINI_ARRAY)
+        posDtFiniArrVal = segRW.tamanho()
+        segRW.anexarU64LE(0)
+        segRW.anexarU64LE(ec.DT_FINI_ARRAYSZ)
+        segRW.anexarU64LE(totalFiniArray)
+        nDynEnt = nDynEnt + 2
     }
 
     segRW.anexarU64LE(ec.DT_HASH)
@@ -591,7 +983,7 @@ funcao prepararEstadoLink(objs: qualquer[], arquivosAr: qualquer[], defsPrevia: 
     segRW.anexarU64LE(24)
     segRW.anexarU64LE(ec.DT_NULL)
     segRW.anexarU64LE(0)
-    const lenDynamic: inteiro = (libNameOffs.tamanho() + 9) * 16
+    const lenDynamic: inteiro = (nDynEnt + 9) * 16
 
     ec.preencherAlinhBytes(segRW, 8, 0)
     const offGot: inteiro = rwFileOff + segRW.tamanho()
@@ -612,6 +1004,30 @@ funcao prepararEstadoLink(objs: qualquer[], arquivosAr: qualquer[], defsPrevia: 
     const lenGot: inteiro = (numDyn + localGotSyms.tamanho()) * 8
 
     ec.preencherAlinhBytes(segRW, 8, 0)
+    const posInitArrayNoRW: inteiro = segRW.tamanho()
+    const offInitArray: inteiro = rwFileOff + posInitArrayNoRW
+    const initArrayVaddr: inteiro = rwVaddr + posInitArrayNoRW
+    const lenInitArray: inteiro = mergedInitArray.tamanho()
+    se (lenInitArray > 0) {
+        segRW.anexarBytes(mergedInitArray)
+        se (posDtInitArrVal >= 0) segRW.definirU64LE(posDtInitArrVal, initArrayVaddr)
+    }
+
+    mergedInitArray.liberar()
+
+    ec.preencherAlinhBytes(segRW, 8, 0)
+    const posFiniArrayNoRW: inteiro = segRW.tamanho()
+    const offFiniArray: inteiro = rwFileOff + posFiniArrayNoRW
+    const finiArrayVaddr: inteiro = rwVaddr + posFiniArrayNoRW
+    const lenFiniArray: inteiro = mergedFiniArray.tamanho()
+    se (lenFiniArray > 0) {
+        segRW.anexarBytes(mergedFiniArray)
+        se (posDtFiniArrVal >= 0) segRW.definirU64LE(posDtFiniArrVal, finiArrayVaddr)
+    }
+
+    mergedFiniArray.liberar()
+
+    ec.preencherAlinhBytes(segRW, maxDataAlign, 0)
     const posDataNoRW: inteiro = segRW.tamanho()
     const offData: inteiro = rwFileOff + posDataNoRW
     const dataVaddr: inteiro = rwVaddr + posDataNoRW
@@ -619,7 +1035,7 @@ funcao prepararEstadoLink(objs: qualquer[], arquivosAr: qualquer[], defsPrevia: 
     se (lenData > 0) segRW.anexarBytes(mergedData)
     mergedData.liberar()
 
-    ec.preencherAlinhBytes(segRW, 8, 0)
+    ec.preencherAlinhBytes(segRW, maxBssAlign, 0)
     const rwFileSize: inteiro = segRW.tamanho()
     const offBss: inteiro = rwFileOff + rwFileSize
     const bssVaddr: inteiro = rwVaddr + rwFileSize
@@ -632,6 +1048,9 @@ funcao prepararEstadoLink(objs: qualquer[], arquivosAr: qualquer[], defsPrevia: 
         const offS: inteiro = inteiro(secOffDest[ch])
         se (dstS == "TEXT") secFinalVaddr[ch] = textVaddr + userTextBaseOff + offS
         senao se (dstS == "RODATA") secFinalVaddr[ch] = rodataVaddr + offS
+        senao se (dstS == "TDATA" ou dstS == "TBSS") secFinalVaddr[ch] = offS - tlsBlockSize
+        senao se (dstS == "INIT_ARRAY") secFinalVaddr[ch] = initArrayVaddr + offS
+        senao se (dstS == "FINI_ARRAY") secFinalVaddr[ch] = finiArrayVaddr + offS
         senao se (dstS == "DATA") secFinalVaddr[ch] = dataVaddr + offS
         senao secFinalVaddr[ch] = bssVaddr + offS
     }
@@ -660,8 +1079,10 @@ funcao prepararEstadoLink(objs: qualquer[], arquivosAr: qualquer[], defsPrevia: 
 
     // 7. Preenche .rela.dyn, _start e stubs PLT
     para (var i: inteiro = 0; i < numDyn; i++) {
+        const nmR: texto = dynSyms[i]
         const rOffG: inteiro = vaddrGot + i * 8
-        const rInfoG: inteiro = ((i + 1) << 32) | ec.R_X86_64_GLOB_DAT
+        const relTipoDyn: inteiro = dynTlsSyms.contem(nmR) ? ec.R_X86_64_TPOFF64 : ec.R_X86_64_GLOB_DAT
+        const rInfoG: inteiro = ((i + 1) << 32) | relTipoDyn
         const pR: inteiro = posRelaNoBuf + i * 24
         corpoPreText.definirU64LE(pR, rOffG)
         corpoPreText.definirU64LE(pR + 8, rInfoG)
@@ -669,9 +1090,9 @@ funcao prepararEstadoLink(objs: qualquer[], arquivosAr: qualquer[], defsPrevia: 
     }
 
     const mainVaddr: inteiro = inteiro(globFinalVaddr["main"])
-    finalText.definirU32LE(posCallMain, mainVaddr - (textVaddr + posCallMain + 4))
-    const exitPltVaddr: inteiro = textVaddr + inteiro(pltOffsets["exit"])
-    finalText.definirU32LE(posCallExit, exitPltVaddr - (textVaddr + posCallExit + 4))
+    finalText.definirU32LE(posLeaMain, mainVaddr - (textVaddr + posLeaMain + 4))
+    const libcStartPltVaddr: inteiro = textVaddr + inteiro(pltOffsets["__libc_start_main"])
+    finalText.definirU32LE(posCallLibcStart, libcStartPltVaddr - (textVaddr + posCallLibcStart + 4))
 
     para (var i: inteiro = 0; i < pltSyms.tamanho(); i++) {
         const nm: texto = pltSyms[i]
@@ -721,6 +1142,21 @@ funcao prepararEstadoLink(objs: qualquer[], arquivosAr: qualquer[], defsPrevia: 
     est.posDataNoRW = posDataNoRW
     est.offBss = offBss
     est.bssVaddr = bssVaddr
+    est.offTdata = offTdata
+    est.lenTdata = lenTdata
+    est.tdataVaddr = tdataVaddr
+    est.posTdataNoBuf = posTdataNoBuf
+    est.tlsMemSize = tlsMemSize
+    est.tlsAlign = tlsAlign
+    est.tlsBlockSize = tlsBlockSize
+    est.offInitArray = offInitArray
+    est.lenInitArray = lenInitArray
+    est.initArrayVaddr = initArrayVaddr
+    est.posInitArrayNoRW = posInitArrayNoRW
+    est.offFiniArray = offFiniArray
+    est.lenFiniArray = lenFiniArray
+    est.finiArrayVaddr = finiArrayVaddr
+    est.posFiniArrayNoRW = posFiniArrayNoRW
     est.corpoPreText = corpoPreText
     est.finalText = finalText
     est.segRW = segRW
@@ -731,6 +1167,7 @@ funcao prepararEstadoLink(objs: qualquer[], arquivosAr: qualquer[], defsPrevia: 
     est.pltOffsets = pltOffsets
     est.gotVaddrs = gotVaddrs
     est.localGotPosRW = localGotPosRW
+    est.skipTlsReloc = skipTlsReloc
     retorna est
 }
 
@@ -746,13 +1183,17 @@ assincrona funcao aplicarRelocacoesParAsync(est: EstadoLink, workers: inteiro, d
     const pltOffsets: dicionario = est.pltOffsets
     const gotVaddrs: dicionario = est.gotVaddrs
     const localGotPosRW: dicionario = est.localGotPosRW
+    const skipTlsReloc: dicionario = est.skipTlsReloc
     const corpoPreText: qualquer = est.corpoPreText
     const finalText: qualquer = est.finalText
     const segRW: qualquer = est.segRW
     const textVaddr: inteiro = est.textVaddr
     const userTextBaseOff: inteiro = est.userTextBaseOff
     const posDataNoRW: inteiro = est.posDataNoRW
+    const posInitArrayNoRW: inteiro = est.posInitArrayNoRW
+    const posFiniArrayNoRW: inteiro = est.posFiniArrayNoRW
     const posRodataNoBuf: inteiro = est.posRodataNoBuf
+    const posTdataNoBuf: inteiro = est.posTdataNoBuf
 
     const nLotes: inteiro = workers < objs.tamanho() ? workers : (objs.tamanho() > 0 ? objs.tamanho() : 1)
     var lotesBufs: qualquer[] = []
@@ -772,10 +1213,13 @@ assincrona funcao aplicarRelocacoesParAsync(est: EstadoLink, workers: inteiro, d
             const rel: qualquer = obj.relocs[r]
             const chAlvo: texto = "${o}:${rel.alvoSecIdx}"
             se (!secTipoDest.contem(chAlvo)) continua
+            se (rel.rType == ec.R_X86_64_NONE) continua
+            const sym: qualquer = obj.simbolos[rel.symIdx]
+            se (sym.nome == "__tls_get_addr" e skipTlsReloc.contem("${o}:${rel.alvoSecIdx}:${rel.rOffset}")) continua
+
             const secAlvo: qualquer = obj.secoes[rel.alvoSecIdx]
             const dstSecNome: texto = texto(secTipoDest[chAlvo])
             const P: inteiro = inteiro(secFinalVaddr[chAlvo]) + rel.rOffset
-            const sym: qualquer = obj.simbolos[rel.symIdx]
             var S: inteiro = 0
             var ehDin: logico = falso
             var nomeGot: texto = sym.nome
@@ -802,14 +1246,39 @@ assincrona funcao aplicarRelocacoesParAsync(est: EstadoLink, workers: inteiro, d
                 }
                 S = inteiro(globFinalVaddr[sym.nome])
             }
-            const dstId: inteiro = dstSecNome == "TEXT" ? 1 : (dstSecNome == "DATA" ? 2 : 3)
+            var dstId: inteiro = 3
             var patchOff: inteiro = posRodataNoBuf + inteiro(secOffDest[chAlvo]) + rel.rOffset
-            se (dstId == 1) patchOff = userTextBaseOff + inteiro(secOffDest[chAlvo]) + rel.rOffset
-            senao se (dstId == 2) patchOff = posDataNoRW + inteiro(secOffDest[chAlvo]) + rel.rOffset
+            se (dstSecNome == "TEXT") {
+                dstId = 1
+                patchOff = userTextBaseOff + inteiro(secOffDest[chAlvo]) + rel.rOffset
+            } senao se (dstSecNome == "DATA") {
+                dstId = 2
+                patchOff = posDataNoRW + inteiro(secOffDest[chAlvo]) + rel.rOffset
+            } senao se (dstSecNome == "INIT_ARRAY") {
+                dstId = 2
+                patchOff = posInitArrayNoRW + inteiro(secOffDest[chAlvo]) + rel.rOffset
+            } senao se (dstSecNome == "FINI_ARRAY") {
+                dstId = 2
+                patchOff = posFiniArrayNoRW + inteiro(secOffDest[chAlvo]) + rel.rOffset
+            } senao se (dstSecNome == "TDATA") {
+                dstId = 3
+                patchOff = posTdataNoBuf + inteiro(secOffDest[chAlvo]) + rel.rOffset
+            }
             const temPlt: logico = pltOffsets.contem(sym.nome)
             const Lval: inteiro = temPlt ? textVaddr + inteiro(pltOffsets[sym.nome]) : 0
             const temGot: logico = gotVaddrs.contem(nomeGot)
             const Gval: inteiro = temGot ? inteiro(gotVaddrs[nomeGot]) : 0
+
+            se (rel.rType == ec.R_X86_64_TLSGD ou rel.rType == ec.R_X86_64_TLSLD ou rel.rType == ec.R_X86_64_GOTPC32_TLSDESC ou rel.rType == ec.R_X86_64_TLSDESC_CALL) {
+                se (dstId != 1) {
+                    diag.erroDireto(obj.nomeArquivo, 0, 0, "relocacao TLSGD/TLSLD/TLSDESC fora de secao .text",
+                        "", "", "E5013")
+                }
+                aplicarRelaxacaoTlsTexto(finalText, patchOff, P, S, Gval, rel.rAddend, ehDin,
+                    temGot, rel.rType, obj.nomeArquivo, diag)
+                continua
+            }
+
             lb.anexarU32LE(o)
             lb.anexarU32LE(r)
             lb.anexarByte(dstId)
@@ -901,13 +1370,17 @@ funcao aplicarRelocacoesSeq(est: EstadoLink, diag: qualquer): vazio {
     const pltOffsets: dicionario = est.pltOffsets
     const gotVaddrs: dicionario = est.gotVaddrs
     const localGotPosRW: dicionario = est.localGotPosRW
+    const skipTlsReloc: dicionario = est.skipTlsReloc
     const corpoPreText: qualquer = est.corpoPreText
     const finalText: qualquer = est.finalText
     const segRW: qualquer = est.segRW
     const textVaddr: inteiro = est.textVaddr
     const userTextBaseOff: inteiro = est.userTextBaseOff
     const posDataNoRW: inteiro = est.posDataNoRW
+    const posInitArrayNoRW: inteiro = est.posInitArrayNoRW
+    const posFiniArrayNoRW: inteiro = est.posFiniArrayNoRW
     const posRodataNoBuf: inteiro = est.posRodataNoBuf
+    const posTdataNoBuf: inteiro = est.posTdataNoBuf
 
     para (var o: inteiro = 0; o < objs.tamanho(); o++) {
         const obj: qualquer = objs[o]
@@ -915,10 +1388,13 @@ funcao aplicarRelocacoesSeq(est: EstadoLink, diag: qualquer): vazio {
             const rel: qualquer = obj.relocs[r]
             const chAlvo: texto = "${o}:${rel.alvoSecIdx}"
             se (!secTipoDest.contem(chAlvo)) continua
+            se (rel.rType == ec.R_X86_64_NONE) continua
+            const sym: qualquer = obj.simbolos[rel.symIdx]
+            se (sym.nome == "__tls_get_addr" e skipTlsReloc.contem("${o}:${rel.alvoSecIdx}:${rel.rOffset}")) continua
+
             const secAlvo: qualquer = obj.secoes[rel.alvoSecIdx]
             const dstSecNome: texto = texto(secTipoDest[chAlvo])
             const P: inteiro = inteiro(secFinalVaddr[chAlvo]) + rel.rOffset
-            const sym: qualquer = obj.simbolos[rel.symIdx]
 
             var S: inteiro = 0
             var ehDinamico: logico = falso
@@ -949,6 +1425,19 @@ funcao aplicarRelocacoesSeq(est: EstadoLink, diag: qualquer): vazio {
                         "", "", "E5012")
                 }
                 S = inteiro(globFinalVaddr[sym.nome])
+            }
+
+            se (rel.rType == ec.R_X86_64_TLSGD ou rel.rType == ec.R_X86_64_TLSLD ou rel.rType == ec.R_X86_64_GOTPC32_TLSDESC ou rel.rType == ec.R_X86_64_TLSDESC_CALL) {
+                se (dstSecNome != "TEXT") {
+                    diag.erroDireto(obj.nomeArquivo, 0, 0, "relocacao TLSGD/TLSLD/TLSDESC fora de secao .text",
+                        "", "", "E5013")
+                }
+                const offPatchTls: inteiro = userTextBaseOff + inteiro(secOffDest[chAlvo]) + rel.rOffset
+                const temGotT: logico = gotVaddrs.contem(nomeGot)
+                const gValT: inteiro = temGotT ? inteiro(gotVaddrs[nomeGot]) : 0
+                aplicarRelaxacaoTlsTexto(finalText, offPatchTls, P, S, gValT, rel.rAddend,
+                    ehDinamico, temGotT, rel.rType, obj.nomeArquivo, diag)
+                continua
             }
 
             var valPatch: inteiro = 0
@@ -985,6 +1474,7 @@ funcao aplicarRelocacoesSeq(est: EstadoLink, diag: qualquer): vazio {
                 caso ec.R_X86_64_GOTPCREL:
                 caso ec.R_X86_64_GOTPCRELX:
                 caso ec.R_X86_64_REX_GOTPCRELX:
+                caso ec.R_X86_64_GOTTPOFF:
                 se (!gotVaddrs.contem(nomeGot)) {
                     diag.erroDireto(obj.nomeArquivo, 0, 0, "entrada GOT ausente para simbolo '${nomeGot}'",
                         "", "", "E5012")
@@ -992,14 +1482,52 @@ funcao aplicarRelocacoesSeq(est: EstadoLink, diag: qualquer): vazio {
                 const G: inteiro = inteiro(gotVaddrs[nomeGot])
                 valPatch = G + rel.rAddend - P
                 caso ec.R_X86_64_32:
-                valPatch = S + rel.rAddend
+                se (ehDinamico) {
+                    se (pltOffsets.contem(sym.nome)) {
+                        valPatch = textVaddr + inteiro(pltOffsets[sym.nome]) + rel.rAddend
+                    } senao {
+                        diag.erroDireto(obj.nomeArquivo, 0, 0, "relocacao R_X86_64_32 para simbolo dinamico '${sym.nome}' nao suportada",
+                            "", "", "E5013")
+                    }
+                } senao {
+                    valPatch = S + rel.rAddend
+                }
                 checarSigned32 = falso
                 se (valPatch < 0 ou valPatch > 4294967295) {
                     diag.erroDireto(obj.nomeArquivo, 0, 0, "estouro em relocacao R_X86_64_32 para '${sym.nome}'",
                         "", "", "E5014")
                 }
                 caso ec.R_X86_64_32S:
+                se (ehDinamico) {
+                    se (pltOffsets.contem(sym.nome)) {
+                        valPatch = textVaddr + inteiro(pltOffsets[sym.nome]) + rel.rAddend
+                    } senao {
+                        diag.erroDireto(obj.nomeArquivo, 0, 0, "relocacao R_X86_64_32S para simbolo dinamico '${sym.nome}' nao suportada",
+                            "", "", "E5013")
+                    }
+                } senao {
+                    valPatch = S + rel.rAddend
+                }
+                caso ec.R_X86_64_DTPOFF64:
                 valPatch = S + rel.rAddend
+                larguraPatch = 8
+                checarSigned32 = falso
+                caso ec.R_X86_64_DTPOFF32:
+                caso ec.R_X86_64_TPOFF32:
+                valPatch = S + rel.rAddend
+                caso ec.R_X86_64_PC64:
+                se (ehDinamico) {
+                    se (pltOffsets.contem(sym.nome)) {
+                        valPatch = textVaddr + inteiro(pltOffsets[sym.nome]) + rel.rAddend - P
+                    } senao {
+                        diag.erroDireto(obj.nomeArquivo, 0, 0, "relocacao R_X86_64_PC64 para simbolo dinamico '${sym.nome}' nao suportada",
+                            "", "", "E5013")
+                    }
+                } senao {
+                    valPatch = S + rel.rAddend - P
+                }
+                larguraPatch = 8
+                checarSigned32 = falso
                 padrao:
                 diag.erroDireto(obj.nomeArquivo, 0, 0, "tipo de relocacao x86-64 nao suportado: ${rel.rType}",
                     "", "", "E5013")
@@ -1023,16 +1551,18 @@ funcao aplicarRelocacoesSeq(est: EstadoLink, diag: qualquer): vazio {
                 }
                 se (larguraPatch == 8) finalText.definirU64LE(offPatchT, valPatch)
                 senao finalText.definirU32LE(offPatchT, valPatch)
-            } senao se (dstSecNome == "DATA") {
-                const offPatchD: inteiro = posDataNoRW + inteiro(secOffDest[chAlvo]) + rel.rOffset
+            } senao se (dstSecNome == "DATA" ou dstSecNome == "INIT_ARRAY" ou dstSecNome == "FINI_ARRAY") {
+                const baseRwP: inteiro = dstSecNome == "DATA" ? posDataNoRW : (dstSecNome == "INIT_ARRAY" ? posInitArrayNoRW : posFiniArrayNoRW)
+                const offPatchD: inteiro = baseRwP + inteiro(secOffDest[chAlvo]) + rel.rOffset
                 se (offPatchD < 0 ou offPatchD + larguraPatch > segRW.tamanho()) {
                     diag.erroDireto(obj.nomeArquivo, 0, 0, "patch fora dos limites de .data",
                         "", "", "E5015")
                 }
                 se (larguraPatch == 8) segRW.definirU64LE(offPatchD, valPatch)
                 senao segRW.definirU32LE(offPatchD, valPatch)
-            } senao se (dstSecNome == "RODATA") {
-                const offPatchR: inteiro = posRodataNoBuf + inteiro(secOffDest[chAlvo]) + rel.rOffset
+            } senao se (dstSecNome == "RODATA" ou dstSecNome == "TDATA") {
+                const baseRoP: inteiro = dstSecNome == "RODATA" ? posRodataNoBuf : posTdataNoBuf
+                const offPatchR: inteiro = baseRoP + inteiro(secOffDest[chAlvo]) + rel.rOffset
                 se (offPatchR < 0 ou offPatchR + larguraPatch > corpoPreText.tamanho()) {
                     diag.erroDireto(obj.nomeArquivo, 0, 0, "patch fora dos limites de .rodata",
                         "", "", "E5015")
@@ -1082,10 +1612,27 @@ funcao finalizarElfLink(est: EstadoLink): qualquer {
     const lenData: inteiro = est.lenData
     const offBss: inteiro = est.offBss
     const bssVaddr: inteiro = est.bssVaddr
+    const offTdata: inteiro = est.offTdata
+    const lenTdata: inteiro = est.lenTdata
+    const tdataVaddr: inteiro = est.tdataVaddr
+    const tlsMemSize: inteiro = est.tlsMemSize
+    const tlsAlign: inteiro = est.tlsAlign
+    const offInitArray: inteiro = est.offInitArray
+    const lenInitArray: inteiro = est.lenInitArray
+    const initArrayVaddr: inteiro = est.initArrayVaddr
+    const offFiniArray: inteiro = est.offFiniArray
+    const lenFiniArray: inteiro = est.lenFiniArray
+    const finiArrayVaddr: inteiro = est.finiArrayVaddr
     const corpoPreText: qualquer = est.corpoPreText
     const finalText: qualquer = est.finalText
     const segRW: qualquer = est.segRW
-    const shstrtab: qualquer = bytesMod.Bytes.criarReservado(128)
+
+    const temTdata: logico = lenTdata > 0
+    const temTbss: logico = tlsMemSize > lenTdata
+    const temInitArr: logico = lenInitArray > 0
+    const temFiniArr: logico = lenFiniArray > 0
+
+    const shstrtab: qualquer = bytesMod.Bytes.criarReservado(256)
     shstrtab.anexarByte(0)
     const nInterp: inteiro = ec.anexarCStringBytes(shstrtab, ".interp")
     const nDynstr: inteiro = ec.anexarCStringBytes(shstrtab, ".dynstr")
@@ -1093,9 +1640,13 @@ funcao finalizarElfLink(est: EstadoLink): qualquer {
     const nHash: inteiro = ec.anexarCStringBytes(shstrtab, ".hash")
     const nRela: inteiro = ec.anexarCStringBytes(shstrtab, ".rela.dyn")
     const nRodata: inteiro = ec.anexarCStringBytes(shstrtab, ".rodata")
+    const nTdata: inteiro = temTdata ? ec.anexarCStringBytes(shstrtab, ".tdata") : 0
+    const nTbss: inteiro = temTbss ? ec.anexarCStringBytes(shstrtab, ".tbss") : 0
     const nText: inteiro = ec.anexarCStringBytes(shstrtab, ".text")
     const nDynamic: inteiro = ec.anexarCStringBytes(shstrtab, ".dynamic")
     const nGot: inteiro = ec.anexarCStringBytes(shstrtab, ".got")
+    const nInitArr: inteiro = temInitArr ? ec.anexarCStringBytes(shstrtab, ".init_array") : 0
+    const nFiniArr: inteiro = temFiniArr ? ec.anexarCStringBytes(shstrtab, ".fini_array") : 0
     const nData: inteiro = ec.anexarCStringBytes(shstrtab, ".data")
     const nBss: inteiro = ec.anexarCStringBytes(shstrtab, ".bss")
     const nShstrtab: inteiro = ec.anexarCStringBytes(shstrtab, ".shstrtab")
@@ -1103,7 +1654,7 @@ funcao finalizarElfLink(est: EstadoLink): qualquer {
     const offShstrtab: inteiro = rwFileOff + rwFileSize
     const lenShstrtab: inteiro = shstrtab.tamanho()
     const offShdrs: inteiro = ec.alinharValor(offShstrtab + lenShstrtab, 8)
-    const numShdrs: inteiro = 13
+    const numShdrs: inteiro = 13 + (temTdata ? 1 : 0) + (temTbss ? 1 : 0) + (temInitArr ? 1 : 0) + (temFiniArr ? 1 : 0)
 
     // 10. Monta o binario ELF64 executavel final em uma unica alocacao Bytes pre-dimensionada
     const tamFinalElf: inteiro = offShdrs + numShdrs * 64
@@ -1128,9 +1679,9 @@ funcao finalizarElfLink(est: EstadoLink): qualquer {
     elf.anexarU16LE(numPhdrs)
     elf.anexarU16LE(64)
     elf.anexarU16LE(numShdrs)
-    elf.anexarU16LE(12)
+    elf.anexarU16LE(numShdrs - 1)
 
-    // 5 Program Headers (W^X: segmento RX e segmento RW em paginas separadas)
+    // Program Headers (W^X estrito + PT_TLS opcional + PT_GNU_STACK nao-executavel)
     ec.anexarPhdrBytes(elf, ec.PT_PHDR, ec.PF_R, 64, baseVaddr + 64, numPhdrs * 56, numPhdrs * 56,
         8)
     ec.anexarPhdrBytes(elf, ec.PT_INTERP, ec.PF_R, offInterp, baseVaddr + offInterp, lenInterp,
@@ -1141,6 +1692,12 @@ funcao finalizarElfLink(est: EstadoLink): qualquer {
         rwFileSize + mergedBssSize, 4096)
     ec.anexarPhdrBytes(elf, ec.PT_DYNAMIC, ec.PF_R | ec.PF_W, offDynamic, vaddrDynamic, lenDynamic,
         lenDynamic, 8)
+    se (tlsMemSize > 0) {
+        ec.anexarPhdrBytes(elf, ec.PT_TLS, ec.PF_R, offTdata, tdataVaddr, lenTdata, tlsMemSize,
+            tlsAlign)
+    }
+
+    ec.anexarPhdrBytes(elf, ec.PT_GNU_STACK, ec.PF_R | ec.PF_W, 0, 0, 0, 0, 16)
 
     elf.anexarBytes(corpoPreText)
     elf.anexarBytes(finalText)
@@ -1164,16 +1721,37 @@ funcao finalizarElfLink(est: EstadoLink): qualquer {
         lenRela, 3, 0, 8, 24)
     ec.anexarShdrBytes(elf, nRodata, ec.SHT_PROGBITS, ec.SHF_ALLOC, rodataVaddr, offRodata,
         lenRodata, 0, 0, 8, 0)
+    se (temTdata) {
+        ec.anexarShdrBytes(elf, nTdata, ec.SHT_PROGBITS, ec.SHF_ALLOC | ec.SHF_WRITE | ec.SHF_TLS,
+            tdataVaddr, offTdata, lenTdata, 0, 0, tlsAlign, 0)
+    }
+
+    se (temTbss) {
+        ec.anexarShdrBytes(elf, nTbss, ec.SHT_NOBITS, ec.SHF_ALLOC | ec.SHF_WRITE | ec.SHF_TLS,
+            tdataVaddr + lenTdata, offTdata + lenTdata, tlsMemSize - lenTdata, 0, 0, tlsAlign,
+            0)
+    }
+
     ec.anexarShdrBytes(elf, nText, ec.SHT_PROGBITS, ec.SHF_ALLOC | ec.SHF_EXECINSTR, textVaddr,
         offText, lenText, 0, 0, 16, 0)
     ec.anexarShdrBytes(elf, nDynamic, ec.SHT_DYNAMIC, ec.SHF_ALLOC | ec.SHF_WRITE, vaddrDynamic,
         offDynamic, lenDynamic, 2, 0, 8, 16)
     ec.anexarShdrBytes(elf, nGot, ec.SHT_PROGBITS, ec.SHF_ALLOC | ec.SHF_WRITE, vaddrGot,
         offGot, lenGot, 0, 0, 8, 8)
+    se (temInitArr) {
+        ec.anexarShdrBytes(elf, nInitArr, ec.SHT_INIT_ARRAY, ec.SHF_ALLOC | ec.SHF_WRITE,
+            initArrayVaddr, offInitArray, lenInitArray, 0, 0, 8, 8)
+    }
+
+    se (temFiniArr) {
+        ec.anexarShdrBytes(elf, nFiniArr, ec.SHT_FINI_ARRAY, ec.SHF_ALLOC | ec.SHF_WRITE,
+            finiArrayVaddr, offFiniArray, lenFiniArray, 0, 0, 8, 8)
+    }
+
     ec.anexarShdrBytes(elf, nData, ec.SHT_PROGBITS, ec.SHF_ALLOC | ec.SHF_WRITE, dataVaddr,
-        offData, lenData, 0, 0, 8, 0)
+        offData, lenData, 0, 0, 16, 0)
     ec.anexarShdrBytes(elf, nBss, ec.SHT_NOBITS, ec.SHF_ALLOC | ec.SHF_WRITE, bssVaddr, offBss,
-        mergedBssSize, 0, 0, 8, 0)
+        mergedBssSize, 0, 0, 16, 0)
     ec.anexarShdrBytes(elf, nShstrtab, ec.SHT_STRTAB, 0, 0, offShstrtab, lenShstrtab, 0,
         0, 1, 0)
 
@@ -1183,7 +1761,7 @@ funcao finalizarElfLink(est: EstadoLink): qualquer {
 // Entrada assincrona principal do linker: suporta leitura/validacao concorrente de .o e membros .a
 // via `rotina` (Bytes congelado zero-copy) preservando a ordem exata da linha de comando.
 assincrona funcao linkarObjetosELF64BytesAsync(listaDados: qualquer[], nomesArquivos: texto[],
-    libsEntrada: texto[], diag: qualquer, workers: inteiro = 1): qualquer {
+    libsEntrada: texto[], diag: qualquer, workers: inteiro = 1, rpathsEntrada: texto[] = []): qualquer {
     const leitor: qualquer = importar("elf_leitor.delegua")
     const asyncMod: qualquer = importar("cgd:assincrono")
 
@@ -1256,7 +1834,7 @@ assincrona funcao linkarObjetosELF64BytesAsync(listaDados: qualquer[], nomesArqu
     }
 
     const est: EstadoLink = prepararEstadoLink(objs, arquivosAr, defsPrevia, libsEntrada,
-        diag)
+        diag, rpathsEntrada)
     se (workers > 1 e (est.totalRelocsLink >= 20000 ou (forcarParLnk e est.totalRelocsLink >= 2000))) {
         aguardar aplicarRelocacoesParAsync(est, workers, diag)
     } senao {
@@ -1267,7 +1845,7 @@ assincrona funcao linkarObjetosELF64BytesAsync(listaDados: qualquer[], nomesArqu
 }
 
 funcao linkarObjetosELF64Bytes(listaDados: qualquer[], nomesArquivos: texto[], libsEntrada: texto[],
-    diag: qualquer): qualquer {
+    diag: qualquer, rpathsEntrada: texto[] = []): qualquer {
     const leitor: qualquer = importar("elf_leitor.delegua")
     var objs: qualquer[] = []
     var arquivosAr: qualquer[] = []
@@ -1289,7 +1867,7 @@ funcao linkarObjetosELF64Bytes(listaDados: qualquer[], nomesArquivos: texto[], l
     }
 
     const est: EstadoLink = prepararEstadoLink(objs, arquivosAr, defsPrevia, libsEntrada,
-        diag)
+        diag, rpathsEntrada)
     aplicarRelocacoesSeq(est, diag)
     retorna finalizarElfLink(est)
 }

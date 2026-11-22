@@ -747,3 +747,90 @@ funcao materializarObjetoDeWorker(dadosOrig: qualquer, nomeArq: texto, pacoteRaw
 
     retorna obj
 }
+
+// Extrai o DT_SONAME real de uma biblioteca compartilhada ELF64 (.so) ou de um linker script GNU ld.
+// Retorna texto vazio caso nao consiga identificar um SONAME explicito.
+funcao lerSonameDeSharedObj(caminho: texto): texto {
+    const BytesMod: qualquer = importar("cgd:bytes")
+    const ec: qualquer = importar("../object/elf/elf_comum.delegua")
+    const camMod: qualquer = importar("cgd:caminhos")
+    const texMod: qualquer = importar("cgd:textos")
+
+    tente {
+        const dados: qualquer = BytesMod.Bytes.lerArquivo(caminho)
+        const nBytes: inteiro = dados.tamanho()
+        se (nBytes < 16) retorna ""
+
+        // Caso 1: ELF64 ET_DYN real
+        se (dados.obter(0) == ec.ELF_MAGIC_0 e dados.obter(1) == ec.ELF_MAGIC_1 e dados.obter(2) == ec.ELF_MAGIC_2 e dados.obter(3) == ec.ELF_MAGIC_3) {
+            se (nBytes < 64) retorna ""
+            se (dados.obter(4) != ec.ELFCLASS64 ou dados.obter(5) != ec.ELFDATA2LSB) retorna ""
+            const eType: inteiro = dados.lerU16LE(16)
+            se (eType != ec.ET_DYN) retorna ""
+
+            const eShoff: inteiro = dados.lerU64LE(40)
+            const eShentsize: inteiro = dados.lerU16LE(58)
+            const eShnum: inteiro = dados.lerU16LE(60)
+            se (eShentsize < 64 ou eShnum <= 0 ou eShoff < 64 ou eShoff > nBytes ou eShnum > (nBytes - eShoff) \ eShentsize) {
+                retorna ""
+            }
+
+            para (var i: inteiro = 0; i < eShnum; i++) {
+                const base: inteiro = eShoff + i * eShentsize
+                const shType: inteiro = dados.lerU32LE(base + 4)
+                se (shType != ec.SHT_DYNAMIC) continua
+                const dynOff: inteiro = dados.lerU64LE(base + 24)
+                const dynSz: inteiro = dados.lerU64LE(base + 32)
+                const dynLink: inteiro = dados.lerU32LE(base + 40)
+                se (dynLink <= 0 ou dynLink >= eShnum ou dynOff < 0 ou dynSz <= 0 ou dynOff > nBytes ou dynSz > nBytes - dynOff) {
+                    retorna ""
+                }
+                const strBase: inteiro = eShoff + dynLink * eShentsize
+                const strOff: inteiro = dados.lerU64LE(strBase + 24)
+                const strSz: inteiro = dados.lerU64LE(strBase + 32)
+                se (strOff < 0 ou strSz <= 0 ou strOff > nBytes ou strSz > nBytes - strOff) {
+                    retorna ""
+                }
+                const strFim: inteiro = strOff + strSz
+                const nEnt: inteiro = dynSz \ 16
+                para (var idxEnt: inteiro = 0; idxEnt < nEnt; idxEnt++) {
+                    const p: inteiro = dynOff + idxEnt * 16
+                    const dTag: inteiro = dados.lerU64LE(p)
+                    const dVal: inteiro = dados.lerU64LE(p + 8)
+                    se (dTag == ec.DT_NULL) sustar
+                    se (dTag == ec.DT_SONAME e dVal >= 0 e dVal < strSz) {
+                        retorna dados.lerCString(strOff + dVal, strFim)
+                    }
+                }
+            }
+            retorna ""
+        }
+
+        // Caso 2: GNU ld linker script ASCII (ex.: /usr/lib64/libc.so, libm.so, libgcc_s.so)
+        se (nBytes <= 16384) {
+            const txt: texto = dados.paraTexto()
+            se (texMod.Textos.contar(txt, "GROUP") > 0 ou texMod.Textos.contar(txt, "INPUT") > 0) {
+                var tok: texto = ""
+                para (var k: inteiro = 0; k < txt.tamanho(); k++) {
+                    const ch: texto = txt[k]
+                    const sep: logico = ch == " " ou ch == "\t" ou ch == "\n" ou ch == "\r" ou ch == "(" ou ch == ")" ou ch == "," ou ch == "\""
+                    se (sep) {
+                        se (tok.tamanho() > 0 e texMod.Textos.contar(tok, ".so.") > 0) {
+                            retorna camMod.Caminhos.nome(tok)
+                        }
+                        tok = ""
+                    } senao {
+                        tok = tok + ch
+                    }
+                }
+                se (tok.tamanho() > 0 e texMod.Textos.contar(tok, ".so.") > 0) {
+                    retorna camMod.Caminhos.nome(tok)
+                }
+            }
+        }
+    } pegue (erro: Excecao) {
+        retorna ""
+    }
+
+    retorna ""
+}

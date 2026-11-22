@@ -33,6 +33,8 @@ classe ConstrutorSSA {
     blocosLabel: dicionario
     alvosBreak: texto[]
     alvosContinue: texto[]
+    cursorLocais: inteiro
+    fnTemLabel: logico
 
     construtor(modulo: qualquer, fn: qualquer, tabela: qualquer) {
         isto.tMod = importar("../types/tipos.delegua")
@@ -53,6 +55,8 @@ classe ConstrutorSSA {
         isto.blocosLabel = {}
         isto.alvosBreak = []
         isto.alvosContinue = []
+        isto.cursorLocais = 0
+        isto.fnTemLabel = falso
         isto.blocoAtual = isto.criarBloco("entry")
     }
 
@@ -82,8 +86,21 @@ classe ConstrutorSSA {
     alocarBytes(tamBytes: inteiro): inteiro {
         const resto: inteiro = tamBytes % 8
         const tam: inteiro = tamBytes <= 0 ? 8 : (resto == 0 ? tamBytes : tamBytes + (8 - resto))
-        isto.fn.tamanhoLocaisBytes = isto.fn.tamanhoLocaisBytes + tam
-        retorna isto.fn.tamanhoLocaisBytes
+        isto.cursorLocais = isto.cursorLocais + tam
+        se (isto.cursorLocais > isto.fn.tamanhoLocaisBytes) {
+            isto.fn.tamanhoLocaisBytes = isto.cursorLocais
+        }
+        retorna isto.cursorLocais
+    }
+
+    contemLabelRec(no: qualquer): logico {
+        se (no == nulo) retorna falso
+        se (no.kind == isto.Kind.StmtLabel) retorna verdadeiro
+        se (no.filhos == nulo) retorna falso
+        para (var i: inteiro = 0; i < no.filhos.tamanho(); i++) {
+            se (isto.contemLabelRec(no.filhos[i])) retorna verdadeiro
+        }
+        retorna falso
     }
 
     alocarVar(nome: texto, tipoC: qualquer): inteiro {
@@ -552,6 +569,8 @@ classe ConstrutorSSA {
             caso isto.Kind.DeclTypedef:
             retorna
             caso isto.Kind.Bloco:
+            const savedCurBloco: inteiro = isto.cursorLocais
+            const temLblBloco: logico = isto.fnTemLabel ? isto.contemLabelRec(stmt) : falso
             isto.escoposOffset.empilhar({})
             isto.escoposStatic.empilhar({})
             isto.escoposVla.empilhar({})
@@ -561,6 +580,9 @@ classe ConstrutorSSA {
             isto.escoposOffset.removerUltimo()
             isto.escoposStatic.removerUltimo()
             isto.escoposVla.removerUltimo()
+            se (!temLblBloco) {
+                isto.cursorLocais = savedCurBloco
+            }
             retorna
             caso isto.Kind.VarDecl:
             se (stmt.ehStatic) {
@@ -688,6 +710,8 @@ classe ConstrutorSSA {
             isto.blocoAtual = bbFimD
             retorna
             caso isto.Kind.StmtFor:
+            const savedCurFor: inteiro = isto.cursorLocais
+            const temLblFor: logico = isto.fnTemLabel ? isto.contemLabelRec(stmt) : falso
             isto.escoposOffset.empilhar({})
             isto.escoposStatic.empilhar({})
             isto.escoposVla.empilhar({})
@@ -725,6 +749,9 @@ classe ConstrutorSSA {
             isto.escoposOffset.removerUltimo()
             isto.escoposStatic.removerUltimo()
             isto.escoposVla.removerUltimo()
+            se (!temLblFor) {
+                isto.cursorLocais = savedCurFor
+            }
             retorna
             caso isto.Kind.StmtSwitch:
             const valAlvo: inteiro = isto.baixarExpr(stmt.filhos[0])
@@ -1908,6 +1935,7 @@ funcao construirFuncaoSSA(no: qualquer, tabela: qualquer, modulo: qualquer): qua
         }
     }
 
+    builder.fnTemLabel = builder.contemLabelRec(no.filhos[1])
     builder.baixarStmt(no.filhos[1])
     no.filhos = []
     se (!builder.blocoAtual.terminado) {

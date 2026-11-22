@@ -900,11 +900,111 @@ def rodar_testes_linker_cruzado(tmp: Path) -> int:
     rph = subprocess.run(["readelf", "-W", "-l", str(tmp / "l1")], capture_output=True, text=True, env=env_c, check=True).stdout
     rsh = subprocess.run(["readelf", "-W", "-S", str(tmp / "l1")], capture_output=True, text=True, env=env_c, check=True).stdout
     rldd = subprocess.run(["ldd", str(tmp / "l1")], capture_output=True, text=True, env=env_c, check=True).stdout
-    if "REL (Relocatable file)" not in rh_obj or "RWE" in rph or ".shstrtab" not in rsh or "libc.so.6" not in rldd:
+    if "REL (Relocatable file)" not in rh_obj or "RWE" in rph or "GNU_STACK" not in rph or ".shstrtab" not in rsh or "libc.so.6" not in rldd:
         print("[FALHA AUDITORIA ELF64]")
         falhas += 1
     else:
         print("[OK] auditoria_elf64_et_rel_e_et_exec")
+
+    # Teste de objetos GCC -fPIC -O2 com TLS (.tdata + .tbss, TLSGD/TLSLD/DTPOFF32), .init_array e -pthread
+    (tmp / "tls_mod.c").write_text(
+        """
+#include <pthread.h>
+#include <stdint.h>
+
+__thread int g_tls_init = 17;
+__thread long g_tls_zero;
+static __thread int s_tls_local = 5;
+static int g_ctor_ran = 0;
+
+__attribute__((constructor))
+static void inicializar_mod(void) {
+    g_ctor_ran = 13;
+}
+
+static void *worker_tls(void *arg) {
+    int delta = *(int *)arg;
+    g_tls_init += delta;
+    g_tls_zero = 100 + delta;
+    s_tls_local += 2;
+    return (void *)(intptr_t)(g_tls_init + g_tls_zero + s_tls_local);
+}
+
+int testar_tls_e_ctor(void) {
+    pthread_t th;
+    int delta = 4;
+    void *ret_th = 0;
+    if (pthread_create(&th, 0, worker_tls, &delta) != 0) return -1;
+    if (pthread_join(th, &ret_th) != 0) return -2;
+    // Thread principal deve preservar g_tls_init=17, g_tls_zero=0, s_tls_local=5
+    int main_sum = g_tls_init + (int)g_tls_zero + s_tls_local + g_ctor_ran; // 17+0+5+13 = 35
+    int th_sum = (int)(intptr_t)ret_th; // 21+104+7 = 132
+    return (main_sum == 35 && th_sum == 132) ? 77 : (main_sum + th_sum);
+}
+""",
+        encoding="utf-8",
+    )
+    (tmp / "tls_main.c").write_text(
+        """
+#include <stdio.h>
+#include <stdlib.h>
+int testar_tls_e_ctor(void);
+int main(void) {
+    int r = testar_tls_e_ctor();
+    const char *envv = getenv("DCC_LINK_TEST_ENV");
+    printf("tls=%d env=%s\\n", r, envv ? envv : "none");
+    return r;
+}
+""",
+        encoding="utf-8",
+    )
+    subprocess.run(["gcc", "-std=gnu99", "-fPIC", "-O2", "-c", str(tmp / "tls_mod.c"), "-o", str(tmp / "tls_mod.o")], check=True)
+    subprocess.run([str(DCC_BIN), "-c", str(tmp / "tls_main.c"), "-o", str(tmp / "tls_main.o")], check=True)
+    r_tls = subprocess.run(
+        [str(DCC_BIN), str(tmp / "tls_main.o"), str(tmp / "tls_mod.o"), "-pthread", "-o", str(tmp / "tls_bin")],
+        capture_output=True, text=True, check=False,
+    )
+    if r_tls.returncode != 0:
+        print(f"[FALHA linker_tls_pthread_init_array] link rc={r_tls.returncode} err={r_tls.stderr}")
+        falhas += 1
+    else:
+        env_tls = dict(os.environ)
+        env_tls["DCC_LINK_TEST_ENV"] = "OK_ENV"
+        ex_tls = subprocess.run([str(tmp / "tls_bin")], capture_output=True, text=True, env=env_tls, check=False)
+        if ex_tls.returncode != 77 or ex_tls.stdout != "tls=77 env=OK_ENV\n":
+            print(f"[FALHA EXEC linker_tls_pthread_init_array] rc={ex_tls.returncode} out={ex_tls.stdout!r}")
+            falhas += 1
+        else:
+            print("[OK] linker_tls_pthread_init_array -> exit=77")
+
+    # Teste de biblioteca compartilhada .so com DT_SONAME e -Wl,-rpath (via -L/-l e .so direto)
+    so_dir = tmp / "solib"
+    so_dir.mkdir()
+    (tmp / "demo_so.c").write_text("int demo_so_mul(int a, int b) { return a * b + 3; }\n", encoding="utf-8")
+    so_real = so_dir / "libdccdemo.so.1"
+    so_link = so_dir / "libdccdemo.so"
+    subprocess.run(
+        ["gcc", "-shared", "-fPIC", "-Wl,-soname,libdccdemo.so.1", str(tmp / "demo_so.c"), "-o", str(so_real)],
+        check=True,
+    )
+    os.symlink(so_real.name, so_link)
+    (tmp / "so_main.c").write_text(
+        "int demo_so_mul(int a, int b);\nint main(void) { return demo_so_mul(6, 7); }\n",
+        encoding="utf-8",
+    )
+    subprocess.run([str(DCC_BIN), "-c", str(tmp / "so_main.c"), "-o", str(tmp / "so_main.o")], check=True)
+    for nome_so, cmd_so in [
+        ("linker_so_soname_rpath", [str(DCC_BIN), str(tmp / "so_main.o"), "-L", str(so_dir), "-ldccdemo", f"-Wl,-rpath,{so_dir}", "-o", str(tmp / "so_bin1")]),
+        ("linker_so_entrada_direta", [str(DCC_BIN), str(tmp / "so_main.o"), str(so_real), "-o", str(tmp / "so_bin2")]),
+    ]:
+        out_so = Path(cmd_so[-1])
+        r_so = subprocess.run(cmd_so, capture_output=True, text=True, check=False)
+        ec_so, _ = rodar_bin(out_so) if r_so.returncode == 0 else (-1, "")
+        if r_so.returncode != 0 or ec_so != 45:
+            print(f"[FALHA {nome_so}] rc={r_so.returncode} ec={ec_so} err={r_so.stderr}")
+            falhas += 1
+        else:
+            print(f"[OK] {nome_so} -> exit={ec_so}")
     return falhas
 
 

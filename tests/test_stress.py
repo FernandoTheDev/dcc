@@ -213,6 +213,84 @@ int main(void) {
     return 0
 
 
+def testar_stack_frame_e_recursao_profunda(tmp: Path) -> int:
+    """Valida reuso de slots SSA (linear-scan) e locais por bloco em recursao profunda e loops aninhados."""
+    casos = []
+    for k in range(48):
+        casos.append(
+            f"""        case {k}: {{
+            long buf[16];
+            buf[0] = x + {k};
+            buf[1] = (x * 3 + {k}) ^ (x >> 1);
+            buf[2] = (buf[0] > 0 && buf[1] != 0) ? (buf[0] + buf[1]) : (buf[0] - buf[1]);
+            for (int i = 0; i < 4; i++) {{
+                long outer_v = buf[i % 3] + i;
+                long acc_in = 0;
+                for (int j = 0; j < 3; j++) {{
+                    long tmp = (j == 1 && (i & 1)) ? (outer_v + j * 7) : (outer_v ^ (j + 1));
+                    acc_in += tmp;
+                }}
+                buf[i + 3] = acc_in;
+            }}
+            res = buf[3] + buf[4] + buf[5] + buf[6];
+            break;
+        }}"""
+        )
+
+    src = tmp / "deep_frame.c"
+    src.write_text(
+        """#include <stdio.h>
+#include <stdint.h>
+
+long rec_grande(int depth, long x) {
+    if (depth <= 0) return x;
+    long res = 0;
+    switch (depth % 48) {
+"""
+        + "\n".join(casos)
+        + """
+        default:
+            res = x + 1;
+            break;
+    }
+    return rec_grande(depth - 1, (res ^ (long)depth) & 0x7fffffffL);
+}
+
+int main(void) {
+    long ans = rec_grande(400, 17);
+    printf("%ld\\n", ans);
+    return (int)(ans % 200);
+}
+""",
+        encoding="utf-8",
+    )
+
+    ref_bin = tmp / "deep_gcc"
+    subprocess.run(["gcc", "-std=c99", "-O2", str(src), "-o", str(ref_bin)], check=True)
+    r_ref = subprocess.run([str(ref_bin)], capture_output=True, text=True, check=False)
+
+    for opt in ("-O0", "-O2"):
+        dcc_bin = tmp / f"deep_dcc_{opt[1:]}"
+        r_comp = subprocess.run(
+            [str(DCC_BIN), opt, str(src), "-o", str(dcc_bin)],
+            capture_output=True,
+            text=True,
+            check=False,
+        )
+        if r_comp.returncode != 0:
+            print(f"[FALHA DEEP_FRAME COMP {opt}] {r_comp.stderr}")
+            return 1
+        r_dcc = subprocess.run([str(dcc_bin)], capture_output=True, text=True, check=False)
+        if r_dcc.returncode != r_ref.returncode or r_dcc.stdout != r_ref.stdout:
+            print(
+                f"[FALHA DEEP_FRAME RUN {opt}] ref=({r_ref.returncode},{r_ref.stdout!r}) "
+                f"dcc=({r_dcc.returncode},{r_dcc.stdout!r})"
+            )
+            return 1
+        print(f"[OK] stress_stack_frame_recursao ({opt}) -> exit={r_dcc.returncode} out={r_dcc.stdout.strip()}")
+    return 0
+
+
 def main() -> int:
     if not DCC_BIN.exists():
         print(f"Binario nao encontrado: {DCC_BIN}")
@@ -223,6 +301,7 @@ def main() -> int:
         falhas += testar_projeto_multiarquivo_e_archive(tmp)
         falhas += testar_repeticao_e_concorrencia(tmp)
         falhas += rodar_benchmark_fases(tmp)
+        falhas += testar_stack_frame_e_recursao_profunda(tmp)
         print(f"\nResumo Estresse/Benchmark DCC: {'APROVADO' if falhas == 0 else f'{falhas} FALHA(S)'}")
         return 1 if falhas > 0 else 0
     finally:

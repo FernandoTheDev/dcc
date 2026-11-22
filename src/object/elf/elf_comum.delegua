@@ -10,6 +10,7 @@ const ELFDATA2LSB: inteiro = 1
 const EV_CURRENT: inteiro = 1
 const ET_REL: inteiro = 1
 const ET_EXEC: inteiro = 2
+const ET_DYN: inteiro = 3
 const EM_X86_64: inteiro = 62
 
 // Section Header Types (SHT_*)
@@ -22,18 +23,23 @@ const SHT_HASH: inteiro = 5
 const SHT_DYNAMIC: inteiro = 6
 const SHT_NOBITS: inteiro = 8
 const SHT_DYNSYM: inteiro = 11
+const SHT_INIT_ARRAY: inteiro = 14
+const SHT_FINI_ARRAY: inteiro = 15
 
 // Section Header Flags (SHF_*)
 const SHF_WRITE: inteiro = 1
 const SHF_ALLOC: inteiro = 2
 const SHF_EXECINSTR: inteiro = 4
 const SHF_INFO_LINK: inteiro = 64
+const SHF_TLS: inteiro = 1024
 
 // Program Header Types (PT_*) e Flags (PF_*)
 const PT_LOAD: inteiro = 1
 const PT_DYNAMIC: inteiro = 2
 const PT_INTERP: inteiro = 3
 const PT_PHDR: inteiro = 6
+const PT_TLS: inteiro = 7
+const PT_GNU_STACK: inteiro = 1685382481 // 0x6474e551
 const PF_X: inteiro = 1
 const PF_W: inteiro = 2
 const PF_R: inteiro = 4
@@ -64,8 +70,15 @@ const DT_RELASZ: inteiro = 8
 const DT_RELAENT: inteiro = 9
 const DT_STRSZ: inteiro = 10
 const DT_SYMENT: inteiro = 11
+const DT_SONAME: inteiro = 14
+const DT_INIT_ARRAY: inteiro = 25
+const DT_FINI_ARRAY: inteiro = 26
+const DT_INIT_ARRAYSZ: inteiro = 27
+const DT_FINI_ARRAYSZ: inteiro = 28
+const DT_RUNPATH: inteiro = 29
 
 // Relocations x86-64 (R_X86_64_*)
+const R_X86_64_NONE: inteiro = 0
 const R_X86_64_64: inteiro = 1
 const R_X86_64_PC32: inteiro = 2
 const R_X86_64_PLT32: inteiro = 4
@@ -73,7 +86,16 @@ const R_X86_64_GLOB_DAT: inteiro = 6
 const R_X86_64_GOTPCREL: inteiro = 9
 const R_X86_64_32: inteiro = 10
 const R_X86_64_32S: inteiro = 11
+const R_X86_64_DTPOFF64: inteiro = 17
+const R_X86_64_TPOFF64: inteiro = 18
+const R_X86_64_TLSGD: inteiro = 19
+const R_X86_64_TLSLD: inteiro = 20
+const R_X86_64_DTPOFF32: inteiro = 21
 const R_X86_64_GOTTPOFF: inteiro = 22
+const R_X86_64_TPOFF32: inteiro = 23
+const R_X86_64_PC64: inteiro = 24
+const R_X86_64_GOTPC32_TLSDESC: inteiro = 34
+const R_X86_64_TLSDESC_CALL: inteiro = 35
 const R_X86_64_GOTPCRELX: inteiro = 41
 const R_X86_64_REX_GOTPCRELX: inteiro = 42
 

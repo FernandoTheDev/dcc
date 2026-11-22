@@ -83,30 +83,74 @@ funcao resolverWorkersEfetivos(jobsSolicitado: inteiro, memPorTarefaBytes: intei
     retorna rec < 1 ? 1 : rec
 }
 
-// Busca primeiro biblioteca estatica lib<nome>.a em -L; se nao achar, mapeia para .so dinamica.
+funcao ehEntradaSharedObj(caminho: texto): logico {
+    const camMod: qualquer = importar("cgd:caminhos")
+    const texMod: qualquer = importar("cgd:textos")
+    const base: texto = camMod.Caminhos.nome(caminho)
+    retorna texMod.Textos.terminaCom(base, ".so") ou texMod.Textos.contar(base, ".so.") > 0
+}
+
+funcao ehEntradaBinariaLink(caminho: texto): logico {
+    const texMod: qualquer = importar("cgd:textos")
+    retorna texMod.Textos.terminaCom(caminho, ".o") ou texMod.Textos.terminaCom(caminho,
+        ".a") ou ehEntradaSharedObj(caminho)
+}
+
+// Busca primeiro biblioteca estatica lib<nome>.a ou compartilhada lib<nome>.so em -L;
+// em seguida consulta aliases padrao e diretorios do sistema extraindo o DT_SONAME real ELF64.
 funcao resolverBibliotecaCli(nomeL: texto, dirsLib: texto[]): (texto, logico) {
     const arquivos: qualquer = importar("cgd:arquivos")
     const camMod: qualquer = importar("cgd:caminhos")
+    const leitor: qualquer = importar("../linker/elf_leitor.delegua")
+
+    // 1. Diretorios explicitos via -L (estatica .a ou compartilhada .so)
     para (var i: inteiro = 0; i < dirsLib.tamanho(); i++) {
         const candA: texto = camMod.Caminhos.juntar([dirsLib[i], "lib" + nomeL + ".a"])
         se (arquivos.Arquivo(candA).existe()) retorna tupla([candA, verdadeiro])
+        const candSo: texto = camMod.Caminhos.juntar([dirsLib[i], "lib" + nomeL + ".so"])
+        se (arquivos.Arquivo(candSo).existe()) {
+            const snU: texto = leitor.lerSonameDeSharedObj(candSo)
+            retorna tupla([snU.tamanho() > 0 ? snU : "lib" + nomeL + ".so", falso])
+        }
     }
 
+    // 2. Aliases canonicos de bibliotecas base POSIX/glibc
     se (nomeL == "m") retorna tupla(["libm.so.6", falso])
     se (nomeL == "c") retorna tupla(["libc.so.6", falso])
     se (nomeL == "pthread") retorna tupla(["libpthread.so.0", falso])
     se (nomeL == "dl") retorna tupla(["libdl.so.2", falso])
     se (nomeL == "rt") retorna tupla(["librt.so.1", falso])
-    para (var i: inteiro = 0; i < dirsLib.tamanho(); i++) {
-        const candSo: texto = camMod.Caminhos.juntar([dirsLib[i], "lib" + nomeL + ".so"])
-        se (arquivos.Arquivo(candSo).existe()) retorna tupla([candSo, falso])
+    se (nomeL == "gcc_s") retorna tupla(["libgcc_s.so.1", falso])
+
+    // 3. Diretorios padrao do sistema Linux x86-64: resolve DT_SONAME real (ex.: libgc.so.1, libcurl.so.4)
+    const dirsSys: texto[] = [
+        "/usr/lib64",
+        "/lib64",
+        "/usr/lib/x86_64-linux-gnu",
+        "/lib/x86_64-linux-gnu",
+        "/usr/lib",
+        "/usr/local/lib64",
+        "/usr/local/lib"
+    ]
+    para (var i: inteiro = 0; i < dirsSys.tamanho(); i++) {
+        const candSoSys: texto = camMod.Caminhos.juntar([dirsSys[i], "lib" + nomeL + ".so"])
+        se (arquivos.Arquivo(candSoSys).existe()) {
+            const snS: texto = leitor.lerSonameDeSharedObj(candSoSys)
+            se (snS.tamanho() > 0) retorna tupla([snS, falso])
+            retorna tupla(["lib" + nomeL + ".so", falso])
+        }
+    }
+
+    para (var i: inteiro = 0; i < dirsSys.tamanho(); i++) {
+        const candASys: texto = camMod.Caminhos.juntar([dirsSys[i], "lib" + nomeL + ".a"])
+        se (arquivos.Arquivo(candASys).existe()) retorna tupla([candASys, verdadeiro])
     }
 
     retorna tupla(["lib" + nomeL + ".so", falso])
 }
 
 funcao imprimirAjuda(): vazio {
-    escreva("Uso: dcc [opcoes] arquivo1.c|arquivo1.o|lib.a [arquivo2...]")
+    escreva("Uso: dcc [opcoes] arquivo1.c|arquivo1.o|lib.a|lib.so [arquivo2...]")
     escreva("")
     escreva("DCC - Delegua C Compiler v0.3.0 (Linux x86-64 / System V AMD64 ABI)")
     escreva("")
@@ -120,6 +164,9 @@ funcao imprimirAjuda(): vazio {
     escreva("  -U <MACRO>                   Remove definicao de macro no pre-processador")
     escreva("  -L <dir>                     Adiciona diretorio de busca de bibliotecas (.a / .so)")
     escreva("  -l <lib>                     Vincula biblioteca estatica (.a) ou dinamica (.so)")
+    escreva("  -pthread                     Habilita suporte a threads POSIX (-D_REENTRANT -lpthread)")
+    escreva("  -Wl,-rpath,<dir>             Adiciona diretorio em DT_RUNPATH no executavel")
+    escreva("  -no-pie, -fPIC               Opcoes de modelo de codigo/linkagem aceitas")
     escreva("  -std=c99                     Modo ISO C99 (padrao)")
     escreva("  -std=gnu99                   Modo C99 com extensoes GNU delimitadas")
     escreva("  -O0, -O1, -O2, -O3           Nivel de otimizacao da IR SSA")
@@ -429,6 +476,7 @@ assincrona funcao executarDriverDCCAsync(args: texto[]): inteiro {
     var undefsCli: texto[] = []
     var dirsLib: texto[] = []
     var libsCli: texto[] = []
+    var rpathsCli: texto[] = []
     var caminhoSaida: texto = ""
     var somentePreproc: logico = falso
     var somenteAsm: logico = falso
@@ -554,6 +602,49 @@ assincrona funcao executarDriverDCCAsync(args: texto[]): inteiro {
             i = i + 2
         } senao se (a.tamanho() > 2 e texMod.Textos.comecaCom(a, "-l")) {
             libsCli.empilhar(a.fatiar(2, a.tamanho()))
+            i++
+        } senao se (a == "-pthread") {
+            defsCli.empilhar("_REENTRANT=1")
+            libsCli.empilhar("pthread")
+            i++
+        } senao se (a == "-no-pie" ou a == "-fno-pie" ou a == "-fPIC" ou a == "-fpic" ou a == "-rdynamic") {
+            i++
+        } senao se (a == "-rpath") {
+            se (i + 1 >= args.tamanho()) {
+                escreverErro("dcc: error: diretorio ausente apos '-rpath'")
+                retorna 1
+            }
+            rpathsCli.empilhar(args[i + 1])
+            i = i + 2
+        } senao se (texMod.Textos.comecaCom(a, "-rpath=") e a.tamanho() > 7) {
+            rpathsCli.empilhar(a.fatiar(7, a.tamanho()))
+            i++
+        } senao se (texMod.Textos.comecaCom(a, "-Wl,") e a.tamanho() > 4) {
+            const partesWl: texto[] = a.fatiar(4, a.tamanho()).dividir(",")
+            var pw: inteiro = 0
+            enquanto (pw < partesWl.tamanho()) {
+                const tokW: texto = partesWl[pw]
+                se (tokW == "-rpath" e pw + 1 < partesWl.tamanho()) {
+                    rpathsCli.empilhar(partesWl[pw + 1])
+                    pw = pw + 2
+                } senao se (texMod.Textos.comecaCom(tokW, "-rpath=") e tokW.tamanho() > 7) {
+                    rpathsCli.empilhar(tokW.fatiar(7, tokW.tamanho()))
+                    pw++
+                } senao se (texMod.Textos.comecaCom(tokW, "-L") e tokW.tamanho() > 2) {
+                    dirsLib.empilhar(tokW.fatiar(2, tokW.tamanho()))
+                    pw++
+                } senao se (texMod.Textos.comecaCom(tokW, "-l") e tokW.tamanho() > 2) {
+                    libsCli.empilhar(tokW.fatiar(2, tokW.tamanho()))
+                    pw++
+                } senao se (tokW == "-z" e pw + 1 < partesWl.tamanho()) {
+                    pw = pw + 2
+                } senao se (tokW == "--as-needed" ou tokW == "--no-as-needed" ou tokW == "--gc-sections" ou tokW == "-O1" ou tokW == "--export-dynamic") {
+                    pw++
+                } senao {
+                    escreverErro("dcc: error: opcao de linker nao suportada em '${a}': '${tokW}'")
+                    retorna 1
+                }
+            }
             i++
         } senao se (a == "-E") {
             somentePreproc = verdadeiro
@@ -683,8 +774,7 @@ assincrona funcao executarDriverDCCAsync(args: texto[]): inteiro {
                 escreverErro("dcc: error: arquivo nao encontrado: '${arqPath}'")
                 retorna 1
             }
-            se (texMod.Textos.terminaCom(arqPath, ".o") ou texMod.Textos.terminaCom(arqPath,
-                ".a")) {
+            se (ehEntradaBinariaLink(arqPath)) {
                 se (somenteObjeto ou somenteAsm) {
                     escreverErro("dcc: error: arquivo binario '${arqPath}' nao pode ser usado com -c ou -S")
                     retorna 1
@@ -696,6 +786,9 @@ assincrona funcao executarDriverDCCAsync(args: texto[]): inteiro {
 
         var objetosLinkar: qualquer[] = []
         var nomesObjetos: texto[] = []
+        var libsDinEntrada: texto[] = []
+        const leitorCli: qualquer = importar("../linker/elf_leitor.delegua")
+        const camCli: qualquer = importar("cgd:caminhos")
         var tPre: real = 0.0
         var tLex: real = 0.0
         var tPar: real = 0.0
@@ -787,6 +880,11 @@ assincrona funcao executarDriverDCCAsync(args: texto[]): inteiro {
                         objetosLinkar.empilhar(lerBinarioBytes(tmpObjPath))
                         nomesObjetos.empilhar(entradas[k])
                         arquivos.Arquivo(tmpObjPath).remover()
+                    } senao se (ehEntradaSharedObj(entradas[k])) {
+                        const snDir: texto = leitorCli.lerSonameDeSharedObj(entradas[k])
+                        libsDinEntrada.empilhar(snDir.tamanho() > 0 ? snDir : camCli.Caminhos.nome(entradas[k]))
+                        const dirSo: texto = camCli.Caminhos.diretorio(entradas[k])
+                        se (dirSo.tamanho() > 0 e dirSo != ".") rpathsCli.empilhar(dirSo)
                     } senao {
                         se (verbose) escreverErro("[dcc] lendo binario ELF64/ar: ${entradas[k]}")
                         objetosLinkar.empilhar(lerBinarioBytes(entradas[k]))
@@ -797,6 +895,14 @@ assincrona funcao executarDriverDCCAsync(args: texto[]): inteiro {
         } senao {
             para (var k: inteiro = 0; k < entradas.tamanho(); k++) {
                 const arqPath: texto = entradas[k]
+
+                se (ehEntradaSharedObj(arqPath)) {
+                    const snDir2: texto = leitorCli.lerSonameDeSharedObj(arqPath)
+                    libsDinEntrada.empilhar(snDir2.tamanho() > 0 ? snDir2 : camCli.Caminhos.nome(arqPath))
+                    const dirSo2: texto = camCli.Caminhos.diretorio(arqPath)
+                    se (dirSo2.tamanho() > 0 e dirSo2 != ".") rpathsCli.empilhar(dirSo2)
+                    continua
+                }
 
                 se (texMod.Textos.terminaCom(arqPath, ".o") ou texMod.Textos.terminaCom(arqPath,
                     ".a")) {
@@ -881,6 +987,9 @@ assincrona funcao executarDriverDCCAsync(args: texto[]): inteiro {
 
         se (!somenteAsm e !somenteObjeto) {
             var libsDinamicas: texto[] = []
+            para (var d: inteiro = 0; d < libsDinEntrada.tamanho(); d++) {
+                libsDinamicas.empilhar(libsDinEntrada[d])
+            }
             para (var k: inteiro = 0; k < libsCli.tamanho(); k++) {
                 const resLib: (texto, logico) = resolverBibliotecaCli(libsCli[k], dirsLib)
                 se (resLib[1]) {
@@ -895,7 +1004,7 @@ assincrona funcao executarDriverDCCAsync(args: texto[]): inteiro {
             se (verbose) escreverErro("[dcc] linkando ${objetosLinkar.tamanho()} entrada(s) ELF64/ar -> executavel (workers=${workersEfetivos})")
             cron.reiniciar()
             const elfExecBytes: qualquer = aguardar lnkMod.linkarObjetosELF64BytesAsync(objetosLinkar,
-                nomesObjetos, libsDinamicas, diagLink, workersEfetivos)
+                nomesObjetos, libsDinamicas, diagLink, workersEfetivos, rpathsCli)
             tLnk = tLnk + cron.milisegundos()
             const destExec: texto = caminhoSaida.tamanho() > 0 ? caminhoSaida : "a.out"
             gravarBinarioBytes(destExec, elfExecBytes, verdadeiro)
